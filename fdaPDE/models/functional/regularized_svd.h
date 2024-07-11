@@ -20,24 +20,29 @@
 #include <fdaPDE/utils.h>
 #include <Eigen/SVD>
 
+#include "../../core/fdaPDE/linear_algebra/randSVD_algorithms.h"
+using fdapde::core::RSI;
+using fdapde::core::RBKI;
+
 #include "../../calibration/kfold_cv.h"
 #include "../../calibration/symbols.h"
 using fdapde::calibration::Calibration;
+
 #include "../model_traits.h"
 #include "power_iteration.h"
 #include "../../core/fdaPDE/optimization/grid.h"
-
 
 namespace fdapde {
 namespace models {
 
 // Let X be a data matrix made of noisy and discrete measurements of smooth functions sampled from a random field
 // \mathcal{X}. RegularizedSVD implements the computation of a low-rank approximation of X using some regularizing term
-template <typename SolutionPolicy_> class RegularizedSVD;
+template <typename SolutionPolicy_, typename SVDType_> class RegularizedSVD;
 
 // Finds a low-rank approximation of X while penalizing for the eigenfunctions of \mathcal{X} by sequentially solving
 // \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f), up to a desired rank
-template <> class RegularizedSVD<sequential> {
+template<typename SVDType_>
+class RegularizedSVD<sequential, SVDType_> {
    private:
     Calibration calibration_;    // PC function's smoothing parameter selection strategy
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
@@ -46,6 +51,8 @@ template <> class RegularizedSVD<sequential> {
     double tolerance_ = 1e-6;   // relative tolerance between Jnew and Jold, used as stopping criterion
     int max_iter_ = 20;         // maximum number of allowed iterations
     int seed_ = fdapde::random_seed;
+
+    SVDType_ svd_;
 
     // problem solution
     DMatrix<double> loadings_;        // PC functions' expansion coefficients
@@ -62,13 +69,13 @@ template <> class RegularizedSVD<sequential> {
         int index_;                               // current rank
         DMatrix<double> X_;                       // deflated data
         PowerIteration<ModelType> solver_;        // rank-one step solver
-        Eigen::JacobiSVD<DMatrix<double>> svd_;   // thin monolithic Singular Value Decomposition (not regularized)
+        //SVDType svd_;   // thin monolithic Singular Value Decomposition (not regularized)
         ModelType& model_;
 
         // rank-one step: \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f). calibration of \lambda
         // dispatched to desired strategy
         void rank_one_step() {
-            DVector<double> f0 = svd_.matrixV().col(index_);
+            DVector<double> f0 = rsvd_->svd_.matrixV().col(index_);
 	    // select optimal smoothing level according to requested calibration strategy
 	    DVector<double> optimal_lambda;
             switch (rsvd_->calibration_) {
@@ -115,7 +122,7 @@ template <> class RegularizedSVD<sequential> {
             rsvd_(rsvd), index_(index), X_(X), solver_(model, rsvd->tolerance_, rsvd->max_iter_, rsvd->seed_),
             model_(model) {
             // first guess of PCs set to a multivariate PCA (SVD)
-            svd_ = Eigen::JacobiSVD<DMatrix<double>>(X_, Eigen::ComputeThinU | Eigen::ComputeThinV);
+            rsvd_->svd_.compute(X_);
             solver_.init();   // initialize power iteration solver
         };
         rsvd_iterator& operator++() {
@@ -136,8 +143,8 @@ template <> class RegularizedSVD<sequential> {
     };
    public:
     // constructors
-    RegularizedSVD(Calibration c) : calibration_(c) { }
-    RegularizedSVD() : RegularizedSVD(Calibration::off) {};
+    RegularizedSVD(Calibration c, SVDType_ svd) : calibration_(c), svd_(svd){ };
+    RegularizedSVD(SVDType_ svd) : RegularizedSVD(Calibration::off, svd) {};
 
     // sequentially solves \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f), up to the specified rank,
     // selecting the level of smoothing of the component according to the desired strategy
@@ -182,8 +189,12 @@ template <> class RegularizedSVD<sequential> {
 };
 
 // finds a rank r matrix U minimizing \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top]
-template <> class RegularizedSVD<monolithic> {
+template<typename SVDType_>
+class RegularizedSVD<monolithic, SVDType_> {
    public:
+    // constructor
+    RegularizedSVD(SVDType_ svd) : svd_(svd){ };
+
     // solves \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top] retaining the first rank components
     template <typename ModelType> void compute(const DMatrix<double>& X, ModelType& model, int rank) {
         // compute matrix C = \Psi^\top*\Psi + P(\lambda)
@@ -193,12 +204,20 @@ template <> class RegularizedSVD<monolithic> {
         DMatrix<double> invD = D.inverse();
 
         // compute SVD of X*\Psi*(D^{-1})^\top
+        /*
         Eigen::JacobiSVD<DMatrix<double>> svd(
           X * model.Psi() * invD.transpose(), Eigen::ComputeThinU | Eigen::ComputeThinV);
+
+        RBKI<DMatrix<double>, fdapde::core::adaptive> svd(
+                X * model.Psi() * invD.transpose(),
+                rank, 10, 1e-8);
+        */
+        svd_.compute(X * model.Psi() * invD.transpose());
+
         // store results
-        scores_ = svd.matrixU().leftCols(rank);
+        scores_ = svd_.matrixU().leftCols(rank);
         loadings_ =
-          (svd.singularValues().head(rank).asDiagonal() * svd.matrixV().leftCols(rank).transpose() * invD).transpose();
+          (svd_.singularValues().head(rank).asDiagonal() * svd_.matrixV().leftCols(rank).transpose() * invD).transpose();
         loadings_norm_.resize(rank);
         for (int i = 0; i < rank; ++i) {
             loadings_norm_[i] = std::sqrt(loadings_.col(i).dot(model.R0() * loadings_.col(i)));   // L^2 norm
@@ -213,6 +232,7 @@ template <> class RegularizedSVD<monolithic> {
     const DVector<double>& loadings_norm() const { return loadings_norm_; }
     Calibration calibration() const { return Calibration::off; }   // calibration is implicitly off
    private:
+    SVDType_ svd_;
     // let E*\Sigma*F^\top the reduced (rank r) SVD of X*\Psi*(D^{1})^\top, with D^{-1} the inverse of the cholesky
     // factor of \Psi^\top * \Psi + P(\lambda), then
     DMatrix<double> scores_;          // matrix E in the reduced SVD of X*\Psi*(D^{-1})^\top

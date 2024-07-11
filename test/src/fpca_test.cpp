@@ -17,6 +17,7 @@
 #include <fdaPDE/core.h>
 #include <gtest/gtest.h>   // testing framework
 
+#include <iostream>
 #include <cstddef>
 
 #include <fdaPDE/core.h>
@@ -24,6 +25,11 @@ using fdapde::core::FEM;
 using fdapde::core::fem_order;
 using fdapde::core::laplacian;
 using fdapde::core::PDE;
+
+using fdapde::core::RSI;
+using fdapde::core::RBKI;
+
+#include <Eigen/SVD>
 
 #include "../../fdaPDE/models/functional/fpca.h"
 #include "../../fdaPDE/models/sampling_design.h"
@@ -60,7 +66,11 @@ TEST(fpca_test, laplacian_samplingatnodes_sequential) {
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> pde(domain.mesh, L, u);
     // define model
     double lambda_D = 1e-2;
-    FPCA<SpaceOnly> model(pde, Sampling::mesh_nodes, RegularizedSVD<fdapde::sequential>{Calibration::off});
+
+    RSI<DMatrix<double>,fdapde::core::extended> RandSVD(3,3);
+
+    FPCA<SpaceOnly> model(pde, Sampling::mesh_nodes,
+                          RegularizedSVD<fdapde::sequential, RSI<DMatrix<double>,fdapde::core::extended>>(RandSVD));
     model.set_lambda_D(lambda_D);
     // set model's data
     BlockFrame<double, int> df;
@@ -69,10 +79,18 @@ TEST(fpca_test, laplacian_samplingatnodes_sequential) {
     // solve FPCA problem
     model.init();
     model.solve();
+
+    // compute distances
+    DMatrix<double> exp_loadings = read_mtx<double>("../data/models/fpca/2D_test1/loadings_seq.mtx");
+    double err = (model.Psi() * model.loadings() - exp_loadings).lpNorm<Eigen::Infinity>();
+
+    std::cout << err << std::endl;
+
     // test correctness
     EXPECT_TRUE(almost_equal(model.Psi() * model.loadings(), "../data/models/fpca/2D_test1/loadings_seq.mtx"));
-    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test1/scores_seq.mtx"  ));
+    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test1/scores_seq.mtx"));
 }
+
 
 // test 2
 //    domain:       unit square [1,1] x [1,1]
@@ -93,7 +111,13 @@ TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double lambda_D = 1e-2;
-    FPCA<SpaceOnly> model(problem, Sampling::mesh_nodes, RegularizedSVD<fdapde::monolithic>());
+
+    RSI<DMatrix<double>,fdapde::core::extended> RandSVD(3,3);
+    Eigen::JacobiSVD<DMatrix<double>> exact_svd(0,0,Eigen::ComputeThinU | Eigen::ComputeThinV);
+
+    FPCA<SpaceOnly>
+            model(problem, Sampling::mesh_nodes,
+                  RegularizedSVD<fdapde::monolithic, Eigen::JacobiSVD<DMatrix<double>>>(exact_svd));
     model.set_lambda_D(lambda_D);
     // set model's data
     BlockFrame<double, int> df;
@@ -102,11 +126,18 @@ TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
     // solve FPCA problem
     model.init();
     model.solve();
+
+    // compute distances
+    DMatrix<double> exp_loadings = read_mtx<double>("../data/models/fpca/2D_test1/loadings_mon.mtx");
+    double err = ((model.Psi() * model.loadings()).cwiseAbs() - exp_loadings.cwiseAbs()).lpNorm<Eigen::Infinity>();
+    std::cout << err << std::endl;
+
     // test correctness
     EXPECT_TRUE(almost_equal(model.Psi() * model.loadings(), "../data/models/fpca/2D_test1/loadings_mon.mtx"));
     EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test1/scores_mon.mtx"  ));
 }
 
+/*
 // test 3
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations != nodes
@@ -258,3 +289,4 @@ TEST(fpca_test, laplacian_samplingatnodes_nocalibration_missingdata) {
     EXPECT_TRUE(almost_equal(model.scores(),   "../data/models/fpca/2D_test4/scores.mtx"  ));
 }
 */
+

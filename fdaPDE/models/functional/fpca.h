@@ -37,9 +37,11 @@ template <typename RegularizationType_>
 class FPCA : public FunctionalBase<FPCA<RegularizationType_>, RegularizationType_> {
    private:
     int n_pc_ = 3;   // number of principal components
+
     struct SolverType__ {    // type erased solver strategy
         using This_ = FPCA<RegularizationType_>;
         template <typename T> using fn_ptrs = mem_fn_ptrs<&T::template compute<This_>, &T::loadings, &T::scores>;
+
         void compute(const DMatrix<double>& X, This_& model, int rank) {
             invoke<void, 0>(*this, X, model, rank);
         }
@@ -47,7 +49,7 @@ class FPCA : public FunctionalBase<FPCA<RegularizationType_>, RegularizationType
         decltype(auto) scores()   const { return invoke<const DMatrix<double>&, 2>(*this); }
     };
     using SolverType = fdapde::erase<heap_storage, SolverType__>;
-    SolverType solver_;   // RegularizedSVD solver
+    SolverType solver_;  // RegularizedSVD solver
    public:
     using RegularizationType = std::decay_t<RegularizationType_>;
     using This = FPCA<RegularizationType>;
