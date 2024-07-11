@@ -7,9 +7,18 @@
 *.RData
 *.o
 *.so
+.DS_Store
+
 test/fdapde_test
 test/.cache
 test/build/
 test/CMakeFiles/
 test/_deps/
 test/libs/
+
+#clion directories
+cmake-build-debug/
+cmake-build-default/
+CMakeFiles/
+
+
