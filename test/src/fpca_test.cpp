@@ -137,7 +137,7 @@ TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
     EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test1/scores_mon.mtx"  ));
 }
 
-/*
+
 // test 3
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations != nodes

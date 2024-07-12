@@ -23,4 +23,8 @@ CMakeFiles/
 
 .idea/
 
+*.Rproj
+.Rproj.user
 
+test/data/
+test/data/mesh/

@@ -1,5 +1,7 @@
 library(fdaPDE)
 
+mesh_data_path <- "data/mesh/unit_square_rsvd_test"
+
 ## define eigenfunctions of laplace operator over square with neumann boundary conditions
 square_eigenfunction <- function(a, b, locs) {
     return(cos(a * pi * locs[,1]) * cos(b * pi * locs[, 2]))
@@ -13,9 +15,15 @@ locations.2D <- expand.grid(x.2D, y.2D)
 mesh.2D <- fdaPDE::create.mesh.2D(locations.2D)
 
 ## export mesh
-write.csv(format(mesh.2D$nodes, digits = 16), paste("nodes.csv", sep = ""))
-write.csv(format(mesh.2D$triangles, digits = 16), paste("elements.csv", sep = ""))
-write.csv(format(1 * mesh.2D$nodesmarkers, digits = 16), paste("boundary.csv", sep = ""))
+write.csv(format(mesh.2D$nodes, digits = 16), paste(mesh_data_path,"points.csv", sep = "/"))
+write.csv(format(mesh.2D$triangles, digits = 16), paste(mesh_data_path,"elements.csv", sep = "/"))
+write.csv(format(1 * mesh.2D$nodesmarkers, digits = 16), paste(mesh_data_path,"boundary.csv", sep = "/"))
+write.csv(format(mesh.2D$neighbors, digits = 16), paste(mesh_data_path,"neigh.csv", sep = "/"))
+write.csv(format(mesh.2D$edges, digits = 16), paste(mesh_data_path,"edges.csv", sep = "/"))
+
+
+## Observation data
+obs_data_path <- "data/models/fpca/2D_test_rsvd"
 
 ## define observations' locations
 n <- 15 ## number of observation locations
@@ -25,7 +33,7 @@ locations.obs.2D <- expand.grid(x.obs.2D, y.obs.2D)
 n_locations <- nrow(locations.obs.2D)
 
 ## export locations
-write.csv(format(locations.obs.2D, digits = 16), paste("locs.csv", sep = ""))
+write.csv(format(locations.obs.2D, digits = 16), paste(obs_data_path,"locs.csv", sep = "/"))
 
 plot(mesh.2D)
 points(locations.obs.2D, col = "red")
@@ -87,13 +95,13 @@ seed = 467897965 ## for reproducibility purposes
 n_replicas = 50  ## number of repetitions
 data_range <- max(c(f1, f2, f3)) - min(c(f1, f2, f3))
 
-if (!dir.exists("data")) dir.create("data")
-setwd("data")
+#if (!dir.exists("data")) dir.create("data")
+#setwd("data")
 
 ## export eigenfunctions
-write.csv(format(f1, digits = 16), paste("f1.csv", sep = ""))
-write.csv(format(f2, digits = 16), paste("f2.csv", sep = ""))
-write.csv(format(f3, digits = 16), paste("f3.csv", sep = ""))
+write.csv(format(f1, digits = 16), paste(obs_data_path,"f1.csv", sep = "/"))
+write.csv(format(f2, digits = 16), paste(obs_data_path,"f2.csv", sep = "/"))
+write.csv(format(f3, digits = 16), paste(obs_data_path,"f3.csv", sep = "/"))
 
 for(i in 1:n_replicas) {
     set.seed(seed + 4 * i)
@@ -112,7 +120,7 @@ for(i in 1:n_replicas) {
     datamatrix_pointwise <- datamatrix_pointwise_exact + error
 
     ## datamatrix.pointwise are the observations
-
+  
     ## (pointwise) center data
     data_bar <- colMeans(datamatrix_pointwise)
     data_bar <- matrix(rep(data_bar, nrow(datamatrix_pointwise)),
@@ -122,11 +130,12 @@ for(i in 1:n_replicas) {
     datamatrix_pointwise_centred <- datamatrix_pointwise - data_bar
 
     ## export data .csv format
-    write.csv(format(score1, digits = 16), paste("score1", "-", i, ".csv", sep = ""))
-    write.csv(format(score2, digits = 16), paste("score2", "-", i, ".csv", sep = ""))
-    write.csv(format(score3, digits = 16), paste("score3", "-", i, ".csv", sep = ""))
+    write.csv(format(score1, digits = 16), paste(obs_data_path,paste("score1", "-", i, ".csv", sep = ""),sep="/"))
+    write.csv(format(score2, digits = 16), paste(obs_data_path,paste("score2", "-", i, ".csv", sep = ""),sep="/"))
+    write.csv(format(score3, digits = 16), paste(obs_data_path,paste("score3", "-", i, ".csv", sep = ""),sep="/"))
     write.csv(format(datamatrix_pointwise_centred, digits = 16),
-              paste("datamatrix_centred", "-", i, ".csv", sep = ""))
+              paste(obs_data_path,paste("datamatrix_centred", "-", i, ".csv", sep = ""),sep="/")
+              )
 }
 
-setwd("..")
+#setwd("..")

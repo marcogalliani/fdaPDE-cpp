@@ -2,6 +2,7 @@
 // include eigen now to avoid possible linking errors
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
+#include <Eigen/SVD>
 
 // regression test suite
 /*
@@ -15,14 +16,31 @@
  */
 // #include "src/kcv_srpde_test.cpp"
 // functional test suite
-#include "src/fpca_test.cpp"
+//#include "src/fpca_test.cpp"
+#include "src/fpca_extensive_testing.cpp"
 /*
 #include "src/fpls_test.cpp"
 #include "src/centering_test.cpp"
  */
 
+using fdapde::core::RSI;
+using fdapde::core::RBKI;
+
 int main(int argc, char **argv){
-  // start testing
-  testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+
+    // SVD solvers
+    RSI<DMatrix<double>,fdapde::core::extended> svd_rsi(3,3); //1st: rank, 2nd: oversampling
+    RBKI<DMatrix<double>,fdapde::core::extended> svd_rbki(3,10); //1st: rank, 2nd: block size
+    Eigen::JacobiSVD<DMatrix<double>> exact_svd(0,0,Eigen::ComputeThinU | Eigen::ComputeThinV);
+
+    // Monolithic RSVD
+    fpca_test<Eigen::JacobiSVD<DMatrix<double>>,fdapde::monolithic>(exact_svd);
+
+    /*
+    // start testing
+    testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+    */
+
+     return 0;
 }
