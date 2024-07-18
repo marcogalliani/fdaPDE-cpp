@@ -21,7 +21,6 @@ write.csv(format(1 * mesh.2D$nodesmarkers, digits = 16), paste(mesh_data_path,"b
 write.csv(format(mesh.2D$neighbors, digits = 16), paste(mesh_data_path,"neigh.csv", sep = "/"))
 write.csv(format(mesh.2D$edges, digits = 16), paste(mesh_data_path,"edges.csv", sep = "/"))
 
-
 ## Observation data
 obs_data_path <- "data/models/fpca/2D_test_rsvd"
 
@@ -117,10 +116,12 @@ for(i in 1:n_replicas) {
     
     ## add error to simulate real data
     error <- rnorm(n = M * n_locations, sd = sd_error * data_range)
-    datamatrix_pointwise <- datamatrix_pointwise_exact + error
+    #datamatrix_pointwise <- datamatrix_pointwise_exact + error
+    datamatrix_pointwise <- datamatrix_pointwise_exact + matrix(error, #modified sum
+                                                                nrow = nrow(datamatrix_pointwise_exact),
+                                                                byrow = T)
 
     ## datamatrix.pointwise are the observations
-  
     ## (pointwise) center data
     data_bar <- colMeans(datamatrix_pointwise)
     data_bar <- matrix(rep(data_bar, nrow(datamatrix_pointwise)),

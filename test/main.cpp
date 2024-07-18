@@ -34,8 +34,12 @@ int main(int argc, char **argv){
     Eigen::JacobiSVD<DMatrix<double>> exact_svd(0,0,Eigen::ComputeThinU | Eigen::ComputeThinV);
 
     // Monolithic RSVD
-    fpca_test<Eigen::JacobiSVD<DMatrix<double>>,fdapde::monolithic>(exact_svd);
+    //fpca_generated_test<Eigen::JacobiSVD<DMatrix<double>>,fdapde::monolithic>(exact_svd);
 
+    // Sequential RSVD
+    //fpca_generated_test<RSI<DMatrix<double>,fdapde::core::extended>,fdapde::sequential>(svd_rsi);
+    fpca_generated_test<Eigen::JacobiSVD<DMatrix<double>>,fdapde::sequential>(exact_svd);
+    //fpca_library_test<RSI<DMatrix<double>,fdapde::core::extended> ,fdapde::sequential>(svd_rsi);
     /*
     // start testing
     testing::InitGoogleTest(&argc, argv);

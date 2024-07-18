@@ -45,14 +45,13 @@ template<typename SVDType_>
 class RegularizedSVD<sequential, SVDType_> {
    private:
     Calibration calibration_;    // PC function's smoothing parameter selection strategy
+    typename std::decay_t<SVDType_> svd_;
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
     DMatrix<double> lambda_grid_;
     // power iteration parameters
     double tolerance_ = 1e-6;   // relative tolerance between Jnew and Jold, used as stopping criterion
     int max_iter_ = 20;         // maximum number of allowed iterations
     int seed_ = fdapde::random_seed;
-
-    SVDType_ svd_;
 
     // problem solution
     DMatrix<double> loadings_;        // PC functions' expansion coefficients
