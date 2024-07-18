@@ -48,7 +48,7 @@ using fdapde::testing::read_csv;
 using fdapde::testing::read_mtx;
 
 template<typename SVDType, typename SolutionPolicy_>
-void fpca_test(SVDType svd){
+void fpca_generated_test(SVDType svd){
     // define domain
     MeshLoader<Mesh2D> domain("unit_square_rsvd_test");
 
@@ -59,11 +59,16 @@ void fpca_test(SVDType svd){
     auto L = -laplacian<FEM>();
     DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> pde(domain.mesh, L, u);
-    // define model
-    double lambda_D = 1e-2;
-    FPCA<SpaceOnly> model(pde, Sampling::pointwise, RegularizedSVD<SolutionPolicy_,SVDType>(svd));
+    // grid of smoothing parameters
+    DMatrix<double> lambda_grid(20, 1);
+    for (int i = 0; i < 20; ++i) lambda_grid(i, 0) = std::pow(10, -4 + 0.1 * i);
+
+    // rsvd solver
+    RegularizedSVD<SolutionPolicy_,SVDType> rsvd(Calibration::gcv, svd);
+    rsvd.set_lambda(lambda_grid);
+
+    FPCA<SpaceOnly> model(pde, Sampling::pointwise, rsvd);
     model.set_spatial_locations(locs);
-    model.set_lambda_D(lambda_D);
     // set model's data
     BlockFrame<double, int> df;
     df.insert(OBSERVATIONS_BLK, y);
@@ -82,44 +87,99 @@ void fpca_test(SVDType svd){
     DVector<double> f2 = read_csv<double>("../data/models/fpca/2D_test_rsvd/f2.csv");
     DVector<double> f3 = read_csv<double>("../data/models/fpca/2D_test_rsvd/f3.csv");
 
-    DVector<double> est_f1 = (model.Psi() * model.loadings()).col(0);
-    DVector<double> est_f2 = (model.Psi() * model.loadings()).col(1);
-    DVector<double> est_f3 = (model.Psi() * model.loadings()).col(2);
+    DMatrix<double> est_PCs = model.Psi() * model.loadings();
+
+    Eigen::saveMarket(est_PCs.col(0), "../est_PC1.mtx");
+    Eigen::saveMarket(est_PCs.col(1), "../est_PC2.mtx");
+    Eigen::saveMarket(est_PCs.col(2), "../est_PC3.mtx");
+
+    DMatrix<double> XYZ(f1.rows(), 2);
+    XYZ.col(0) = f1;
+    XYZ.col(1) = est_PCs.col(0);
+    std::cout << XYZ << std::endl;
+
 
     //1st autofunction
     std::cout << "First PC" << std::endl;
-    std::cout << (f1 - est_f1).lpNorm<Eigen::Infinity>() << std::endl;
-    std::cout << (f1 + est_f1).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (f1 - est_PCs.col(0)).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (f1 + est_PCs.col(0)).lpNorm<Eigen::Infinity>() << std::endl;
     //2nd autofunction
     std::cout << "Second PC" << std::endl;
-    std::cout << (f2 - est_f2).lpNorm<Eigen::Infinity>() << std::endl;
-    std::cout << (f2 + est_f2).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (f2 - est_PCs.col(1)).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (f2 + est_PCs.col(1)).lpNorm<Eigen::Infinity>() << std::endl;
     //3rd autofunction
     std::cout << "Third PC" << std::endl;
-    std::cout << (f3 - est_f3).lpNorm<Eigen::Infinity>() << std::endl;
-    std::cout << (f3 + est_f3).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (f3 - est_PCs.col(2)).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (f3 + est_PCs.col(2)).lpNorm<Eigen::Infinity>() << std::endl;
 
     //-> Scores
     DVector<double> scores_1 = read_csv<double>("../data/models/fpca/2D_test_rsvd/score1-1.csv");
     DVector<double> scores_2 = read_csv<double>("../data/models/fpca/2D_test_rsvd/score2-1.csv");
     DVector<double> scores_3 = read_csv<double>("../data/models/fpca/2D_test_rsvd/score3-1.csv");
 
-    DVector<double> est_scores_1 = model.scores().col(0);
-    DVector<double> est_scores_2 = model.scores().col(1);
-    DVector<double> est_scores_3 = model.scores().col(2);
-
     //1st PC scores
     std::cout << "First PC scores" << std::endl;
-    std::cout << (scores_1 - est_scores_1).lpNorm<Eigen::Infinity>() << std::endl;
-    std::cout << (scores_1 + est_scores_1).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (scores_1 - model.scores().col(0)).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (scores_1 + model.scores().col(0)).lpNorm<Eigen::Infinity>() << std::endl;
     //2nd scores
     std::cout << "Second PC scores" << std::endl;
-    std::cout << (scores_2 - est_scores_2).lpNorm<Eigen::Infinity>() << std::endl;
-    std::cout << (scores_2 - est_scores_2).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (scores_2 - model.scores().col(1)).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (scores_2 + model.scores().col(1)).lpNorm<Eigen::Infinity>() << std::endl;
     //3rd scores
     std::cout << "Third PC scores" << std::endl;
-    std::cout << (scores_3 - est_scores_3).lpNorm<Eigen::Infinity>() << std::endl;
-    std::cout << (scores_3 - est_scores_3).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (scores_3 - model.scores().col(2)).lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (scores_3 + model.scores().col(2)).lpNorm<Eigen::Infinity>() << std::endl;
 
     return;
 }
+
+template<typename SVDType, typename SolutionPolicy_>
+void fpca_library_test(SVDType svd){
+    // define domain
+    MeshLoader<Mesh2D> domain("unit_square");
+
+    // import data from files
+    //DMatrix<double> locs = read_csv<double>("../data/models/fpca/2D_test_rsvd/locs.csv");
+    DMatrix<double> y = read_csv<double>("../data/models/fpca/2D_test1/y.csv");
+    // define regularizing PDE
+    auto L = -laplacian<FEM>();
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> pde(domain.mesh, L, u);
+    // define model
+    double lambda_D = 1e-2;
+    FPCA<SpaceOnly> model(pde, Sampling::mesh_nodes, RegularizedSVD<SolutionPolicy_,SVDType>(svd));
+    // model.set_spatial_locations(locs);
+    model.set_lambda_D(lambda_D);
+    // set model's data
+    BlockFrame<double, int> df;
+    df.insert(OBSERVATIONS_BLK, y);
+    model.set_data(df);
+
+    // solve FPCA problem
+    const auto start{std::chrono::steady_clock::now()};
+    model.init();
+    model.solve();
+    const auto end{std::chrono::steady_clock::now()};
+    std::cout << "Elapsed_time: " << (std::chrono::duration<double>{end - start}).count() << std::endl;
+
+    // Distance from the actual solution
+    //-> PC functions
+    DMatrix<double> loadings = read_mtx<double>("../data/models/fpca/2D_test1/loadings_seq.mtx");
+    DMatrix<double> est_loadings = model.Psi() * model.loadings();
+
+    std::cout << "Loadings" << std::endl;
+    std::cout << (loadings - est_loadings).colwise().lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (loadings + est_loadings).colwise().lpNorm<Eigen::Infinity>() << std::endl;
+
+    //-> Scores
+    DMatrix<double> scores = read_mtx<double>("../data/models/fpca/2D_test1/scores_seq.mtx");
+    DMatrix<double> est_scores = model.scores();
+
+    //1st PC scores
+    std::cout << "Scores" << std::endl;
+    std::cout << (scores - est_scores).colwise().lpNorm<Eigen::Infinity>() << std::endl;
+    std::cout << (scores + est_scores).colwise().lpNorm<Eigen::Infinity>() << std::endl;
+
+    return;
+}
+
