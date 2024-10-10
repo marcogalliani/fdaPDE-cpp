@@ -96,11 +96,11 @@ class RegularizedSVD<sequential, SVDType_> {
                 auto cv_score = [&](
                                   const DVector<double>& lambda, const core::BinaryVector<Dynamic>& train_set,
                                   const core::BinaryVector<Dynamic>& test_set) -> double {
-                    solver_.compute(train_set.blk_repeat(1, X_.cols()).select(X_), lambda, f0);   // fit on train set
+                    solver_.compute(train_set.repeat(1, X_.cols()).select(X_), lambda, f0);   // fit on train set
                     // reconstruction error on test set: \norm{X_test * (I - fn*fn^\top/J)}_F/n_test, with
                     // J = \norm{f_n}_2^2 + f^\top*P(\lambda)*f (PS: the division of f^\top*P(\lambda)*f by
                     // \norm{f}_{L^2} is necessary to obtain J as expected)
-                    return (test_set.blk_repeat(1, X_.cols()).select(X_) *
+                    return (test_set.repeat(1, X_.cols()).select(X_) *
                             (DMatrix<double>::Identity(X_.cols(), X_.cols()) -
                              solver_.fn() * solver_.fn().transpose() /
                                (solver_.fn().squaredNorm() + solver_.ftPf(lambda) / solver_.f_squaredNorm())))

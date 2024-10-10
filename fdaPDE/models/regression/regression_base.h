@@ -46,7 +46,7 @@ class RegressionBase :
     // missing data and masking logic
     BinaryVector<fdapde::Dynamic> nan_mask_;     // indicator function over missing observations
     BinaryVector<fdapde::Dynamic> y_mask_;       // discards i-th observation from the fitting if y_mask_[i] == true
-    int n_nan_ = 0;                      // number of missing entries in observation vector
+    int n_nan_ = 0;                              // number of missing entries in observation vector
     SpMatrix<double> B_;                         // matrix \Psi corrected for NaN and masked observations
 
     // matrices required for Woodbury decomposition
@@ -184,7 +184,7 @@ class RegressionBase :
     }
     // correct \Psi setting to zero rows corresponding to masked observations
     void correct_psi() {
-        if (masked_obs().any()) B_ = (~masked_obs().blk_repeat(1, n_basis())).select(Psi(not_nan()));
+        if (masked_obs().any()) B_ = (~masked_obs().repeat(1, n_basis())).select(Psi(not_nan()));
     }
 };
 

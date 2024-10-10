@@ -73,6 +73,8 @@ template <typename Model> class SpaceOnlyBase : public ModelBase<Model> {
         if (is_empty(P_)) { P_ = R1().transpose() * invR0().solve(R1()); }
         return P_;
     }
+    // evaluation of x^\top*(R1^\top*R0^{-1}*R1)*x
+    double xtPDx(const DVector<double>& x) const { return x.dot(PD() * x); }
     // evaluation of penalty term \lambda*(R1^\top*R0^{-1}*R1) at \lambda
     auto P(const SVector<n_lambda>& lambda) const { return lambda[0] * PD(); }
     auto P() const { return P(lambda()); }

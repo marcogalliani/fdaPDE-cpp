@@ -65,6 +65,10 @@ class SpaceTimeSeparableBase : public SpaceTimeBase<Model, SpaceTimeSeparable> {
     // getters
     const SpMatrix<double>& R0() const { return R0_; }
     const SpMatrix<double>& R1() const { return R1_; }
+    const fdapde::SparseLU<SpMatrix<double>>& invR0() const {   // LU factorization of mass matrix R0
+        if (!invR0_) { invR0_.compute(R0()); }
+        return invR0_;
+    }
     int n_basis() const { return space_pde_.n_dofs() * time_pde_.n_dofs(); }
     int n_spatial_basis() const { return space_pde_.n_dofs(); }   // number of space basis functions
     int n_temporal_basis() const { return time_pde_.n_dofs(); }   // number of time basis functions
@@ -92,12 +96,15 @@ class SpaceTimeSeparableBase : public SpaceTimeBase<Model, SpaceTimeSeparable> {
     }
     const SpMatrix<double>& PD() const {   // space-penalty component (P0 \kron (R1^T*R0^{-1}*R1))
         if (is_empty(PD_)) {
-            fdapde::SparseLU<SpMatrix<double>> invR0_;
-            invR0_.compute(space_pde_.mass());
-            PD_ = Kronecker(P0(), space_pde_.stiff().transpose() * invR0_.solve(space_pde_.stiff()));
+            fdapde::SparseLU<SpMatrix<double>> invR0;   // inverse of space-only mass
+            invR0.compute(space_pde_.mass());
+            PD_ = Kronecker(P0(), space_pde_.stiff().transpose() * invR0.solve(space_pde_.stiff()));
         }
         return PD_;
     }
+    // evaluation of x^\top*PD*x and x^\top*PT*x
+    double xtPDx(const DVector<double>& x) const { return x.dot(PD() * x); }
+    double xtPTx(const DVector<double>& x) const { return x.dot(PT() * x); }
     // discretized penalty P = \lambda_D*(P0 \kron (R1^T*R0^{-1}*R1)) + \lambda_T*(P1 \kron R0)
     auto P(const SVector<n_lambda>& lambda) const { return lambda[0] * PD() + lambda[1] * PT(); }
     auto P() const { return P(Base::lambda()); }
@@ -114,6 +121,7 @@ class SpaceTimeSeparableBase : public SpaceTimeBase<Model, SpaceTimeSeparable> {
     DVector<double> time_locs_;     // time instants t_1, ..., t_m
     mutable SpMatrix<double> PD_;   // discretization of space regularization: (R1^T*R0^{-1}*R1) \kron P0
     mutable SpMatrix<double> PT_;   // discretization of time regularization:  (R0 \kron P1)
+    mutable fdapde::SparseLU<SpMatrix<double>> invR0_;
 };
 
 }   // namespace models

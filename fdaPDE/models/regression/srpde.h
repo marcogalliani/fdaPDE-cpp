@@ -36,7 +36,7 @@ namespace models {
 
 class SRPDE : public RegressionBase<SRPDE, SpaceOnly> {
    private:
-    typedef RegressionBase<SRPDE, SpaceOnly> Base;
+    using Base = RegressionBase<SRPDE, SpaceOnly>;
     SparseBlockMatrix<double, 2, 2> A_ {};         // system matrix of non-parametric problem (2N x 2N matrix)
     fdapde::SparseLU<SpMatrix<double>> invA_ {};   // factorization of matrix A
     DVector<double> b_ {};                         // right hand side of problem's linear system (1 x 2N vector)

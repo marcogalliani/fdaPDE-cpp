@@ -23,7 +23,7 @@ using fdapde::core::fem_order;
 using fdapde::core::laplacian;
 using fdapde::core::diffusion;
 using fdapde::core::PDE;
-using fdapde::core::Mesh;
+using fdapde::core::Triangulation;
 using fdapde::core::bilaplacian;
 using fdapde::core::SPLINE;
 using fdapde::core::spline_order;
@@ -59,12 +59,12 @@ using fdapde::testing::read_csv;
 //    GCV optimization: grid exact
 TEST(gcv_qsrpde_test, laplacian_nonparametric_samplingatnodes_spaceonly_gridexact) {
     // define domain
-    MeshLoader<Mesh2D> domain("unit_square_coarse");
+    MeshLoader<Triangulation<2, 2>> domain("unit_square_coarse");
     // import data from files
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test1/y.csv");
     // define regularizing PDE
     auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.1;
@@ -96,12 +96,12 @@ TEST(gcv_qsrpde_test, laplacian_nonparametric_samplingatnodes_spaceonly_gridexac
 //    GCV optimization: grid stochastic
 TEST(gcv_qsrpde_test, laplacian_nonparametric_samplingatnodes_spaceonly_gridstochastic) {
     // define domain
-    MeshLoader<Mesh2D> domain("unit_square_coarse");
+    MeshLoader<Triangulation<2, 2>> domain("unit_square_coarse");
     // import data from files
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test2/y.csv");
     // define regularizing PDE
     auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.1;
@@ -134,14 +134,14 @@ TEST(gcv_qsrpde_test, laplacian_nonparametric_samplingatnodes_spaceonly_gridstoc
 //    GCV optimization: grid exact
 TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingatlocations_gridexact) {
     // define domain
-    MeshLoader<Mesh2D> domain("c_shaped");
+    MeshLoader<Triangulation<2, 2>> domain("c_shaped");
     // import data from files
     DMatrix<double> locs = read_csv<double>("../data/gcv/qsrpde/2D_test3/locs.csv");
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test3/y.csv");
     DMatrix<double> X = read_csv<double>("../data/gcv/qsrpde/2D_test3/X.csv");
     // define regularizing PDE
     auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.9;
@@ -175,14 +175,14 @@ TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingatlocations_gridexact) {
 //    GCV optimization: grid stochastic
 TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingatlocations_gridstochastic) {
     // define domain
-    MeshLoader<Mesh2D> domain("c_shaped");
+    MeshLoader<Triangulation<2, 2>> domain("c_shaped");
     // import data from files
     DMatrix<double> locs = read_csv<double>("../data/gcv/qsrpde/2D_test4/locs.csv");
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test4/y.csv");
     DMatrix<double> X = read_csv<double>("../data/gcv/qsrpde/2D_test4/X.csv");
     // define regularizing PDE
     auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.9;
@@ -217,14 +217,14 @@ TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingatlocations_gridstochasti
 //    GCV optimization: grid exact
 TEST(gcv_qsrpde_test, costantcoefficientspde_nonparametric_samplingatnodes_gridexact) {
     // define domain
-    MeshLoader<Mesh2D> domain("unit_square_coarse");
+    MeshLoader<Triangulation<2, 2>> domain("unit_square_coarse");
     // import data from files
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test5/y.csv");
     // define regularizing PDE
     SMatrix<2> K;
     K << 1, 0, 0, 4;
     auto L = -diffusion<FEM>(K);   // anisotropic diffusion
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.1;
@@ -256,14 +256,14 @@ TEST(gcv_qsrpde_test, costantcoefficientspde_nonparametric_samplingatnodes_gride
 //    GCV optimization: grid stochastic
 TEST(gcv_qsrpde_test, costantcoefficientspde_nonparametric_samplingatnodes_gridstochastic) {
     // define domain
-    MeshLoader<Mesh2D> domain("unit_square_coarse");
+    MeshLoader<Triangulation<2, 2>> domain("unit_square_coarse");
     // import data from files
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test6/y.csv");
     // define regularizing PDE
     SMatrix<2> K;
     K << 1, 0, 0, 4;
     auto L = -diffusion<FEM>(K);   // anisotropic diffusion
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.1;
@@ -296,14 +296,14 @@ TEST(gcv_qsrpde_test, costantcoefficientspde_nonparametric_samplingatnodes_grids
 //    GCV optimization: grid exact
 TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingareal_gridexact) {
     // define domain
-    MeshLoader<Mesh2D> domain("c_shaped_areal");
+    MeshLoader<Triangulation<2, 2>> domain("c_shaped_areal");
     // import data from files
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test7/y.csv");
     DMatrix<double> X = read_csv<double>("../data/gcv/qsrpde/2D_test7/X.csv");
     DMatrix<double> subdomains = read_csv<double>("../data/gcv/qsrpde/2D_test7/incidence_matrix.csv");
     // define regularizing PDE
     auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.5;
@@ -337,14 +337,14 @@ TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingareal_gridexact) {
 //    GCV optimization: grid stochastic
 TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingareal_gridstochastic) {
     // define domain
-    MeshLoader<Mesh2D> domain("c_shaped_areal");
+    MeshLoader<Triangulation<2, 2>> domain("c_shaped_areal");
     // import data from files
     DMatrix<double> y = read_csv<double>("../data/gcv/qsrpde/2D_test8/y.csv");
     DMatrix<double> X = read_csv<double>("../data/gcv/qsrpde/2D_test8/X.csv");
     DMatrix<double> subdomains = read_csv<double>("../data/gcv/qsrpde/2D_test8/incidence_matrix.csv");
     // define regularizing PDE
     auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3, 1);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double alpha = 0.5;
@@ -382,19 +382,19 @@ TEST(gcv_qsrpde_test, laplacian_semiparametric_samplingareal_gridstochastic) {
 //    time penalization: separable (mass penalization)
 TEST(gcv_qsrpde_test, laplacian_nonparametric_samplingatlocations_timelocations_separable_gridexact) {
     // define temporal and spatial domain
-    Mesh<1, 1> time_mesh(0, fdapde::testing::pi, 2);   // interval [0, \pi] with 3 knots
-    MeshLoader<Mesh2D> domain("c_shaped_adj");
+    Triangulation<1, 1> time_mesh(0, fdapde::testing::pi, 2);   // interval [0, \pi] with 3 knots
+    MeshLoader<Triangulation<2, 2>> domain("c_shaped_adj");
     // import data from files
     DMatrix<double> space_locs = read_csv<double>("../data/gcv/qsrpde/2D_test9/locs.csv");
     DMatrix<double> time_locs  = read_csv<double>("../data/gcv/qsrpde/2D_test9/time_locations.csv");
     DMatrix<double> y          = read_csv<double>("../data/gcv/qsrpde/2D_test9/y.csv");
     // define regularizing PDE in space
     auto Ld = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3 * time_mesh.n_nodes(), 1);
-    PDE<Mesh<2, 2>, decltype(Ld), DMatrix<double>, FEM, fem_order<1>> space_penalty(domain.mesh, Ld, u);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3 * time_mesh.n_nodes(), 1);
+    PDE<Triangulation<2, 2>, decltype(Ld), DMatrix<double>, FEM, fem_order<1>> space_penalty(domain.mesh, Ld, u);
     // define regularizing PDE in time
     auto Lt = -bilaplacian<SPLINE>();
-    PDE<Mesh<1, 1>, decltype(Lt), DMatrix<double>, SPLINE, spline_order<3>> time_penalty(time_mesh, Lt);
+    PDE<Triangulation<1, 1>, decltype(Lt), DMatrix<double>, SPLINE, spline_order<3>> time_penalty(time_mesh, Lt);
     // define model
     double alpha = 0.5;
     QSRPDE<SpaceTimeSeparable> model(space_penalty, time_penalty, Sampling::pointwise, alpha);
@@ -435,19 +435,19 @@ TEST(gcv_qsrpde_test, laplacian_nonparametric_samplingatlocations_timelocations_
 //    time penalization: separable (mass penalization)
 TEST(gcv_qsrpde_test, laplacian_nonparametric_samplingatlocations_timelocations_separable_gridstochastic) {
     // define temporal and spatial domain
-    Mesh<1, 1> time_mesh(0, fdapde::testing::pi, 2);   // interval [0, \pi] with 3 knots
-    MeshLoader<Mesh2D> domain("c_shaped_adj");
+    Triangulation<1, 1> time_mesh(0, fdapde::testing::pi, 2);   // interval [0, \pi] with 3 knots
+    MeshLoader<Triangulation<2, 2>> domain("c_shaped_adj");
     // import data from files
     DMatrix<double> space_locs = read_csv<double>("../data/gcv/qsrpde/2D_test10/locs.csv");
     DMatrix<double> time_locs  = read_csv<double>("../data/gcv/qsrpde/2D_test10/time_locations.csv");
     DMatrix<double> y          = read_csv<double>("../data/gcv/qsrpde/2D_test10/y.csv");
     // define regularizing PDE in space 
     auto Ld = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_elements() * 3 * time_mesh.n_nodes(), 1);
-    PDE<Mesh<2, 2>, decltype(Ld), DMatrix<double>, FEM, fem_order<1>> space_penalty(domain.mesh, Ld, u);
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3 * time_mesh.n_nodes(), 1);
+    PDE<Triangulation<2, 2>, decltype(Ld), DMatrix<double>, FEM, fem_order<1>> space_penalty(domain.mesh, Ld, u);
     // define regularizing PDE in time
     auto Lt = -bilaplacian<SPLINE>();
-    PDE<Mesh<1, 1>, decltype(Lt), DMatrix<double>, SPLINE, spline_order<3>> time_penalty(time_mesh, Lt);
+    PDE<Triangulation<1, 1>, decltype(Lt), DMatrix<double>, SPLINE, spline_order<3>> time_penalty(time_mesh, Lt);
     // define model
     double alpha = 0.5;
     QSRPDE<SpaceTimeSeparable> model(space_penalty, time_penalty, Sampling::pointwise, alpha);

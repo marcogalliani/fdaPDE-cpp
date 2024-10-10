@@ -82,6 +82,10 @@ class SpaceTimeParabolicBase : public SpaceTimeBase<Model, SpaceTimeParabolic> {
     const PDE& pde() const { return pde_; }   // regularizing term df/dt + Lf - u
     const SpMatrix<double>& R0() const { return R0_; }
     const SpMatrix<double>& R1() const { return R1_; }
+    const fdapde::SparseLU<SpMatrix<double>>& invR0() const {   // LU factorization of mass matrix R0
+        if (!invR0_) { invR0_.compute(R0()); }
+        return invR0_;
+    }
     int n_basis() const { return pde_.n_dofs(); }   // number of basis functions
     int n_spatial_basis() const { return pde_.n_dofs(); }
     const SpMatrix<double>& L() const { return L_; }
@@ -92,25 +96,24 @@ class SpaceTimeParabolicBase : public SpaceTimeBase<Model, SpaceTimeParabolic> {
     // \lambda_D*((Im \kron R1 + \lambda_T*(L \kron R0))^T*(I_m \kron R0)^{-1}*(Im \kron R1 + \lambda_T*(L \kron R0)))
     auto P() {
         if (is_empty(pen_)) {   // compute once and cache result
-            invR0_.compute(R0());
             penT_ = Kronecker(L_, pde_.mass());
         }
-        return lambda_D() * (R1() + lambda_T() * penT_).transpose() * invR0_.solve(R1() + lambda_T() * penT_);
+        return lambda_D() * (R1() + lambda_T() * penT_).transpose() * invR0().solve(R1() + lambda_T() * penT_);
     }
     // destructor
     virtual ~SpaceTimeParabolicBase() = default;
    protected:
     PDE pde_ {};   // parabolic differential penalty df/dt + Lf - u
     // let m the number of time points
-    DMatrix<double> s_;     // N x 1 initial condition vector
-    DMatrix<double> u_;     // discretized forcing [1/DeltaT * (u_1 + R_0*s) \ldots u_n]
-    SpMatrix<double> Im_;   // m x m sparse identity matrix (assembled once and cached for reuse)
-    SpMatrix<double> L_;    // m x m matrix associated with the derivation in time
-    double DeltaT_;         // time step (assumes equidistant points in time)
-    SpMatrix<double> R0_;   // Im \kron R0 (R0: spatial mass matrix)
-    SpMatrix<double> R1_;   // Im \kron R1 (R1: spatial penalty discretization)
-    SpMatrix<double> penT_;                      // L_ \kron pde.R0
-    fdapde::SparseLU<SpMatrix<double>> invR0_;   // factorization of Im \kron R0
+    DMatrix<double> s_;       // N x 1 initial condition vector
+    DMatrix<double> u_;       // discretized forcing [1/DeltaT * (u_1 + R_0*s) \ldots u_n]
+    SpMatrix<double> Im_;     // m x m sparse identity matrix (assembled once and cached for reuse)
+    SpMatrix<double> L_;      // m x m matrix associated with the derivation in time
+    double DeltaT_;           // time step (assumes equidistant points in time)
+    SpMatrix<double> R0_;     // Im \kron R0 (R0: spatial mass matrix)
+    SpMatrix<double> R1_;     // Im \kron R1 (R1: spatial penalty discretization)
+    SpMatrix<double> penT_;   // L_ \kron pde.R0
+    mutable fdapde::SparseLU<SpMatrix<double>> invR0_;
     // discretized penalty: (Im \kron R1 + L \kron R0)^T*(I_m \kron R0)^{-1}*(Im \kron R1 + L \kron R0)
     SpMatrix<double> pen_;
 };
