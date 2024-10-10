@@ -45,9 +45,10 @@ class FPCA : public FunctionalBase<FPCA<RegularizationType_>, RegularizationType
         void compute(const DMatrix<double>& X, This_& model, int rank) {
             invoke<void, 0>(*this, X, model, rank);
         }
-        decltype(auto) loadings() const { return invoke<const DMatrix<double>&, 1>(*this); }
-        decltype(auto) scores()   const { return invoke<const DMatrix<double>&, 2>(*this); }
+        decltype(auto) loadings() const { return invoke<const DMatrix<double>&, 1>(*this);}
+        decltype(auto) scores()   const { return invoke<const DMatrix<double>&, 2>(*this);}
     };
+
     using SolverType = fdapde::erase<heap_storage, SolverType__>;
     SolverType solver_;  // RegularizedSVD solver
    public:
