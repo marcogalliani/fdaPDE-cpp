@@ -19,9 +19,12 @@
 
 #include <fdaPDE/utils.h>
 #include <Eigen/SVD>
-#include "fdaPDE/core/fdaPDE/linear_algebra/randomized_algorithms/randomized_svd.h"
-using fdapde::core::RandomizedEVD;
-using fdapde::core::IterationPolicy;
+#include <Eigen/SparseCholesky>
+
+#include "fdaPDE/core/fdaPDE/linear_algebra.h"
+using fdapde::core::TruncatedSVD;
+using fdapde::core::SVDPolicy;
+
 
 #include "../../calibration/kfold_cv.h"
 #include "../../calibration/symbols.h"
@@ -38,15 +41,14 @@ namespace models {
 
 // Let X be a data matrix made of noisy and discrete measurements of smooth functions sampled from a random field
 // \mathcal{X}. RegularizedSVD implements the computation of a low-rank approximation of X using some regularizing term
-template <typename SolutionPolicy_, typename SVDType_> class RegularizedSVD;
+template <typename SolutionPolicy_, SVDPolicy SVDPolicy_> class RegularizedSVD;
 
 // Finds a low-rank approximation of X while penalizing for the eigenfunctions of \mathcal{X} by sequentially solving
 // \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f), up to a desired rank
-template<typename SVDType_>
-class RegularizedSVD<sequential, SVDType_> {
+template<SVDPolicy SVDPolicy_>
+class RegularizedSVD<sequential, SVDPolicy_> {
    private:
     Calibration calibration_;    // PC function's smoothing parameter selection strategy
-    typename std::decay_t<SVDType_> svd_;
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
     DMatrix<double> lambda_grid_;
     // power iteration parameters
@@ -62,20 +64,21 @@ class RegularizedSVD<sequential, SVDType_> {
 
     // rank-one-stepper API: this iterator allows to range over each component of X, while triggering the computation
     // only when required
-    template <typename ModelType> struct rsvd_iterator {
+    template <typename ModelType>
+    struct rsvd_iterator {
        private:
         friend RegularizedSVD;
         RegularizedSVD* rsvd_;
         int index_;                               // current rank
         DMatrix<double> X_;                       // deflated data
         PowerIteration<ModelType> solver_;        // rank-one step solver
-        //SVDType svd_;   // thin monolithic Singular Value Decomposition (not regularized)
+        TruncatedSVD<DMatrix<double>,SVDPolicy_> tr_svd_;   // thin monolithic Singular Value Decomposition (not regularized)
         ModelType& model_;
 
         // rank-one step: \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f). calibration of \lambda
         // dispatched to desired strategy
         void rank_one_step() {
-            DVector<double> f0 = rsvd_->svd_.matrixV().col(index_);
+            DVector<double> f0 = tr_svd_.matrixV().col(index_);
 	    // select optimal smoothing level according to requested calibration strategy
 	    DVector<double> optimal_lambda;
             switch (rsvd_->calibration_) {
@@ -118,13 +121,13 @@ class RegularizedSVD<sequential, SVDType_> {
         }
        public:
         // constructor
-        rsvd_iterator(RegularizedSVD* rsvd, int index, const DMatrix<double>& X, ModelType& model) :
-            rsvd_(rsvd), index_(index), X_(X), solver_(model, rsvd->tolerance_, rsvd->max_iter_, rsvd->seed_),
+        rsvd_iterator(RegularizedSVD* rsvd, int index, int rank, const DMatrix<double>& X, ModelType& model) :
+            rsvd_(rsvd), index_(index), tr_svd_(rank), X_(X), solver_(model, rsvd->tolerance_, rsvd->max_iter_, rsvd->seed_),
             model_(model) {
             // first guess of PCs set to a multivariate PCA (SVD)
 
             const auto start_svd{std::chrono::steady_clock::now()};
-            rsvd_->svd_.compute(X_);
+            tr_svd_.compute(X_);
             const auto end_svd{std::chrono::steady_clock::now()};
             std::ofstream t_svd("../fpca/results/time_svd.csv");
             t_svd  << (std::chrono::duration<double>{end_svd - start_svd}).count() << std::endl;
@@ -150,8 +153,8 @@ class RegularizedSVD<sequential, SVDType_> {
     };
    public:
     // constructors
-    RegularizedSVD(Calibration c, SVDType_ svd) : calibration_(c), svd_(svd){ };
-    RegularizedSVD(SVDType_ svd) : RegularizedSVD(Calibration::off, svd) {};
+    RegularizedSVD(Calibration c) : calibration_(c){};
+    RegularizedSVD() : RegularizedSVD(Calibration::off){};
 
     // sequentially solves \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f), up to the specified rank,
     // selecting the level of smoothing of the component according to the desired strategy
@@ -161,7 +164,7 @@ class RegularizedSVD<sequential, SVDType_> {
         scores_.resize(X.rows(), rank);
         loadings_norm_.resize(rank);
         int i = 0;
-        for (auto it = rank_one_stepper(X, model); it != rank; ++it, ++i) {
+        for (auto it = rank_one_stepper(X, rank, model); it != rank; ++it, ++i) {
             loadings_.col(i) = it.loading();
             scores_.col(i) = it.scores() * it.norm();
             loadings_norm_[i] = it.norm();
@@ -169,8 +172,8 @@ class RegularizedSVD<sequential, SVDType_> {
     }
     // iterator support
     template <typename ModelType>
-    rsvd_iterator<ModelType> rank_one_stepper(const DMatrix<double>& X, ModelType&& model) {
-        return rsvd_iterator<ModelType>(this, 0, X, model);
+    rsvd_iterator<ModelType> rank_one_stepper(const DMatrix<double>& X, int rank, ModelType&& model) {
+        return rsvd_iterator<ModelType>(this, 0, rank, X, model);
     }
     // getters
     const DMatrix<double>& scores() const { return scores_; }
@@ -197,19 +200,21 @@ class RegularizedSVD<sequential, SVDType_> {
 };
 
 // finds a rank r matrix U minimizing \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top]
-template<typename SVDType_>
-class RegularizedSVD<monolithic, SVDType_> {
+template<SVDPolicy SVDPolicy_>
+class RegularizedSVD<monolithic, SVDPolicy_> {
    public:
     // constructor
-    RegularizedSVD(SVDType_ svd) : svd_(svd){ };
+    RegularizedSVD(){};
 
     // solves \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top] retaining the first rank components
     template <typename ModelType> void compute(const DMatrix<double>& X, ModelType& model, int rank) {
 
         const auto start_chol{std::chrono::steady_clock::now()};
         // compute matrix C = \Psi^\top*\Psi + P(\lambda)
-        DMatrix<double> C = model.Psi().transpose() * model.Psi() + model.P();
-        DMatrix<double> D = C.llt().matrixL();
+
+        auto C = model.Psi().transpose() * model.Psi() + model.P();
+        Eigen::SimplicialLLT<decltype(C)> chol(C);
+        DMatrix<double> D = chol.matrixL();
         DMatrix<double> invD = D.inverse();
         const auto end_chol{std::chrono::steady_clock::now()};
 
@@ -219,16 +224,16 @@ class RegularizedSVD<monolithic, SVDType_> {
 
         const auto start_svd{std::chrono::steady_clock::now()};
         // compute SVD of X*\Psi*(D^{-1})^\top
-        svd_.compute(X * model.Psi() * invD.transpose(), Eigen::ComputeThinU | Eigen::ComputeThinV);
+        TruncatedSVD<DMatrix<double>,SVDPolicy_> tr_svd(X * model.Psi() * invD.transpose(),rank);
         const auto end_svd{std::chrono::steady_clock::now()};
         std::ofstream t_svd("../fpca/results/time_svd.csv");
         t_svd  << (std::chrono::duration<double>{end_svd - start_svd}).count() << std::endl;
         t_svd.close();
 
         // store results
-        scores_ = svd_.matrixU().leftCols(rank);
+        scores_ = tr_svd.matrixU().leftCols(rank);
         loadings_ =
-          (svd_.singularValues().head(rank).asDiagonal() * svd_.matrixV().leftCols(rank).transpose()*invD).transpose();
+          (tr_svd.singularValues().head(rank).asDiagonal() * tr_svd.matrixV().leftCols(rank).transpose()*invD).transpose();
         loadings_norm_.resize(rank);
         for (int i = 0; i < rank; ++i) {
             loadings_norm_[i] = std::sqrt(loadings_.col(i).dot(model.R0() * loadings_.col(i)));   // L^2 norm
@@ -245,66 +250,6 @@ class RegularizedSVD<monolithic, SVDType_> {
     Calibration calibration() const { return Calibration::off; }   // calibration is implicitly off
 
    private:
-    SVDType_ svd_;
-    // let E*\Sigma*F^\top the reduced (rank r) SVD of X*\Psi*(D^{1})^\top, with D^{-1} the inverse of the cholesky
-    // factor of \Psi^\top * \Psi + P(\lambda), then
-    DMatrix<double> scores_;          // matrix E in the reduced SVD of X*\Psi*(D^{-1})^\top
-    DMatrix<double> loadings_;        // \Sigma*F^\top*D^{-1} (PC functions expansion coefficients, L^2 normalized)
-    DVector<double> loadings_norm_;   // L^2 norm of estimated fields
-};
-
-// finds a rank r matrix U minimizing \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top]
-template<typename SVDType_>
-class RegularizedSVD<new_monolithic, SVDType_> {
-public:
-    // constructor
-    RegularizedSVD(SVDType_ svd) : svd_(svd){ };
-
-    // solves \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top] retaining the first rank components
-    template <typename ModelType> void compute(const DMatrix<double>& X, ModelType& model, int rank) {
-
-        const auto start_chol{std::chrono::steady_clock::now()};
-        // compute matrix C = \Psi^\top*\Psi + P(\lambda)
-        DMatrix<double> C = model.Psi().transpose() * model.Psi() + model.P();
-        RandomizedEVD<DMatrix<double>,IterationPolicy::BlockKrylovIterations> evd(C,std::floor(C.rows()/10),1e-1,fdapde::random_seed);
-
-        DMatrix<double> U = X*model.Psi()*evd.matrixU()*evd.eigenValues().cwiseInverse().asDiagonal()*evd.matrixU().transpose();
-        const auto end_chol{std::chrono::steady_clock::now()};
-        std::ofstream t_chol("../fpca/results/time_other.csv");
-        t_chol << (std::chrono::duration<double>{end_chol - start_chol}).count() << std::endl;
-        t_chol.close();
-        const auto start_svd{std::chrono::steady_clock::now()};
-
-        std::cout << "Rank: " <<  evd.rank() << std::endl;
-
-        // compute SVD of X*\Psi*(D^{-1})^\top
-        svd_.compute(U);
-        const auto end_svd{std::chrono::steady_clock::now()};
-        std::ofstream t_svd("../fpca/results/time_svd.csv");
-        t_svd  << (std::chrono::duration<double>{end_svd - start_svd}).count() << std::endl;
-        t_svd.close();
-
-        // store results
-        scores_ = svd_.matrixU().leftCols(rank);
-        loadings_ =
-                (svd_.singularValues().head(rank).asDiagonal() * svd_.matrixV().leftCols(rank).transpose()).transpose();
-        loadings_norm_.resize(rank);
-        for (int i = 0; i < rank; ++i) {
-            loadings_norm_[i] = std::sqrt(loadings_.col(i).dot(model.R0() * loadings_.col(i)));   // L^2 norm
-            loadings_.col(i) = loadings_.col(i) / loadings_norm_[i];
-        }
-        scores_ = scores_.array().rowwise() * loadings_norm_.transpose().array();
-        return;
-    }
-    // getters
-    const DMatrix<double>& scores() const { return scores_; }
-    const DMatrix<double>& loadings() const { return loadings_; }
-
-    const DVector<double>& loadings_norm() const { return loadings_norm_; }
-    Calibration calibration() const { return Calibration::off; }   // calibration is implicitly off
-
-private:
-    SVDType_ svd_;
     // let E*\Sigma*F^\top the reduced (rank r) SVD of X*\Psi*(D^{1})^\top, with D^{-1} the inverse of the cholesky
     // factor of \Psi^\top * \Psi + P(\lambda), then
     DMatrix<double> scores_;          // matrix E in the reduced SVD of X*\Psi*(D^{-1})^\top

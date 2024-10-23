@@ -28,7 +28,6 @@ namespace fdapde {
 
 // supported resolution strategies
 struct monolithic {};
-struct new_monolithic{};
 struct iterative {};
 struct sequential {};
   
