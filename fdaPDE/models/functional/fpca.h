@@ -40,13 +40,14 @@ class FPCA : public FunctionalBase<FPCA<RegularizationType_>, RegularizationType
 
     struct SolverType__ {    // type erased solver strategy
         using This_ = FPCA<RegularizationType_>;
-        template <typename T> using fn_ptrs = mem_fn_ptrs<&T::template compute<This_>, &T::loadings, &T::scores>;
+        template <typename T> using fn_ptrs = mem_fn_ptrs<&T::template compute<This_>, &T::loadings, &T::scores, &T::selected_lambdas>;
 
         void compute(const DMatrix<double>& X, This_& model, int rank) {
             invoke<void, 0>(*this, X, model, rank);
         }
         decltype(auto) loadings() const { return invoke<const DMatrix<double>&, 1>(*this);}
         decltype(auto) scores()   const { return invoke<const DMatrix<double>&, 2>(*this);}
+        decltype(auto) selected_lambdas()   const { return invoke<const std::vector<DVector<double>>&, 3>(*this);}
     };
 
     using SolverType = fdapde::erase<heap_storage, SolverType__>;
@@ -72,6 +73,7 @@ class FPCA : public FunctionalBase<FPCA<RegularizationType_>, RegularizationType
     // getters
     const DMatrix<double>& loadings() const { return solver_.loadings(); }
     const DMatrix<double>& scores() const { return solver_.scores(); }
+    const std::vector<DVector<double>>& selected_lambdas() const { return solver_.selected_lambdas(); }
     // setters
     void set_npc(int n_pc) { n_pc_ = n_pc; }
     template <typename SolverType_> void set_solver(SolverType_&& solver) { solver_ = solver; }
