@@ -23,9 +23,7 @@
 #include <Eigen/SparseCholesky>
 
 #include "fdaPDE/core/fdaPDE/linear_algebra.h"
-using fdapde::core::TruncatedSVD;
-using fdapde::core::SVDPolicy;
-using fdapde::core::FSPAI;
+using fdapde::core::RSVD;
 
 #include "../../calibration/kfold_cv.h"
 #include "../../calibration/symbols.h"
@@ -47,12 +45,12 @@ namespace models {
 
 // Let X be a data matrix made of noisy and discrete measurements of smooth functions sampled from a random field
 // \mathcal{X}. RegularizedSVD implements the computation of a low-rank approximation of X using some regularizing term
-template <typename SolutionPolicy_, SVDPolicy SVDPolicy_> class RegularizedSVD;
+template <typename SolutionPolicy_> class RegularizedSVD;
 
 // Finds a low-rank approximation of X while penalizing for the eigenfunctions of \mathcal{X} by sequentially solving
 // \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f), up to a desired rank
-template<SVDPolicy SVDPolicy_>
-class RegularizedSVD<sequential, SVDPolicy_> {
+template<>
+class RegularizedSVD<sequential> {
    private:
     Calibration calibration_;    // PC function's smoothing parameter selection strategy
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
@@ -78,13 +76,13 @@ class RegularizedSVD<sequential, SVDPolicy_> {
         int index_;                               // current rank
         DMatrix<double> X_;                       // deflated data
         PowerIteration<ModelType> solver_;        // rank-one step solver
-        TruncatedSVD<DMatrix<double>,SVDPolicy_> tr_svd_;   // thin monolithic Singular Value Decomposition (not regularized)
+        RSVD<DMatrix<double>> svd_;   // Randomized Singular Value Decomposition (not regularized)(truncated)
         ModelType& model_;
 
         // rank-one step: \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f). calibration of \lambda
         // dispatched to desired strategy
         void rank_one_step() {
-            DVector<double> f0 = tr_svd_.matrixV().col(index_);
+            DVector<double> f0 = svd_.matrixV().col(index_);
             // select optimal smoothing level according to requested calibration strategy
             DVector<double> optimal_lambda;
             switch (rsvd_->calibration_) {
@@ -128,12 +126,11 @@ class RegularizedSVD<sequential, SVDPolicy_> {
        public:
         // constructor
         rsvd_iterator(RegularizedSVD* rsvd, int index, int rank, const DMatrix<double>& X, ModelType& model) :
-            rsvd_(rsvd), index_(index), tr_svd_(rank), X_(X), solver_(model, rsvd->tolerance_, rsvd->max_iter_, rsvd->seed_),
+            rsvd_(rsvd), index_(index), X_(X), solver_(model, rsvd->tolerance_, rsvd->max_iter_, rsvd->seed_),
             model_(model) {
             // first guess of PCs set to a multivariate PCA (SVD)
-
             const auto start_svd{std::chrono::steady_clock::now()};
-            tr_svd_.compute(X_);
+            svd_.compute(X_,rank);
             const auto end_svd{std::chrono::steady_clock::now()};
             std::ofstream t_svd("results/time_svd.csv");
             t_svd  << (std::chrono::duration<double>{end_svd - start_svd}).count() << std::endl;
@@ -207,57 +204,67 @@ class RegularizedSVD<sequential, SVDPolicy_> {
 };
 
 // finds a rank r matrix U minimizing \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top]
-template<SVDPolicy SVDPolicy_>
-class RegularizedSVD<monolithic, SVDPolicy_> {
+template<>
+class RegularizedSVD<monolithic> {
 private:
     Calibration calibration_;    // PC function's smoothing parameter selection strategy
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
     DMatrix<double> lambda_grid_;
     int seed_ = fdapde::random_seed;
 
-    /*
     template <typename ModelType>
-    struct monolithic_internal_solver{
+    struct internal_solver{
     private:
-        friend RegularizedSVD;
-        RegularizedSVD* rsvd_;
+        const DMatrix<double> &X_;
         ModelType& model_;
-
+        double lambda_;
         //Solution to the generalized eigenvalue problem
         Eigen::SelfAdjointEigenSolver<DMatrix<double>> evd_;
-        DMatrix<double> V_; //generalized eigenvectors of Psi^T*Psi
-
+        Eigen::SimplicialLLT<SpMatrix<double>> chol_; //cholesky of Psi^T*Psi
+        DMatrix<double> invL_; // inverse of the cholesky factor
         //Solution to the fpca problem
-        TruncatedSVD<DMatrix<double>,SVDPolicy_> svd_;
+        RSVD<DMatrix<double>> svd_; //here we use a randomized algorithm
         DMatrix<double> invD_; //factorization of (Psi^T*Psi+lambda P)^(-1) for the given lambda
-
     public:
-        monolithic_internal_solver(RegularizedSVD* rsvd, ModelType& model) :
-                rsvd_(rsvd), model_(model) {
+        internal_solver(const DMatrix<double> &X, ModelType& model) : X_(X), model_(model) {
             //Genelarized eigenvalue problem: P*V = (Psi^T*Psi)*V*Lambda
-            Eigen::SimplicialLLT<SpMatrix<double>> chol_B(model.Psi().transpose()*model.Psi());
-            DMatrix<double> invL = chol_B.matrixL().solve(DMatrix<double>::Identity(model.n_basis(),model.n_basis()))*chol_B.permutationP().toDenseMatrix().cast<double>();
-            evd_.compute(invL*model.P(DVector<double>::Ones(1))*invL.transpose());
-            V_ = invL.transpose()*evd_.eigenvectors();
+            chol_.compute(model.Psi().transpose()*model.Psi());
+            invL_ = chol_.matrixL().solve(DMatrix<double>::Identity(model.n_basis(),model.n_basis()))*chol_.permutationP().toDenseMatrix().cast<double>();
+            evd_.compute(invL_*model.P(DVector<double>::Ones(1))*invL_.transpose());
         };
-        void compute(const DMatrix<double>& X, int rank, double lambda){
+        void compute(const core::BinaryVector<Dynamic>& train_set, int rank, double lambda){
+            lambda_ = lambda;
             // assemble the factorization of (Psi^T*Psi+lambda P)^(-1) for the given lambda
-            invD_ = (DVector<double>::Ones(invD_.cols())+lambda*evd_.eigenvalues()).unaryExpr([](double x){ return 1/std::sqrt(x);}).asDiagonal()*V_.transpose();
+            DMatrix<double> V = invL_.transpose()*evd_.eigenvectors();
+            invD_ = (DVector<double>::Ones(model_.n_basis())+lambda_*evd_.eigenvalues()).unaryExpr([](double x){ return 1/std::sqrt(x);}).asDiagonal()*V.transpose();
             // compute SVD of X*\Psi*(D^{-1})^\top
-            svd_.compute(X*model_.Psi()*invD_.transpose(),rank);
+            svd_.compute(train_set.repeat(1, X_.cols()).select(X_)*model_.Psi()*invD_.transpose(),rank);
             return;
         }
         //gcv score
         double gcv(){
-            DMatrix<double> S_m = model.Psi()*invD_*svd_.matrixV();
+            DMatrix<double> S_m = model_.Psi()*invD_.transpose()*svd_.matrixV();
+            //DMatrix<double> tmp = svd_.matrixV().transpose()*(DMatrix<double>::Identity(model_.n_basis(),model_.n_basis()) - invD_*(model_.Psi().transpose()*model_.Psi())*invD_.transpose())*svd_.matrixV();
+            S_m = S_m*S_m.transpose();
+
+            double gcv_score = X_.cols()/std::pow(X_.cols()-S_m.trace(),2)*
+                               (X_*(DMatrix<double>::Identity(X_.cols(), X_.cols()) - S_m)).squaredNorm();
+
             //Computation of the GCV index
-            return X.cols()/std::pow(X.cols()-(S_m*S_m.transpose()).trace(),2)*
-                   (X*(DMatrix<double>::Identity(X.cols(), X.cols()) + S_m*(DMatrix<double>::Identity(rank, rank)-S_m.transpose()*S_m)*S_m.transpose())).squaredNorm();
+            return gcv_score;
         }
-        const DMatrix<double>& scores() const { return svd_.matrixU(); }
-        const DMatrix<double>& loadings() const { return (svd_.singularValues().asDiagonal()*svd_.matrixV().transpose()*invD_).transpose(); }
+        double reconstruction_error(const core::BinaryVector<Dynamic>& test_set){
+            DMatrix<double> S_m = model_.Psi()*invD_.transpose()*svd_.matrixV();
+            S_m = S_m*S_m.transpose();
+            DMatrix<double> X_test = test_set.repeat(1, X_.cols()).select(X_);
+
+            return (X_test*
+                    (DMatrix<double>::Identity(X_test.cols(), X_test.cols()) - S_m)).squaredNorm() /
+                   (X_test.rows() * X_test.cols());
+        }
+        const DMatrix<double> scores() const { return svd_.matrixU(); }
+        const DMatrix<double> loadings() const { return (svd_.singularValues().asDiagonal()*svd_.matrixV().transpose()*invD_).transpose(); }
     };
-    */
 
 public:
     // constructors
@@ -268,10 +275,7 @@ public:
     template <typename ModelType> void compute(const DMatrix<double>& X, ModelType& model, int rank) {
         //Calibration
         DVector<double> optimal_lambda;
-        //Genelarized eigenvalue problem: P*V = (Psi^T*Psi)*V*Lambda
-        Eigen::SimplicialLLT<SpMatrix<double>> chol_B(model.Psi().transpose()*model.Psi());
-        DMatrix<double> invL = chol_B.matrixL().solve(DMatrix<double>::Identity(model.n_basis(),model.n_basis()))*chol_B.permutationP().toDenseMatrix().cast<double>();
-        Eigen::SelfAdjointEigenSolver<DMatrix<double>> evd_A(invL*model.P(DVector<double>::Ones(1))*invL.transpose());
+        auto mono_solver = internal_solver(X,model);
 
         switch (calibration_) {
             case Calibration::off: {
@@ -280,40 +284,21 @@ public:
             case Calibration::gcv: {
                 // select \lambda minimizing the GCV index
                 ScalarField<Dynamic> gcv([&](const DVector<double>& lambda) -> double {
-                    DMatrix<double> invD = invL.transpose()*evd_A.eigenvectors();
-                    invD = (DVector<double>::Ones(invD.cols())+optimal_lambda(0)*evd_A.eigenvalues()).unaryExpr([](double x){ return 1/std::sqrt(x);}).asDiagonal()*(invL.transpose()*evd_A.eigenvectors()).transpose();
-
-                    //compute SVD of X*\Psi*(D^{-1})^\top
-                    TruncatedSVD<DMatrix<double>,SVDPolicy_> tr_svd(X*model.Psi()*invD.transpose(),rank);
-
-                    DMatrix<double> S_m = model.Psi()*invD*tr_svd.matrixV();
-                    //Computation of the GCV index
-                    return X.cols()/std::pow(X.cols()-(S_m*S_m.transpose()).trace(),2)*
-                    (X*(DMatrix<double>::Identity(X.cols(), X.cols()) + S_m*(DMatrix<double>::Identity(rank, rank)-S_m.transpose()*S_m)*S_m.transpose())).squaredNorm();
+                    mono_solver.compute(core::BinaryVector<Dynamic>::Ones(X.rows()),rank,lambda(0));
+                    return mono_solver.gcv();
                 });
                 optimal_lambda = core::Grid<Dynamic> {}.optimize(gcv, lambda_grid_);
             } break;
             case Calibration::kcv:{
                 // select \lambda minimizing the reconstruction error in cross-validation
                 auto cv_score = [&](
-                        const DVector<double>& lambda, const core::BinaryVector<Dynamic>& train_set,
+                        const DVector<double>& lambda,
+                        const core::BinaryVector<Dynamic>& train_set,
                         const core::BinaryVector<Dynamic>& test_set) -> double {
-
-                    DMatrix<double> C = model.Psi().transpose() * model.Psi() + model.P(lambda);
-                    Eigen::LLT<decltype(C)> chol(C);
-
-                    DMatrix<double> invD = chol.matrixL().solve(DMatrix<double>::Identity(C.rows(),C.cols()));
-
-                    // compute SVD of X*\Psi*(D^{-1})^\top
-                    TruncatedSVD<DMatrix<double>,SVDPolicy_> tr_svd(train_set.repeat(1, X.cols()).select(X) * model.Psi() * invD.transpose(),rank);
-                    DMatrix<double> S_m = model.Psi()*invD*tr_svd.matrixV();
-
-                    // reconstruction error on test set: \norm{X_test * (I - fn*fn^\top/J)}_F/n_test, with
-                    // J = \norm{f_n}_2^2 + f^\top*P(\lambda)*f (PS: the division of f^\top*P(\lambda)*f by
-                    // \norm{f}_{L^2} is necessary to obtain J as expected)
-                    return (test_set.repeat(1, X.cols()).select(X)*
-                            (DMatrix<double>::Identity(X.cols(), X.cols()) - S_m*S_m.transpose())).squaredNorm() /
-                            (test_set.count() * X.cols());
+                    //fitting on the training set
+                    mono_solver.compute(train_set,rank,lambda(0));
+                    //evaluate error on the test set
+                    return mono_solver.reconstruction_error(test_set);
                 };
                 optimal_lambda =
                         calibration::KCV{n_folds_, seed_, false}.fit(model, lambda_grid_, cv_score);
@@ -323,17 +308,12 @@ public:
 
         //Run using the optimal lambda
         model.set_lambda(selected_lambdas_.back());
-
-        DMatrix<double> invD = invL.transpose()*evd_A.eigenvectors();
-        invD = (DVector<double>::Ones(invD.cols())+optimal_lambda(0)*evd_A.eigenvalues()).unaryExpr([](double x){ return 1/std::sqrt(x);}).asDiagonal()*(invL.transpose()*evd_A.eigenvectors()).transpose();
-
-        // compute SVD of X*\Psi*(D^{-1})^\top
-        TruncatedSVD<DMatrix<double>,SVDPolicy_> tr_svd(X*model.Psi()*invD.transpose(),rank);
+        //train on all the data
+        mono_solver.compute(core::BinaryVector<Dynamic>::Ones(X.rows()),rank,optimal_lambda(0));
 
         // store results
-        scores_ = tr_svd.matrixU();
-        loadings_ =
-          (tr_svd.singularValues().head(rank).asDiagonal() * tr_svd.matrixV().leftCols(rank).transpose()*invD).transpose();
+        scores_ = mono_solver.scores();
+        loadings_ = mono_solver.loadings();
         loadings_norm_.resize(rank);
         for (int i = 0; i < rank; ++i) {
             loadings_norm_[i] = std::sqrt(loadings_.col(i).dot(model.R0() * loadings_.col(i)));   // L^2 norm
@@ -367,8 +347,8 @@ public:
 };
 
 //Exploiting sparsity
-template<SVDPolicy SVDPolicy_>
-class RegularizedSVD<monolithic_spchol, SVDPolicy_> {
+template<>
+class RegularizedSVD<monolithic_spchol> {
 public:
     // constructor
     RegularizedSVD(){};
@@ -422,7 +402,7 @@ public:
 
         const auto start_svd{std::chrono::steady_clock::now()};
         // compute SVD of X*\Psi*(D^{-1})^\top
-        TruncatedSVD<DMatrix<double>,SVDPolicy_> tr_svd(X * model.Psi() * invD.transpose(),rank);
+        RSVD<DMatrix<double>> tr_svd(X * model.Psi() * invD.transpose(),rank);
         const auto end_svd{std::chrono::steady_clock::now()};
         std::ofstream t_svd("results/time_svd.csv");
         t_svd  << (std::chrono::duration<double>{end_svd - start_svd}).count() << std::endl;
@@ -438,7 +418,6 @@ public:
             loadings_.col(i) = loadings_.col(i) / loadings_norm_[i];
         }
         scores_ = scores_.array().rowwise() * loadings_norm_.transpose().array();
-
         return;
     }
     // getters
