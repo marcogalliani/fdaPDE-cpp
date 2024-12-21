@@ -85,10 +85,33 @@ namespace testing {
   // utility to import .csv files
   template <typename T>
   DMatrix<T> read_csv(const std::string& file_name) {
-    CSVReader<T> reader {};
-    return reader.template parse_file<Eigen::Dense>(file_name);
+      core::CSVReader<T> reader {};
+      return reader.template parse_file<Eigen::Dense>(file_name);
   }
-  
+  template <typename T>
+  void write_csv(const std::string& file_name, const DMatrix<T> &matrix){
+    // Open file for writing
+    std::ofstream file(file_name);
+    if (!file.is_open()) {
+        throw std::runtime_error("Error: Could not open file for writing!");
+    }
+    // Write the header row
+    file << "\"\""; // First header is empty
+    for (int col = 0; col < matrix.cols(); ++col) {
+        file << ",\"V" << (col + 1) << "\""; // Header names as "V1", "V2", ...
+    }
+    file << "\n";
+    // Write each row with its index
+    for (int row = 0; row < matrix.rows(); ++row) {
+        file << "\"" << (row + 1) << "\""; // Row index in quotes
+        for (int col = 0; col < matrix.cols(); ++col) {
+            file << ",\"" << std::setw(3) << matrix(row, col) << "\""; // Write elements with padding
+        }
+        file << "\n";
+    }
+    // Close the file
+    file.close();
+  }
 }}
 
 #endif // __UTILS_H__

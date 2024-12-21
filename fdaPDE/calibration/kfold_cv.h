@@ -27,12 +27,16 @@ using fdapde::core::BinaryVector;
 using fdapde::Dynamic;
 
 #include "calibration_base.h"
+#include "symbols.h"
+
+#include "fdaPDE/models/model_macros.h"
 
 namespace fdapde {
 namespace calibration {
-  
+
 // general implementation of KFold Cross Validation
-class KCV : public CalibratorBase<KCV> {
+template<KCVPolicy KCVPolicy_=row_deletion>
+class KCV : public CalibratorBase<KCV<KCVPolicy_>> {
    private:
     // algorithm's parameters
     int K_;          // number of folds
@@ -46,18 +50,19 @@ class KCV : public CalibratorBase<KCV> {
 
     // produces a bit_mask identifying the i-th fold to be supplied to the model via mask_obs
     using TrainTestPartition = std::pair<BinaryVector<Dynamic>, BinaryVector<Dynamic>>;
-    TrainTestPartition split(const BlockFrame<double, int>& data, int i) {
-        int n = data.rows();          // number of data points
+    TrainTestPartition split(const Eigen::ArrayXi& indices, int i) {
+        int n = indices.size();
         int m = std::floor(n / K_);   // number of data per fold
 
         // create test-train index sets, as function of test fold i
         BinaryVector<Dynamic> test_mask(n);
-	BinaryVector<Dynamic> train_mask(n);
-        for (int j = 0; j < n; ++j) {
+	    BinaryVector<Dynamic> train_mask(n);
+
+        for(int j=0; j<n;j++){
             if (j >= m * i && j < m * (i + 1)) {
-                test_mask.set(j);
+                test_mask.set(indices[j]);
             } else {
-                train_mask.set(j);
+                train_mask.set(indices[j]);
             }
         }
         return std::make_pair(train_mask, test_mask);
@@ -75,14 +80,25 @@ class KCV : public CalibratorBase<KCV> {
         fdapde_assert(lambdas.cols() == 1 || lambdas.cols() == 2);
         // reserve space for CV scores
         scores_.resize(K_, lambdas.rows());
-        if (shuffle_) {   // perform a first shuffling of the data if required
-            model.set_data(model.data().shuffle(seed_));
-	}
+
+        int n;
+        if constexpr (KCVPolicy_==row_deletion){
+            n = model.data().rows();
+        }else{
+            n = model.n_locs();
+        }
+        Eigen::ArrayXi indices = Eigen::ArrayXi::LinSpaced(n,0,n-1);
+
+        if(shuffle_){
+            std::mt19937 rng(seed_);
+            std::shuffle(indices.data(),indices.data()+n,rng);
+        }
+
         // cycle over all tuning parameters
         for (int j = 0; j < lambdas.rows(); ++j) {
             for (int fold = 0; fold < K_; ++fold) {   // fixed a tuning parameter, cycle over all data splits
                 // compute train-test partition and evaluate CV score
-                TrainTestPartition partition_mask = split(model.data(), fold);
+                TrainTestPartition partition_mask = split(indices, fold);
                 scores_.coeffRef(fold, j) = cv_score(lambdas.row(j), partition_mask.first, partition_mask.second);
             }
         }

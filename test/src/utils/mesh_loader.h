@@ -19,7 +19,7 @@
 
 #include <fdaPDE/geometry.h>
 #include <fdaPDE/utils.h>
-#include <gtest/gtest.h>   // testing framework
+//#include <gtest/gtest.h>   // testing framework
 #include <random>
 using fdapde::core::CSVReader;
 
@@ -27,8 +27,7 @@ namespace fdapde {
 namespace testing {
 
 const std::string MESH_PATH = "../data/mesh/";
-using MESH_TYPE_LIST = ::testing::Types<
-  core::Triangulation<2,2>/*, core::Triangulation<2,3>, core::Triangulation<3,3>*//*, core::NetworkMesh*/>;
+//using MESH_TYPE_LIST = ::testing::Types<core::Triangulation<2,2>/*, core::Triangulation<2,3>, core::Triangulation<3,3>*//*, core::NetworkMesh*/>;
 
 // selects sample mesh depending on the dimensionality of the problem
 //     * 1.5D: 204  2D points, 559   elements, 559   edges. /test/data/mesh/linear_newtwork/*.csv
