@@ -88,7 +88,7 @@ class RegularizedSVD<sequential,SVDType> {
             DVector<double> f0 = svd_.matrixV().col(index_);
             // select optimal smoothing level according to requested calibration strategy
             DVector<double> optimal_lambda;
-            const auto start{std::chrono::steady_clock::now()};
+
             switch (rsvd_->calibration_){
             case Calibration::off: {
                 // find vectors s,f minimizing \norm_F{Y - s^T*f}^2 + (s^T*s)*P(f) fixed \lambda
@@ -122,19 +122,10 @@ class RegularizedSVD<sequential,SVDType> {
                   calibration::KCV {rsvd_->n_folds_, rsvd_->seed_}.fit(model_, rsvd_->lambda_grid_, cv_score);
             } break;
             }
-            const auto end{std::chrono::steady_clock::now()};
-
-            DMatrix<double> calibration_time = DMatrix<double>::Constant(1,1,(std::chrono::duration<double>{end - start}).count());
-            write_csv("tmp/calibration_time.csv",calibration_time);
-
-            const auto start_fit{std::chrono::steady_clock::now()};
             solver_.compute(X_, optimal_lambda, f0);
             X_ -= solver_.s() * solver_.fn().transpose() * solver_.f_norm();   // X <- X - s*f_n^\top (deflation step)
             rsvd_->selected_lambdas_.push_back(optimal_lambda);                // store optimal smoothing level
-            const auto end_fit{std::chrono::steady_clock::now()};
 
-            DMatrix<double> fit_time = DMatrix<double>::Constant(1,1,(std::chrono::duration<double>{end_fit - start_fit}).count());
-            write_csv("tmp/fit_time.csv",fit_time);
 
             return;
         }
@@ -151,8 +142,8 @@ class RegularizedSVD<sequential,SVDType> {
                 svd_.compute(X_,Eigen::ComputeThinU | Eigen::ComputeThinV);
             }
             const auto end{std::chrono::steady_clock::now()};
-            std::ofstream svd_time("tmp/svd_time.csv");
-            svd_time  << '"' << (std::chrono::duration<double>{end - start}).count() << '"' << std::endl;
+            std::ofstream svd_time("results/svd_time.csv");
+            svd_time  << (std::chrono::duration<double>{end - start}).count() << std::endl;
             svd_time.close();
 
             solver_.init();   // initialize power iteration solver
@@ -241,19 +232,14 @@ public:
         DVector<double> optimal_lambda;
         if (calibration_ == Calibration::off){
             optimal_lambda = model.lambda();
-            Eigen::LLT<DMatrix<double>> chol(model.Psi().transpose()*model.Psi()+model.P(optimal_lambda));
-            DMatrix<double> invD = chol.matrixL().solve(DMatrix<double>::Identity(model.n_basis(),model.n_basis()));
+            FixedLambdaMonolithicSolver<ModelType,SVDType> mono_solver(model, seed_);
 
-            SVDType svd;
-            svd.compute(X*model.Psi()*invD.transpose(),rank);
-            if constexpr (is_rand_svd<SVDType>{}){
-                svd.compute(X*model.Psi()*invD.transpose(),rank);
-            } else{
-                svd.compute(X*model.Psi()*invD.transpose(),Eigen::ComputeThinU | Eigen::ComputeThinV);
-            }
+            mono_solver.init(optimal_lambda);
+            mono_solver.compute(X,rank,optimal_lambda);
+
             // store results
-            scores_ = svd.matrixU().leftCols(rank);
-            loadings_ = (svd.singularValues().head(rank).asDiagonal()*svd.matrixV().leftCols(rank).transpose()*invD).transpose();
+            scores_=mono_solver.scores();
+            loadings_=mono_solver.loadings();
             loadings_norm_.resize(rank);
             for (int i = 0; i < rank; ++i) {
                 loadings_norm_[i] = std::sqrt(loadings_.col(i).dot(model.R0() * loadings_.col(i)));   // L^2 norm
@@ -269,7 +255,7 @@ public:
             case Calibration::gcv: {
                 // select \lambda minimizing the GCV index
                 ScalarField<Dynamic> gcv([&](const DVector<double>& lambda) -> double {
-                    mono_solver.compute(X,rank,lambda(0));
+                    mono_solver.compute(X,rank,lambda);
                     return mono_solver.gcv();
                 });
                 optimal_lambda = core::Grid<Dynamic> {}.optimize(gcv, lambda_grid_);
@@ -281,7 +267,7 @@ public:
                         const core::BinaryVector<Dynamic>& train_set,
                         const core::BinaryVector<Dynamic>& test_set) -> double {
                     //fitting on the training set
-                    mono_solver.compute(train_set.repeat(1,X.cols()).select(X),rank,lambda(0));
+                    mono_solver.compute(train_set.repeat(1,X.cols()).select(X),rank,lambda);
                     //evaluate the error on the test set
                     return mono_solver.reconstruction_error(test_set.repeat(1,X.cols()).select(X));
                 };
@@ -299,7 +285,7 @@ public:
 
         //train on all the data
         const auto start_fit{std::chrono::steady_clock::now()};
-        mono_solver.compute(X,rank,optimal_lambda(0));
+        mono_solver.compute(X,rank,optimal_lambda);
         const auto end_fit{std::chrono::steady_clock::now()};
 
         DMatrix<double> fit_time = DMatrix<double>::Constant(1,1,(std::chrono::duration<double>{end_fit - start_fit}).count());
@@ -444,14 +430,13 @@ public:
         for(int k = 1; k <= rank; ++k){
             //Majorization-Minimization scheme
             while(rec_err > tolerance_){
-                //init
+                //Sequential fPCA
                 DMatrix<double> X_imputed = W.select(X,0)+(!W.array()).select(U_old*model.Psi().transpose(),0);
                 if constexpr (is_rand_svd<SVDType>{}){
                     svd.compute(X_imputed,rank);
                 } else{
                     svd.compute(X_imputed,Eigen::ComputeThinU | Eigen::ComputeThinV);
                 }
-                //sequential estimates
                 for(int index=0; index<k; index++){
                     //fit on the imputed data
                     solver.compute(X_imputed,lambda_,svd.matrixV().col(index));
