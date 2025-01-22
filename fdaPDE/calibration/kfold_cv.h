@@ -117,12 +117,11 @@ class KCV : public CalibratorBase<KCV<KCVPolicy_>> {
             avg_scores_[j] = avg_score;
             std_scores_[j] = std_score;
         }
-
         // store optimal lambda according to given metric F
         Eigen::Index opt_score;
         avg_scores_.minCoeff(&opt_score);
         optimum_ = lambdas.row(opt_score);
-	return optimum_;
+        return optimum_;
     }
 
     // getters

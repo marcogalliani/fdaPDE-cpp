@@ -42,7 +42,7 @@ namespace testing {
 
   // test if two matrices are equal testing the relative error of the infinte norm of their difference
   inline bool almost_equal(const DMatrix<double>& op1, const DMatrix<double>& op2, double epsilon){
-    return (op1-op2).lpNorm<Eigen::Infinity>() < epsilon ||
+      return (op1-op2).lpNorm<Eigen::Infinity>() < epsilon ||
       (op1-op2).lpNorm<Eigen::Infinity>() < (std::max(op1.lpNorm<Eigen::Infinity>(), op2.lpNorm<Eigen::Infinity>()) * epsilon);
   }
   inline bool almost_equal(const DMatrix<double>& op1, const DMatrix<double>& op2){

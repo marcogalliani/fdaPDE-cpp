@@ -44,7 +44,7 @@ using fdapde::testing::almost_equal;
 using fdapde::testing::MeshLoader;
 using fdapde::testing::read_csv;
 using fdapde::testing::read_mtx;
-/*
+
 // test 1
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations = nodes
@@ -53,41 +53,6 @@ using fdapde::testing::read_mtx;
 //    order FE:     1
 //    missing data: no
 //    solver: sequential (power iteration)
-TEST(fpca_test, laplacian_samplingatnodes_sequential) {
-    // define domain
-    MeshLoader<Triangulation<2, 2>> domain("unit_square");
-    // import data from files
-    DMatrix<double> y = read_csv<double>("../data/models/fpca/2D_test1/y.csv");
-    // define regularizing PDE
-    auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
-    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> pde(domain.mesh, L, u);
-    // define model
-    double lambda_D = 1e-2;
-
-    RSI<DMatrix<double>,fdapde::core::extended> RandSVD(3,3);
-
-    FPCA<SpaceOnly> model(pde, Sampling::mesh_nodes,
-                          RegularizedSVD<fdapde::sequential, RSI<DMatrix<double>,fdapde::core::extended>>(RandSVD));
-    model.set_lambda_D(lambda_D);
-    // set model's data
-    BlockFrame<double, int> df;
-    df.insert(OBSERVATIONS_BLK, y);
-    model.set_data(df);
-    // solve FPCA problem
-    model.init();
-    model.solve();
-
-    // compute distances
-    DMatrix<double> exp_loadings = read_mtx<double>("../data/models/fpca/2D_test1/loadings_seq.mtx");
-    double err = (model.Psi() * model.loadings() - exp_loadings).lpNorm<Eigen::Infinity>();
-
-    std::cout << err << std::endl;
-
-    // test correctness
-    EXPECT_TRUE(almost_equal(model.Psi() * model.loadings(), "../data/models/fpca/2D_test1/loadings_seq.mtx"));
-    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test1/scores_seq.mtx"));
-}
 
 
 // test 2
@@ -98,43 +63,34 @@ TEST(fpca_test, laplacian_samplingatnodes_sequential) {
 //    order FE:     1
 //    missing data: no
 //    solver: monolithic (rsvd)
-TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
-    // define domain
-    MeshLoader<Triangulation<2, 2>> domain("unit_square");
-    // import data from files
-    DMatrix<double> y = read_csv<double>("../data/models/fpca/2D_test1/y.csv");
-    // define regularizing PDE
-    auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
-    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
-    // define model
-    double lambda_D = 1e-2;
-
-    RSI<DMatrix<double>,fdapde::core::extended> RandSVD(3,3);
-    Eigen::JacobiSVD<DMatrix<double>> exact_svd(0,0,Eigen::ComputeThinU | Eigen::ComputeThinV);
-
-    FPCA<SpaceOnly>
-            model(problem, Sampling::mesh_nodes,
-                  RegularizedSVD<fdapde::monolithic, Eigen::JacobiSVD<DMatrix<double>>>(exact_svd));
-    model.set_lambda_D(lambda_D);
-    // set model's data
-    BlockFrame<double, int> df;
-    df.insert(OBSERVATIONS_BLK, y);
-    model.set_data(df);
-    // solve FPCA problem
-    model.init();
-    model.solve();
-
-    // compute distances
-    DMatrix<double> exp_loadings = read_mtx<double>("../data/models/fpca/2D_test1/loadings_mon.mtx");
-    double err = ((model.Psi() * model.loadings()).cwiseAbs() - exp_loadings.cwiseAbs()).lpNorm<Eigen::Infinity>();
-    std::cout << err << std::endl;
-
-    // test correctness
-    EXPECT_TRUE(almost_equal(model.Psi() * model.loadings(), "../data/models/fpca/2D_test1/loadings_mon.mtx"));
-    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test1/scores_mon.mtx"  ));
-}
-*/
+//TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
+//    // define domain
+//    MeshLoader<Triangulation<2, 2>> domain("unit_square");
+//    // import data from files
+//    DMatrix<double> y = read_csv<double>("../data/models/fpca/2D_test1/y.csv");
+//    // define regularizing PDE
+//    auto L = -laplacian<FEM>();
+//    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
+//    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
+//    // define model
+//    double lambda_D = 1e-2;
+//
+//    RegularizedSVD<fdapde::monolithic,Eigen::JacobiSVD<DMatrix<double>>> rsvd;
+//
+//    FPCA<SpaceOnly> model(problem, Sampling::mesh_nodes,rsvd);
+//    model.set_lambda_D(lambda_D);
+//    // set model's data
+//    BlockFrame<double, int> df;
+//    df.insert(OBSERVATIONS_BLK, y);
+//    model.set_data(df);
+//    // solve FPCA problem
+//    model.init();
+//    model.solve();
+//
+//    // test correctness
+//    EXPECT_TRUE(almost_equal(model.Psi() * model.loadings(), "../data/models/fpca/2D_test1/loadings_mon.mtx"));
+//    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test1/scores_mon.mtx"  ));
+//}
 
 // test 3
 //    domain:       unit square [1,1] x [1,1]
@@ -144,34 +100,7 @@ TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
 //    order FE:     1
 //    missing data: no
 //    solver: sequential (power iteration) + GCV \lambda selection
-TEST(fpca_test, laplacian_samplingatlocations_sequential_gcv) {
-    // define domain
-    MeshLoader<Triangulation<2, 2>> domain("unit_square");
-    // import data from files
-    DMatrix<double> locs = read_csv<double>("../data/models/fpca/2D_test2/locs.csv");
-    DMatrix<double> y    = read_csv<double>("../data/models/fpca/2D_test2/y.csv");
-    // define regularizing PDE
-    auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
-    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> pde(domain.mesh, L, u);
 
-    // define model
-    RegularizedSVD<fdapde::sequential> rsvd(Calibration::gcv);
-    rsvd.set_lambda(lambda_grid);
-    rsvd.set_seed(78965);   // for reproducibility purposes in testing
-    FPCA<SpaceOnly> model(pde, Sampling::pointwise, rsvd);
-    model.set_spatial_locations(locs);
-    // set model's data
-    BlockFrame<double, int> df;
-    df.insert(OBSERVATIONS_BLK, y);
-    model.set_data(df);
-    // solve FPCA problem
-    model.init();
-    model.solve();
-    // test correctness
-    EXPECT_TRUE(almost_equal(model.Psi() * model.loadings(), "../data/models/fpca/2D_test2/loadings.mtx"));
-    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test2/scores.mtx"  ));
-}
 
 // test 4
 //    domain:       unit square [1,1] x [1,1]
@@ -181,36 +110,7 @@ TEST(fpca_test, laplacian_samplingatlocations_sequential_gcv) {
 //    order FE:     1
 //    missing data: no
 //    solver: sequential (power iteration) + KCV \lambda selection
-TEST(fpca_test, laplacian_samplingatlocations_sequential_kcv) {
-    // define domain
-    MeshLoader<Triangulation<2, 2>> domain("unit_square");
-    // import data from files
-    DMatrix<double> locs = read_csv<double>("../data/models/fpca/2D_test3/locs.csv");
-    DMatrix<double> y    = read_csv<double>("../data/models/fpca/2D_test3/y.csv");
-    // define regularizing PDE
-    auto L = -laplacian<FEM>();
-    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
-    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
-    // grid of smoothing parameters
-    DMatrix<double> lambda_grid(20, 1);
-    for (int i = 0; i < 20; ++i) lambda_grid(i, 0) = std::pow(10, -4 + 0.1 * i);
-    // define model
-    RegularizedSVD<fdapde::sequential> rsvd(Calibration::kcv);
-    rsvd.set_lambda(lambda_grid);
-    rsvd.set_seed(12654);   // for reproducibility purposes in testing    
-    FPCA<SpaceOnly> model(problem, Sampling::pointwise, rsvd);
-    model.set_spatial_locations(locs);
-    // set model's data
-    BlockFrame<double, int> df;
-    df.insert(OBSERVATIONS_BLK, y);
-    model.set_data(df);
-    // solve FPCA problem
-    model.init();
-    model.solve();    
-    // test correctness
-    EXPECT_TRUE(almost_equal(model.Psi() * model.loadings(), "../data/models/fpca/2D_test3/loadings.mtx"));
-    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test3/scores.mtx"  ));
-}
+
 
 // test 5
 //    domain:       unit square [1,1] x [1,1]
@@ -252,7 +152,6 @@ TEST(fpca_test, laplacian_samplingatlocations_sequential_kcv) {
 
 
 
-/*
 // test 4
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations = nodes
@@ -271,7 +170,9 @@ TEST(fpca_test, laplacian_samplingatnodes_nocalibration_missingdata) {
     PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
     // define model
     double lambda_D = 1e-2;
-    FPCA<decltype(problem), SpaceOnly, GeoStatMeshNodes, NoCalibration> model(problem);
+
+    RegularizedSVD<fdapde::sequential,Eigen::JacobiSVD<DMatrix<double>>,true> rsvd;
+    FPCA<SpaceOnly> model(problem, Sampling::mesh_nodes, rsvd);
     model.set_lambda_D(lambda_D);
     // set model's data
     BlockFrame<double, int> df;
@@ -280,9 +181,10 @@ TEST(fpca_test, laplacian_samplingatnodes_nocalibration_missingdata) {
     // solve FPCA problem
     model.init();
     model.solve();
+
     // test correctness
-    EXPECT_TRUE(almost_equal(model.fitted_loadings(), "../data/models/fpca/2D_test4/loadings.mtx"));
+    EXPECT_TRUE(almost_equal(model.loadings(), "../data/models/fpca/2D_test4/loadings.mtx"));
     EXPECT_TRUE(almost_equal(model.scores(),   "../data/models/fpca/2D_test4/scores.mtx"  ));
 }
-*/
+
 
