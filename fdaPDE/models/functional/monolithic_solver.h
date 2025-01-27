@@ -43,16 +43,12 @@ public:
     void compute(const DMatrix<double> &X, int rank){
         rank_ = rank;
         // compute SVD of X*\Psi*(D^{-1})^\top
-        const auto start{std::chrono::steady_clock::now()};
         if constexpr (is_rand_svd<SVDType_>{}){
+            svd_.setSeed(seed_);
             svd_.compute(X*model_.Psi()*invD_.transpose(),rank_);
         } else{
             svd_.compute(X*model_.Psi()*invD_.transpose(),Eigen::ComputeThinU | Eigen::ComputeThinV);
         }
-        const auto end{std::chrono::steady_clock::now()};
-        std::ofstream svd_time("results/svd_time.csv");
-        svd_time << (std::chrono::duration<double>{end - start}).count() << std::endl;
-        svd_time.close();
         return;
     }
     //gcv score (has to be preceded by a call to compute())

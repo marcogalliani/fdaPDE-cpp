@@ -125,7 +125,6 @@ class RegularizedSVD<sequential,SVDType_> {
             X_ -= solver_.s() * solver_.fn().transpose() * solver_.f_norm();   // X <- X - s*f_n^\top (deflation step)
             rsvd_->selected_lambdas_.push_back(optimal_lambda);                // store optimal smoothing level
 
-
             return;
         }
        public:
@@ -134,17 +133,12 @@ class RegularizedSVD<sequential,SVDType_> {
             rsvd_(rsvd), index_(index), X_(X), solver_(model, rsvd->tolerance_, rsvd->max_iter_, rsvd->seed_),
             model_(model) {
             // first guess of PCs set to a multivariate PCA (SVD)
-            const auto start{std::chrono::steady_clock::now()};
             if constexpr (is_rand_svd<SVDType_>{}){
+                svd_.setSeed(rsvd_->seed_);
                 svd_.compute(X_,rank);
             } else{
                 svd_.compute(X_,Eigen::ComputeThinU | Eigen::ComputeThinV);
             }
-            const auto end{std::chrono::steady_clock::now()};
-            std::ofstream svd_time("results/svd_time.csv");
-            svd_time  << (std::chrono::duration<double>{end - start}).count() << std::endl;
-            svd_time.close();
-
             solver_.init();   // initialize power iteration solver
         };
         rsvd_iterator& operator++() {
@@ -283,6 +277,7 @@ public:
     Calibration calibration() const { return calibration_; }
 
     //setters
+    void set_seed(int seed) { seed_ = seed; }
     RegularizedSVD& set_lambda(const DVector<double>& lambda_grid) {
         fdapde_assert(calibration_ != Calibration::off);
         lambda_grid_ = lambda_grid;
@@ -309,7 +304,6 @@ private:
     int seed_ = fdapde::random_seed;
     double tolerance_ = 1e-6;   // relative tolerance between Jnew and Jold, used as stopping criterion
     int max_iter_ = 100;
-
 public:
     // constructors
     RegularizedSVD() = default;
@@ -355,6 +349,10 @@ public:
     const DMatrix<double>& scores() const { return scores_; }
     const DMatrix<double>& loadings() const { return loadings_; }
     const DVector<double>& loadings_norm() const { return loadings_norm_; }
+    //setters
+    void set_tolerance(double tolerance) { tolerance_ = tolerance; }
+    void set_max_iter(int max_iter) { max_iter_ = max_iter; }
+    void set_seed(int seed) { seed_ = seed; }
 private:
     // let E*\Sigma*F^\top the reduced (rank r) SVD of X*\Psi*(D^{1})^\top, with D^{-1} the inverse of the cholesky
     // factor of \Psi^\top * \Psi + P(\lambda), then
@@ -392,9 +390,11 @@ private:
             double Jnew = 1;
             while (!almost_equal(Jnew, Jold, tolerance_) && j < max_iter_) {
                 DMatrix<double> X_imputed = W.select(X, 0) + (!W.array()).select(U * model.Psi().transpose(), 0);
+                X_imputed.rowwise() -= X_imputed.colwise().mean();
                 //Sequential fPCA on the imputed data
                 //->init with SVD
                 if constexpr (is_rand_svd<SVDType_>{}) {
+                    svd.setSeed(seed_);
                     svd.compute(X_imputed, rank);
                 } else {
                     svd.compute(X_imputed, Eigen::ComputeThinU | Eigen::ComputeThinV);
@@ -420,7 +420,6 @@ private:
         }
         return std::make_pair(scores, loadings);
     }
-
 public:
     // constructors
     RegularizedSVD() = default;
@@ -430,28 +429,48 @@ public:
         //Init the solver
         PowerIteration<ModelType> solver(model,1e-6,20);
         solver.init(); //compute the factorization just once
-        /*
-        auto cv_score = [&](
-                const DVector<double>& lambda,
-                const core::BinaryVector<Dynamic>& train_set,
-                const core::BinaryVector<Dynamic>& test_set) -> double {
-
-            //fitting on the training set
-            std::pair<DMatrix<double>,DMatrix<double>> solution = this->MMscheme<ModelType>(train_set.repeat(1,X.cols()).select(X), model, rank, solver, lambda);
-
-            //evaluate the error on the test set
-            DMatrix<double> S_m = model.Psi()*solution.second;
-            S_m = S_m*S_m.transpose();
-            return (test_set.repeat(1,X.cols()).select(X*(DMatrix<double>::Identity(X.cols(), X.cols()) - S_m))).squaredNorm() / (test_set.size() * X.cols());
-        };
-        */
-        //final solution
-        DVector<double> optimal_lambda = model.lambda(); //calibration::KCV{n_folds_, seed_}.fit(model, lambda_grid_, cv_score);
-        std::pair<DMatrix<double>,DMatrix<double>> solution = MMscheme<ModelType>(X, model, rank, solver, optimal_lambda);
-        // store results
-        scores_ = solution.first;
-        loadings_ = solution.second;
+        //init loadings and scores dimensions
+        loadings_.resize(model.n_basis(), rank);
+        scores_.resize(X.rows(), rank);
         loadings_norm_.resize(rank);
+        //MM-scheme init
+        DMatrix<bool> W = !X.array().isNaN();
+        DMatrix<double> U = DMatrix<double>::Zero(X.rows(), model.n_basis());
+        SVDType_ svd;
+        for(int k = 1; k <= rank; ++k){
+            //Majorization-Minimization scheme
+            int j = 0;
+            double Jold = std::numeric_limits<double>::max();
+            double Jnew = 1;
+            while (!almost_equal(Jnew, Jold, tolerance_) && j < max_iter_) {
+                DMatrix<double> X_imputed = W.select(X, 0) + (!W.array()).select(U * model.Psi().transpose(), 0);
+                //Sequential fPCA on the imputed data
+                //->init with SVD
+                if constexpr (is_rand_svd<SVDType_>{}) {
+                    svd.compute(X_imputed, rank);
+                } else {
+                    svd.compute(X_imputed, Eigen::ComputeThinU | Eigen::ComputeThinV);
+                }
+                //->sequential estimation of the components
+                for (int index = 0; index < k; index++) {
+                    //fit on the imputed data
+                    solver.compute(X_imputed, model.lambda(), svd.matrixV().col(index));
+                    //deflation
+                    X_imputed -= solver.s() * solver.fn().transpose() * solver.f_norm();
+                    //normalization
+                    loadings_.col(index) = solver.f();
+                    scores_.col(index) = solver.s() * solver.f_norm();
+                    loadings_norm_[index] = solver.f_norm();
+                }
+                U = scores_.leftCols(k) * loadings_.leftCols(k).transpose();
+                //update
+                j++;
+                Jold = Jnew;
+                Jnew = (W.select(X - U * model.Psi().transpose(), 0)).squaredNorm() +
+                       (U * model.P(model.lambda()) * U.transpose()).trace();
+            }
+        }
+        // normalizing
         for (int i = 0; i < rank; ++i) {
             loadings_norm_[i] = std::sqrt(loadings_.col(i).dot(model.R0() * loadings_.col(i)));   // L^2 norm
             loadings_.col(i) = loadings_.col(i) / loadings_norm_[i];
@@ -463,6 +482,11 @@ public:
     const DMatrix<double>& scores() const { return scores_; }
     const DMatrix<double>& loadings() const { return loadings_; }
     const DVector<double>& loadings_norm() const { return loadings_norm_; }
+    //setters
+    void set_tolerance(double tolerance) { tolerance_ = tolerance; }
+    void set_max_iter(int max_iter) { max_iter_ = max_iter; }
+    void set_seed(int seed) { seed_ = seed; }
+
 private:
     // let E*\Sigma*F^\top the reduced (rank r) SVD of X*\Psi*(D^{1})^\top, with D^{-1} the inverse of the cholesky
     // factor of \Psi^\top * \Psi + P(\lambda), then
