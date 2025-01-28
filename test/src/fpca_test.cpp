@@ -57,7 +57,8 @@ using fdapde::testing::read_mtx;
 //    BC:           no
 //    order FE:     1
 //    missing data: no
-//    solver: sequential (power iteration)
+//    solver:       sequential (power iteration)
+//    SVD:          RSI
 TEST(fpca_test, laplacian_samplingatnodes_sequential) {
     // define domain
     MeshLoader<Triangulation<2, 2>> domain("unit_square");
@@ -108,6 +109,7 @@ TEST(fpca_test, laplacian_samplingatnodes_sequential) {
 //    order FE:     1af
 //    missing data: no
 //    solver:       monolithic (rsvd)
+//    SVD:          RSI
 TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
     // define domain
     MeshLoader<Triangulation<2, 2>> domain("unit_square");
