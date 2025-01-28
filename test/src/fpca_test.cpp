@@ -58,8 +58,59 @@ using fdapde::testing::read_mtx;
 //    order FE:     1
 //    missing data: no
 //    solver:       sequential (power iteration)
+//    SVD:          JacobiSVD
+TEST(fpca_test, laplacian_samplingatnodes_sequential_exactSVD) {
+    // define domain
+    MeshLoader<Triangulation<2, 2>> domain("unit_square");
+    // import data from files
+    DMatrix<double> y = read_csv<double>("../data/models/fpca/2D_test1/y.csv");
+    // define regularizing PDE
+    auto L = -laplacian<FEM>();
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
+    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> pde(domain.mesh, L, u);
+    // define model
+    double lambda_D = 1e-2;
+    RegularizedSVD<fdapde::sequential,Eigen::JacobiSVD<DMatrix<double>>> rsvd;
+    rsvd.set_seed(1412);
+    FPCA<SpaceOnly> model(pde, Sampling::mesh_nodes, rsvd);
+    model.set_lambda_D(lambda_D);
+    // set model's data
+    BlockFrame<double, int> df;
+    df.insert(OBSERVATIONS_BLK, y);
+    model.set_data(df);
+    // solve FPCA problem
+    model.init();
+    model.solve();
+    // test correctness (dealing with uniquess up to sign changes)
+    SpMatrix<double> mem_buff;
+    Eigen::loadMarket(mem_buff, "../data/models/fpca/2D_test1/loadings_seq.mtx");
+    DMatrix<double> true_loadings = mem_buff;
+    Eigen::loadMarket(mem_buff, "../data/models/fpca/2D_test1/scores_seq.mtx");
+    DMatrix<double> true_scores = mem_buff;
+    bool equality_PCs = true;
+    bool equality_Scores = true;
+    for(int i=0; i < 3 && equality_PCs; i++){
+        equality_PCs = almost_equal(model.Psi() * model.loadings().col(i),true_loadings.col(i)) ||
+                       almost_equal(-model.Psi() * model.loadings().col(i),true_loadings.col(i));
+    }
+    for(int i=0; i < 3 && equality_Scores; i++){
+        equality_Scores = almost_equal(model.scores().col(i),true_scores.col(i)) ||
+                          almost_equal(-model.scores().col(i),true_scores.col(i));
+    }
+    EXPECT_TRUE(equality_PCs);
+    EXPECT_TRUE(equality_Scores);
+}
+
+// test 2
+//    domain:       unit square [1,1] x [1,1]
+//    sampling:     locations = nodes
+//    penalization: simple laplacian
+//    BC:           no
+//    order FE:     1
+//    missing data: no
+//    solver:       sequential (power iteration)
 //    SVD:          RSI
-TEST(fpca_test, laplacian_samplingatnodes_sequential) {
+TEST(fpca_test, laplacian_samplingatnodes_sequential_randSVD) {
     // define domain
     MeshLoader<Triangulation<2, 2>> domain("unit_square");
     // import data from files
@@ -101,7 +152,61 @@ TEST(fpca_test, laplacian_samplingatnodes_sequential) {
     EXPECT_TRUE(equality_Scores);
 }
 
-// test 2
+// test 3
+//    domain:       unit square [1,1] x [1,1]
+//    sampling:     locations = nodes
+//    penalization: simple laplacian
+//    BC:           no
+//    order FE:     1af
+//    missing data: no
+//    solver:       monolithic (rsvd)
+//    SVD:          JacobiSVD
+TEST(fpca_test, laplacian_samplingatnodes_monolithic_exactSVD) {
+    // define domain
+    MeshLoader<Triangulation<2, 2>> domain("unit_square");
+    // import data from files
+    DMatrix<double> y = read_csv<double>("../data/models/fpca/2D_test1/y.csv");
+    // define regularizing PDE
+    auto L = -laplacian<FEM>();
+    DMatrix<double> u = DMatrix<double>::Zero(domain.mesh.n_cells() * 3, 1);
+    PDE<decltype(domain.mesh), decltype(L), DMatrix<double>, FEM, fem_order<1>> problem(domain.mesh, L, u);
+    // define model
+    double lambda_D = 1e-2;
+
+    RegularizedSVD<fdapde::monolithic,Eigen::JacobiSVD<DMatrix<double>>> rsvd;
+    rsvd.set_seed(1412);
+
+    FPCA<SpaceOnly> model(problem, Sampling::mesh_nodes,rsvd);
+    model.set_lambda_D(lambda_D);
+    // set model's data
+    BlockFrame<double, int> df;
+    df.insert(OBSERVATIONS_BLK, y);
+    model.set_data(df);
+    // solve FPCA problem
+    model.init();
+    model.solve();
+
+    // test correctness (dealing with uniquess up to sign changes)
+    SpMatrix<double> mem_buff;
+    Eigen::loadMarket(mem_buff, "../data/models/fpca/2D_test1/loadings_mon.mtx");
+    DMatrix<double> true_loadings = mem_buff;
+    Eigen::loadMarket(mem_buff, "../data/models/fpca/2D_test1/scores_mon.mtx");
+    DMatrix<double> true_scores = mem_buff;
+    bool equality_PCs = true;
+    bool equality_Scores = true;
+    for(int i=0; i < 3 && equality_PCs; i++){
+        equality_PCs = almost_equal(model.Psi() * model.loadings().col(i),true_loadings.col(i)) ||
+                       almost_equal(-model.Psi() * model.loadings().col(i),true_loadings.col(i));
+    }
+    for(int i=0; i < 3 && equality_Scores; i++){
+        equality_Scores = almost_equal(model.scores().col(i),true_scores.col(i)) ||
+                          almost_equal(-model.scores().col(i),true_scores.col(i));
+    }
+    EXPECT_TRUE(equality_PCs);
+    EXPECT_TRUE(equality_Scores);
+}
+
+// test 4
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations = nodes
 //    penalization: simple laplacian
@@ -110,7 +215,7 @@ TEST(fpca_test, laplacian_samplingatnodes_sequential) {
 //    missing data: no
 //    solver:       monolithic (rsvd)
 //    SVD:          RSI
-TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
+TEST(fpca_test, laplacian_samplingatnodes_monolithic_randSVD) {
     // define domain
     MeshLoader<Triangulation<2, 2>> domain("unit_square");
     // import data from files
@@ -155,7 +260,7 @@ TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
     EXPECT_TRUE(equality_Scores);
 }
 
-// test 3
+// test 5
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations != nodes
 //    penalization: simple laplacian
@@ -194,7 +299,7 @@ TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
 //    EXPECT_TRUE(almost_equal(model.scores(),                 "../data/models/fpca/2D_test2/scores_seq.mtx"  ));
 //}
 
-// test 4
+// test 6
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations != nodes
 //    penalization: simple laplacian
@@ -234,7 +339,7 @@ TEST(fpca_test, laplacian_samplingatnodes_monolithic) {
 //}
 
 /*
-// test 5
+// test 7
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations == nodes
 //    penalization: space-time separable
@@ -276,7 +381,7 @@ TEST(fpca_test, laplacian_samplingatnodes_separable_sequential) {
 }
 */
 
-// test 4
+// test 8
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations = nodes
 //    penalization: simple laplacian
@@ -328,7 +433,7 @@ TEST(fpca_test, laplacian_samplingatnodes_nocalibration_missingdata_sequential) 
     EXPECT_TRUE(equality_Scores);
 }
 
-// test 5
+// test 9
 //    domain:       unit square [1,1] x [1,1]
 //    sampling:     locations = nodes
 //    penalization: simple laplacian
