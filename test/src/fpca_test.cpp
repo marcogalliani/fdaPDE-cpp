@@ -473,6 +473,7 @@ TEST(fpca_test, laplacian_samplingatnodes_nocalibration_missingdata_monolithic) 
     DMatrix<double> true_scores = mem_buff;
     bool equality_PCs = true;
     bool equality_Scores = true;
+
     for(int i=0; i < 3 && equality_PCs; i++){
         equality_PCs = almost_equal(model.Psi() * model.loadings().col(i),true_loadings.col(i)) ||
                        almost_equal(-model.Psi() * model.loadings().col(i),true_loadings.col(i));

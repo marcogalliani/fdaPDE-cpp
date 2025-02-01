@@ -44,7 +44,7 @@ public:
         rank_ = rank;
         // compute SVD of X*\Psi*(D^{-1})^\top
         if constexpr (is_rand_svd<SVDType_>{}){
-            svd_.setSeed(seed_);
+            svd_.set_seed(seed_);
             svd_.compute(X*model_.Psi()*invD_.transpose(),rank_);
         } else{
             svd_.compute(X*model_.Psi()*invD_.transpose(),Eigen::ComputeThinU | Eigen::ComputeThinV);

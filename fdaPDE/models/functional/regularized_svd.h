@@ -128,7 +128,7 @@ class RegularizedSVD<sequential,SVDType_> {
             model_(model) {
             // first guess of PCs set to a multivariate PCA (SVD)
             if constexpr (is_rand_svd<SVDType_>{}){
-                svd_.setSeed(rsvd_->seed_);
+                svd_.set_seed(rsvd_->seed_);
                 svd_.compute(X_,rank);
             } else{
                 svd_.compute(X_,Eigen::ComputeThinU | Eigen::ComputeThinV);
