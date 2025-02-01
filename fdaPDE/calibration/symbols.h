@@ -21,7 +21,7 @@ namespace fdapde {
 namespace calibration {
 
 // possible calibration strategies
-enum Calibration {off, gcv, kcv , kcv_cols, ocv, gcv_smooth, kcv_projection, kcv_svd_extraction};
+enum Calibration {off, gcv, kcv};
 
 enum KCVPolicy{row_deletion, col_deletion};
 

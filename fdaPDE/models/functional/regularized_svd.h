@@ -36,11 +36,6 @@ using fdapde::calibration::KCVPolicy;
 #include "monolithic_solver.h"
 #include "../../core/fdaPDE/optimization/grid.h"
 
-//test
-#include <chrono>
-#include "../../../test/src/utils/utils.h"
-using fdapde::testing::write_csv;
-
 namespace fdapde {
 namespace models{
 
