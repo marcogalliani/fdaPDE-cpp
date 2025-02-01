@@ -29,7 +29,6 @@ using fdapde::core::is_rand_svd;
 #include "../../calibration/kfold_cv.h"
 #include "../../calibration/symbols.h"
 using fdapde::calibration::Calibration;
-using fdapde::calibration::KCVPolicy;
 
 #include "../model_traits.h"
 #include "power_iteration.h"

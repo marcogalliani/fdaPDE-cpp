@@ -23,8 +23,6 @@ namespace calibration {
 // possible calibration strategies
 enum Calibration {off, gcv, kcv};
 
-enum KCVPolicy{row_deletion, col_deletion};
-
 }   // namespace calibration
 }   // namespace fdapde
 
