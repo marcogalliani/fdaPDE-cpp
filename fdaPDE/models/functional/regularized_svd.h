@@ -365,55 +365,6 @@ private:
     //calibration
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
     DMatrix<double> lambda_grid_;
-
-    template <typename ModelType>
-    std::pair<DMatrix<double>,DMatrix<double>> MMscheme(const DMatrix<double>& X, ModelType& model, int rank,
-                                                        PowerIteration<ModelType> &solver, DVector<double> lambda) {
-        //init loadings and scores dimensions
-        DMatrix<double> loadings(model.n_basis(), rank);
-        DMatrix<double> scores(X.rows(), rank);
-        DVector<double> loadings_norm(rank);
-        //MM-scheme init
-        DMatrix<bool> W = !X.array().isNaN();
-        DMatrix<double> U = DMatrix<double>::Zero(X.rows(), model.n_basis());
-        SVDType_ svd;
-        for(int k = 1; k <= rank; ++k){
-            //Majorization-Minimization scheme
-            int j = 0;
-            double Jold = std::numeric_limits<double>::max();
-            double Jnew = 1;
-            while (!almost_equal(Jnew, Jold, tolerance_) && j < max_iter_) {
-                DMatrix<double> X_imputed = W.select(X, 0) + (!W.array()).select(U * model.Psi().transpose(), 0);
-                X_imputed.rowwise() -= X_imputed.colwise().mean();
-                //Sequential fPCA on the imputed data
-                //->init with SVD
-                if constexpr (is_rand_svd<SVDType_>{}) {
-                    svd.setSeed(seed_);
-                    svd.compute(X_imputed, rank);
-                } else {
-                    svd.compute(X_imputed, Eigen::ComputeThinU | Eigen::ComputeThinV);
-                }
-                //->sequential estimation of the components
-                for (int index = 0; index < k; index++) {
-                    //fit on the imputed data
-                    solver.compute(X_imputed, lambda, svd.matrixV().col(index));
-                    //deflation
-                    X_imputed -= solver.s() * solver.fn().transpose() * solver.f_norm();
-                    //normalization
-                    loadings.col(index) = solver.f();
-                    scores.col(index) = solver.s() * solver.f_norm();
-                    loadings_norm[index] = solver.f_norm();
-                }
-                U = scores.leftCols(k) * loadings.leftCols(k).transpose();
-                //update
-                j++;
-                Jold = Jnew;
-                Jnew = (W.select(X - U * model.Psi().transpose(), 0)).squaredNorm() +
-                       (U * model.P(lambda) * U.transpose()).trace();
-            }
-        }
-        return std::make_pair(scores, loadings);
-    }
 public:
     // constructors
     RegularizedSVD() = default;
