@@ -73,8 +73,8 @@ public:
         return;
     }
     //getters
-    const DMatrix<double> scores() const { return svd_.matrixU().leftCols(rank_)*svd_.singularValues().head(rank_).asDiagonal(); }
-    const DMatrix<double> loadings() const { return (svd_.matrixV().leftCols(rank_).transpose()*invD_).transpose(); }
+    const DMatrix<double>& scores() const { return svd_.matrixU().leftCols(rank_)*svd_.singularValues().head(rank_).asDiagonal(); }
+    const DMatrix<double>& loadings() const { return (svd_.matrixV().leftCols(rank_).transpose()*invD_).transpose(); }
 };
 
 #endif //MONOLITHIC_SOLVER_H
