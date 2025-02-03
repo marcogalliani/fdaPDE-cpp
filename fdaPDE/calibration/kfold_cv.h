@@ -35,7 +35,8 @@ namespace fdapde {
 namespace calibration {
 
 // general implementation of KFold Cross Validation
-class KCV : public CalibratorBase<KCV> {
+template<KCVPolicy KCVPolicy_=row_deletion>
+class KCV : public CalibratorBase<KCV<KCVPolicy_>> {
    private:
     // algorithm's parameters
     int K_;          // number of folds
@@ -80,7 +81,12 @@ class KCV : public CalibratorBase<KCV> {
         // reserve space for CV scores
         scores_.resize(K_, lambdas.rows());
 
-        int n = model.data().rows();
+        int n;
+        if constexpr (KCVPolicy_==row_deletion){
+            n = model.data().rows();
+        }else{
+            n = model.n_locs();
+        }
         Eigen::ArrayXi indices = Eigen::ArrayXi::LinSpaced(n,0,n-1);
 
         if(shuffle_){
