@@ -392,6 +392,7 @@ private:
             double Jnew = 1;
             while (!almost_equal(Jnew, Jold, tolerance_) && j < max_iter_) {
                 DMatrix<double> X_imputed = W.select(X, 0) + (!W.array()).select(U * model.Psi().transpose(), 0);
+                X_imputed.rowwise() -= X_imputed.colwise().mean();
                 //Sequential fPCA on the imputed data
                 //->init with SVD
                 if constexpr (is_rand_svd<SVDType_>{}) {
