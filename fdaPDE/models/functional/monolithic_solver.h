@@ -28,8 +28,9 @@ private:
     DVector<double> lambda_;
     int seed_ = fdapde::random_seed;
     //Solutions to the fPCA problem
-    SVDType_ svd_; //here we may use a randomized algorithm
     DMatrix<double> invD_; //factorization of (Psi^T*Psi+lambda P)^(-1) for the given lambda
+    DMatrix<double> scores_;
+    DMatrix<double> loadings_;
 public:
     FixedLambdaMonolithicSolver(ModelType &model, int seed) : model_(model), seed_(seed){}
 
@@ -43,17 +44,20 @@ public:
     void compute(const DMatrix<double> &X, int rank){
         rank_ = rank;
         // compute SVD of X*\Psi*(D^{-1})^\top
+        SVDType_ svd; //here we may use a randomized algorithm
         if constexpr (is_rand_svd<SVDType_>{}){
-            svd_.set_seed(seed_);
-            svd_.compute(X*model_.Psi()*invD_.transpose(),rank_);
+            svd.set_seed(seed_);
+            svd.compute(X*model_.Psi()*invD_.transpose(),rank_);
         } else{
-            svd_.compute(X*model_.Psi()*invD_.transpose(),Eigen::ComputeThinU | Eigen::ComputeThinV);
+            svd.compute(X*model_.Psi()*invD_.transpose(),Eigen::ComputeThinU | Eigen::ComputeThinV);
         }
+        scores_ = svd.matrixU().leftCols(rank_)*svd.singularValues().head(rank_).asDiagonal();
+        loadings_ = (svd.matrixV().leftCols(rank_).transpose()*invD_).transpose();
         return;
     }
     //gcv score (has to be preceded by a call to compute())
     double gcv(double edf_discount=1.0){
-        DMatrix<double> S_m = model_.Psi()*invD_.transpose()*svd_.matrixV().leftCols(rank_);
+        DMatrix<double> S_m = model_.Psi()*loadings_;
         S_m = S_m*S_m.transpose();
         double gcv_score = model_.X().cols()/std::pow(model_.X().cols()-edf_discount*S_m.trace(),2)*
                            (model_.X()*(DMatrix<double>::Identity(model_.X().cols(), model_.X().cols()) - S_m)).squaredNorm();
@@ -61,7 +65,7 @@ public:
     }
     //test the reconstruction on a different portion of the data (has to be preceded by a call to compute())
     double reconstruction_error(const DMatrix<double>& X_test){
-        DMatrix<double> S_m = invD_.transpose()*svd_.matrixV().leftCols(rank_);
+        DMatrix<double> S_m = loadings_;
         S_m = model_.Psi()*S_m;
         S_m = S_m*S_m.transpose();
 
@@ -73,8 +77,8 @@ public:
         return;
     }
     //getters
-    const DMatrix<double>& scores() const { return svd_.matrixU().leftCols(rank_)*svd_.singularValues().head(rank_).asDiagonal(); }
-    const DMatrix<double>& loadings() const { return (svd_.matrixV().leftCols(rank_).transpose()*invD_).transpose(); }
+    const DMatrix<double>& scores() const { return scores_; }
+    const DMatrix<double>& loadings() const { return loadings_; }
 };
 
 #endif //MONOLITHIC_SOLVER_H
