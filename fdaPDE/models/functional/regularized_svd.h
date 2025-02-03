@@ -318,7 +318,7 @@ public:
             int j=0;
             while(!almost_equal(Jnew, Jold, tolerance_) && j < max_iter_){
                 DMatrix<double> X_imputed = W.select(X,0)+(!W.array()).select(U*model.Psi().transpose(),0);
-                X_imputed.rowwise() -= X_imputed.colwise().mean();
+                X_imputed.rowwise() -= X_imputed.colwise().mean(); //recentering the data
                 //fit on the imputed data
                 mono_solver.compute(X_imputed,k);
                 U = mono_solver.scores()*mono_solver.loadings().transpose();
@@ -389,6 +389,7 @@ public:
             double Jnew = 1;
             while (!almost_equal(Jnew, Jold, tolerance_) && j < max_iter_) {
                 DMatrix<double> X_imputed = W.select(X, 0) + (!W.array()).select(U * model.Psi().transpose(), 0);
+                X_imputed.rowwise() -= X_imputed.colwise().mean(); //recentering the data
                 //Sequential fPCA on the imputed data
                 //->init with SVD
                 if constexpr (is_rand_svd<SVDType_>{}) {
