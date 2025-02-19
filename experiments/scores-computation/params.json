@@ -1,0 +1,15 @@
+{
+  "RunParams": {
+    "n_pc": 3,
+    "RSVDType": "sequential",
+    "SVDType": "exact"
+  },
+  "calibration": {
+    "strategy": "kcv_svd_extraction",
+    "grid_dim": 100,
+    "left": -16,
+    "right": 0,
+    "n_folds": 10,
+    "fixed": 0.001
+  }
+}

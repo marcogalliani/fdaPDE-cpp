@@ -1,0 +1,10 @@
+{
+  "RunParams": {
+    "RSVDType": "subspace",
+    "fixed_lambda": 0.0001
+  },
+  "SubspaceIterations": {
+    "lambdas": [0.0001, 0.0001, 0.0001],
+    "max_iter": 50
+  }
+}

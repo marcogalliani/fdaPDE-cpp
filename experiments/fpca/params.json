@@ -1,0 +1,7 @@
+{
+  "RunParams": {
+    "RSVDType": "sequential",
+    "SVDType": "randomized",
+    "n_replicas": 10
+  }
+}

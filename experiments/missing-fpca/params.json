@@ -1,0 +1,9 @@
+{
+  "RunParams": {
+    "RSVDType": "monolithic",
+    "SVDType": "randomized",
+    "lambda": 0.001,
+    "n_pc": 3,
+    "start_recursion": [3]
+  }
+}

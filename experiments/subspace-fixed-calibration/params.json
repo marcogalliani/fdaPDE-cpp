@@ -1,0 +1,10 @@
+{
+  "RunParams": {
+    "RSVDType": "subspace"
+  },
+  "Calibration": {
+    "LB": -10,
+    "UB": 1,
+    "grid_dim": 30
+  }
+}

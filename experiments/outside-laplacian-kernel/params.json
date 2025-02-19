@@ -1,0 +1,9 @@
+{
+  "RunParams": {
+    "RSVDType": "sequential",
+    "SVDType": "randomized",
+    "n_cores": 1,
+    "n_pc": 3,
+    "lambda": 1e-05
+  }
+}

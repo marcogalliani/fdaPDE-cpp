@@ -1,0 +1,19 @@
+{
+  "RunParams": {
+    "fixed_npc": 5,
+    "fixed_lambda": 1e-05
+  },
+  "npc_grid": {
+    "left": 1,
+    "right": 5
+  },
+  "lambda_grid": {
+    "dim": 30,
+    "left": -12,
+    "right": -5
+  },
+  "Calibration": {
+    "strategy": "kcv",
+    "n_folds": 50
+  }
+}

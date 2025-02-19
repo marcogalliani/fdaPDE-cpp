@@ -1,0 +1,15 @@
+{
+  "RunParams": {
+    "n_cores": 1,
+    "n_pc": 3
+  },
+  "calibration": {
+    "procedure": "generalized",
+    "strategy": "gcv",
+    "grid_dim": 50,
+    "left": -16,
+    "right": -1,
+    "n_folds": 10,
+    "gcv_correction": 1
+  }
+}

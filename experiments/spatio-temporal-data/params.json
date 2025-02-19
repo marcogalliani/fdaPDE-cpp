@@ -1,0 +1,12 @@
+{
+  "RunParams": {
+    "EVDType": "exact",
+    "n_eigenvectors": 30
+  },
+  "DiffusionOp": {
+    "alpha1": 1.0472,
+    "alpha2": 4.1888,
+    "gamma1": 2,
+    "gamma2": 1.5
+  }
+}

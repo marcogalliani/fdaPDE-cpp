@@ -1,0 +1,9 @@
+{
+  "RunParams": {
+    "RSVDType": "fspai_monolithic",
+    "SVDtype": ["exact"],
+    "n_cores": 1,
+    "lambda": 0.01,
+    "SVDType": "exact"
+  }
+}
