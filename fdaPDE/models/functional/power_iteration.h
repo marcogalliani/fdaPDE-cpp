@@ -39,7 +39,7 @@ template <typename Model_> class PowerIteration {
     GCV gcv_;   // GCV functor
     // algorithm's parameters
     double tolerance_ = 1e-6;   // treshold on |Jnew - Jold| used as stopping criterion
-    int max_iter_ = 20;         // maximum number of iterations before forced stop
+    int max_iter_ = 100;         // maximum number of iterations before forced stop
     int k_ = 0;                 // iteration index
     SolverType solver_;         // internal solver
     int seed_ = fdapde::random_seed;
@@ -112,6 +112,7 @@ template <typename Model_> class PowerIteration {
     double f_norm() const { return f_norm_; }
     inline double f_squaredNorm() const { return std::pow(f_norm_, 2); }
     double gcv() { return gcv_.eval(); }   // GCV index at convergence
+    double edfs() {return gcv_.eval_edfs();} // edfs at convergence
     // setters
     void set_tolerance(double tolerance) { tolerance_ = tolerance; }
     void set_max_iter(int max_iter) { max_iter_ = max_iter; }

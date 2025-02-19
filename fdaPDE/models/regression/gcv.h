@@ -112,6 +112,12 @@ class GCV {
         double dor = model_.n_obs() - (model_.q() + trS);   // (n - (q + Tr[S])
         return (model_.n_obs() / std::pow(dor, 2)) * (model_.norm(model_.fitted(), model_.y()));
     }
+    double eval_edfs() {
+        if (cache_.find(model_.lambda()) == cache_.end()) { cache_[model_.lambda()] = trS_.compute(); }
+        double trS = cache_[model_.lambda()];
+        // GCV(\lambda) = n/((n - (q + Tr[S]))^2)*norm(y - \hat y)^2
+        return model_.q() + trS;
+    }
 
     // set edf_evaluation strategy
     template <typename EDFStrategy_> void set_edf_strategy(EDFStrategy_&& trS) {

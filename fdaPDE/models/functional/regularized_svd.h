@@ -32,6 +32,7 @@ using fdapde::calibration::Calibration;
 
 #include "../model_traits.h"
 #include "power_iteration.h"
+#include "subspace_iteration.h"
 #include "monolithic_solver.h"
 #include "../../core/fdaPDE/optimization/grid.h"
 
@@ -298,6 +299,7 @@ private:
     int seed_ = fdapde::random_seed;
     double tolerance_ = 1e-6;   // relative tolerance between Jnew and Jold, used as stopping criterion
     int max_iter_ = 100;
+    int start_=1;
 public:
     // constructors
     RegularizedSVD() = default;
@@ -311,7 +313,7 @@ public:
         FixedLambdaMonolithicSolver<ModelType,SVDType_> mono_solver(model,seed_);
         mono_solver.init(model.lambda()); //works only at fixed lambda
 
-        for(int k = 1; k <= rank; ++k){
+        for(int k = start_; k <= rank; ++k){
             //Majorization-Minimization scheme
             double Jold = std::numeric_limits<double>::max();
             double Jnew = 1.0;
@@ -347,6 +349,7 @@ public:
     void set_tolerance(double tolerance) { tolerance_ = tolerance; }
     void set_max_iter(int max_iter) { max_iter_ = max_iter; }
     void set_seed(int seed) { seed_ = seed; }
+    void set_start(int start) { start_ = start;}
 private:
     // let E*\Sigma*F^\top the reduced (rank r) SVD of X*\Psi*(D^{1})^\top, with D^{-1} the inverse of the cholesky
     // factor of \Psi^\top * \Psi + P(\lambda), then
@@ -365,6 +368,7 @@ private:
     //calibration
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
     DMatrix<double> lambda_grid_;
+    int start_=1;
 public:
     // constructors
     RegularizedSVD() = default;
@@ -382,7 +386,7 @@ public:
         DMatrix<bool> W = !X.array().isNaN();
         DMatrix<double> U = DMatrix<double>::Zero(X.rows(), model.n_basis());
         SVDType_ svd;
-        for(int k = 1; k <= rank; ++k){
+        for(int k = start_; k <= rank; ++k){
             //Majorization-Minimization scheme
             int j = 0;
             double Jold = std::numeric_limits<double>::max();
@@ -432,6 +436,7 @@ public:
     void set_tolerance(double tolerance) { tolerance_ = tolerance; }
     void set_max_iter(int max_iter) { max_iter_ = max_iter; }
     void set_seed(int seed) { seed_ = seed; }
+    void set_start(int start) { start_ = start;}
 
 private:
     // let E*\Sigma*F^\top the reduced (rank r) SVD of X*\Psi*(D^{1})^\top, with D^{-1} the inverse of the cholesky
