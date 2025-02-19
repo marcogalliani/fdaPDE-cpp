@@ -37,3 +37,4 @@ test/data/mesh/
 docs/
 
 #experiments folder
+!experiments/*/*.json
