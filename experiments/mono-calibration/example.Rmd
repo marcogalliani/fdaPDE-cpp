@@ -1,0 +1,290 @@
+---
+title: "Behaviour of lambda while varying the number of components"
+params:
+  n_nodes: 900
+  n_locs: 1600 #squared
+  n_statistical_units: 200 #[200,400,800,"VAR"]
+  n_replicas: 10
+  n_cores: 1
+  n_folds: 10
+---
+
+## Introduction
+```{r}
+library(fdaPDE)
+library(femR)
+
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_test"
+results_path <- "results"
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+
+## Parameters
+- `params.json` modifies the run parameters
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$n_cores <- unbox(params$n_cores)
+json_data$RunParams$n_pc <- unbox(3)
+
+json_data$calibration$procedure <- unbox("generalized")
+json_data$calibration$grid_dim <- unbox(50)
+json_data$calibration$strategy <- unbox("gcv")
+json_data$calibration$left <- unbox(-16)
+json_data$calibration$right <- unbox(-1)
+json_data$calibration$n_folds <- unbox(params$n_folds)
+json_data$calibration$gcv_correction <- unbox(1.0)
+
+
+write_json(json_data, 
+           "params.json", 
+           pretty = TRUE)
+```
+
+- set the parameters to generate the data
+```{r}
+n_units <- params$n_statistical_units
+n_nodes <- params$n_nodes
+n_locs <- params$n_locs
+n_replicas <- params$n_replicas
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+## Data
+Utils
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+
+```{r}
+##(1) Mesh generation
+mesh.2D <- unit_square.mesh(n_nodes, mesh_data_path)
+#define a dummy pde to get the stiffness matrix
+mesh <- Mesh(
+  list(
+    nodes = mesh.2D$nodes,
+    elements = mesh.2D$triangles,
+    boundary = mesh.2D$nodesmarkers
+  )
+)
+Vh <- FunctionSpace(mesh, fe_order=1)
+u <- Function(Vh)
+
+##(2) Eigenfunctions
+## use n = N for the setting locations = mesh nodes
+## (in this case, \Psi is the identity matrix)
+## use n != N for the general case. Set n > N.
+
+locations.obs.2D <- unit_square.locs(n_locs,obs_data_path)
+
+
+## (2.1) at mesh nodes
+## evaluate eigenfunctions on mesh nodes (this is equivalent to get the FEM basis
+## expansion of the eigenfunctions ). change values of a and b to select eigenfunction
+L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    1.5 #intensity
+    )
+f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+
+#evd
+evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+  
+#eigen functions
+f1_fem <- evd$vectors[,20]
+f2_fem <- evd$vectors[,29]
+f3_fem <- evd$vectors[,4]
+
+## (2.2) at locations (normalized)
+#L2 norm
+L2norm <- L2norm.factory(mesh.2D, L) #function to compute the norm
+
+Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+
+f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+
+true_PCs <- cbind(f1,f2,f3)
+
+##(3) Data generation
+#-> generated for each replica
+```
+
+## Metrics
+```{r}
+source("../r-utils/error_metrics.R")
+
+keys <- c("procedure","replica", "n_nodes")
+
+error_metrics <- c("signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+time_metrics <- c("calibration_time","factorization_time","fit_time")
+
+#storing the results
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,time_metrics,"lambda"))))
+names(test_results) <- c(keys,error_metrics,time_metrics,"lambda")
+
+test_results[] <- lapply(test_results, function(x) numeric())
+test_results$calibration <- character()
+test_results$procedure <- character()
+```
+
+Utility to compute the errors
+
+## Run
+```{r}
+library(dplyr)
+
+for(ind_rep in 1:n_replicas){
+  #data 
+  data <- data_generator(n_units,
+                       true_PCs = true_PCs,
+                       scores_sd = c(0.4,0.3,0.2),
+                       error_sd = 0.1,
+                       obs_path = obs_data_path,
+                       seed = seed + 4*ind_rep)
+  
+  for (cal_policy in c("gcv")){
+    cat("\nCalibration policy: ", cal_policy, "\n")
+    json_data$calibration$strategy <- unbox(cal_policy)
+    for(cal_proc in c("direct","generalized")){
+      cat("Procedure: ", cal_proc, "\n")
+      json_data$calibration$procedure <- unbox(cal_proc)
+      write_json(json_data, "params.json", pretty = TRUE)
+    
+      #run the program
+      system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/mono-calibration/mono_calibration --gtest_filter=* --gtest_color=no")
+      
+      #load results
+      est.PCs <- 
+        as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+      est.Scores <- 
+        as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+      
+      #compute errors
+      errors <- compute.errors.FPCA(est.PCs = est.PCs, 
+                                    est.Scores = est.Scores,
+                                    data = data)
+      
+      #times
+      test_report <- read.csv(file=paste(results_path,"test_report.csv",sep="/"),
+                              header = F)
+      #store results
+      test_results <- test_results %>%
+          add_row(calibration=cal_policy, procedure=cal_proc, replica=ind_rep)
+      
+      new_row <- 
+        test_results$calibration==cal_policy & 
+        test_results$procedure==cal_proc & 
+        test_results$replica==ind_rep
+      test_results[new_row, error_metrics] <- unlist(errors[c("signal_reconstruction","space_reconstruction")])
+      test_results[new_row, time_metrics] <- unlist(test_report[,1:3])
+      test_results[new_row, "lambda"] <- unlist(test_report[,4])
+    }#n_pc
+  }#calibration
+}#replica
+```
+
+## Visualization
+```{r}
+source("../r-utils/plot_utils.R")
+
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+
+col_palette <- hue_pal()(2)
+color_map <- c(
+  "gcv" = col_palette[1],
+  "kcv" = col_palette[2]
+)
+```
+### Errors
+```{r}
+save <- F
+
+plot_title <- paste("Mesh: ", params$n_nodes,", ",
+                    "Stat.Units: ", params$n_statistical_units, ", ",
+                    "Locs: ", params$n_locs, sep="")
+
+for(err in error_metrics){
+  plot <- 
+    grouped_boxplot(test_results, plot_title,
+                var_name.x = "procedure", var_name.y = err,
+                group_name = "calibration", color_map = color_map,
+                legend = T, lines = F)
+  print(plot)
+  
+  if(save){
+    ggsave(paste("plots/",
+               err,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_obs,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+         plot, width = 10, height = 5)
+  }
+}
+```
+
+
+
+### Lambda
+```{r}
+save <- F
+
+plot <- 
+  grouped_boxplot(test_results, plot_title,
+              var_name.x = "procedure", var_name.y = "lambda",
+              group_name = "calibration", color_map = color_map,
+              log.y = T, lines = T, legend = F)
+print(plot)
+
+if(save){
+  ggsave(paste("plots/",
+             "lambda",
+             "-Mesh",params$n_nodes,
+             "-Obs",params$n_obs,
+             "-Locs",params$n_locs,
+           ".pdf", sep=""), 
+       plot, width = 10, height = 5)
+}
+```
+
+### Times
+```{r}
+save <- T
+
+for(time in time_metrics){
+  plot <- 
+    grouped_boxplot(test_results, plot_title,
+                var_name.x = "procedure", var_name.y = time,
+                group_name = "calibration", color_map = color_map,
+                legend = F, lines = F)
+  print(plot)
+  
+  if(save){
+    ggsave(paste("plots/",
+               time,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_obs,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+         plot, width = 10, height = 5)
+  }
+}
+```
+

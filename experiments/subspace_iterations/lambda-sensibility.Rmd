@@ -1,0 +1,400 @@
+---
+title: "Sensibility to lambda"
+params: 
+  n_statistical_units: 200 #[200,400,800,"VAR"]
+  n_replicas: 20 
+---
+
+## Introduction
+```{r}
+library(fdaPDE)
+library(femR)
+
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_test"
+results_path <- "results"
+
+plot_path <- "plots/lambda-sensibility"
+
+n_replicas <- params$n_replicas
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+Set the hyperparameters for the experiment by changing the file `params.json` in the folder 
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox("sequential")
+json_data$RunParams$fixed_lambda <- unbox(100)
+
+json_data$SubspaceIterations$max_iter <- unbox(500)
+json_data$SubspaceIterations$lambdas <- rep(100,3)
+
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+- set the parameters to generate the data
+```{r}
+n_units <- params$n_statistical_units
+n_replicas <- params$n_replicas
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+## Data
+```{r}
+source("../r-utils/mesh_utils.R")
+generate.mesh_and_eigenfunctions <- function(n_nodes, mesh_path,
+                                    n_locs, locs_path){
+  ##(1) Mesh generation
+  mesh.2D <- unit_square.mesh(n_nodes, mesh_path)
+  #'define a dummy pde to get the stiffness and the mass matrices of the 
+  #'differential operator
+  mesh <- Mesh(
+    list(
+      nodes = mesh.2D$nodes,
+      elements = mesh.2D$triangles,
+      boundary = mesh.2D$nodesmarkers
+    )
+  )
+  Vh <- FunctionSpace(mesh, fe_order=1)
+  u <- Function(Vh)
+  
+  L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    1.5 #intensity
+    )
+  f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+  pde <- Pde(L(u), f)
+  
+  ##(2) Eigenfunctions
+  #evd
+  evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+  #at mesh nodes
+  f1_fem <- evd$vectors[,4]
+  f2_fem <- evd$vectors[,9]
+  f3_fem <- evd$vectors[,10]
+
+  ##(3) Evaluate at locations
+  locations.obs.2D <- unit_square.locs(n_locs,locs_path) #locations at nodes
+  Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+  
+  L2norm <- L2norm.factory(mesh.2D = mesh.2D, diff_op = L)
+  
+  #final components
+  f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+  f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+  f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+  
+  return(cbind(f1,f2,f3))
+}
+```
+
+### PCs & Mesh
+```{r}
+k <- 30
+
+true_PCs <- generate.mesh_and_eigenfunctions(
+    k^2, mesh_data_path,
+    k^2, obs_data_path
+  )
+locations <- expand.grid(seq(0,1,length.out=k), seq(0,1,length.out=k))
+```
+
+## Replicated tests
+```{r}
+library(dplyr)
+
+keys <- c("rsvd","replica","lambda")
+
+error_metrics <- c("errPC1","errPC2","errPC3",
+                   "errScore1","errScore2","errScore3",
+                   "signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+
+
+time_metrics <- c("exe_time")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,time_metrics, "scores_orth"))))
+names(test_results) <- c(keys, error_metrics,time_metrics, "scores_orth")
+
+test_results[] <- lapply(test_results, function(x) numeric())
+test_results$rsvd <- character()
+```
+
+```{r}
+lambda_grid <- 10^(-10:2)
+```
+
+
+```{r}
+calibrated_json <- fromJSON("../fpca-calibration/params.json")
+
+calibrated_json$RunParams$RSVDType <- unbox("subspace")
+calibrated_json$RunParams$n_pc <- unbox(3)
+
+calibrated_json$calibration$grid_dim <- unbox(50)
+calibrated_json$calibration$strategy <- unbox("gcv")
+calibrated_json$calibration$left <- unbox(-13)
+calibrated_json$calibration$right <- unbox(2)
+calibrated_json$calibration$n_folds <- unbox(params$n_folds)
+calibrated_json$calibration$fixed <- unbox(1e-5)
+
+write_json(calibrated_json, "../fpca-calibration/params.json", pretty = TRUE, digits=10)
+```
+
+
+```{r}
+source("../r-utils/error_metrics.R")
+
+
+for(i in 1:params$n_replicas){
+  cat("Replica:", i, "\n")
+  
+  #->Generate the data
+    data <- data_generator(n_units,
+                     true_PCs = true_PCs,
+                     scores_sd = c(0.4,0.3,0.2),
+                     error_sd = 0.1,
+                     obs_path = obs_data_path,
+                     seed = seed + 4*i)
+    
+  #run the program
+  system("cd ../fpca-calibration; /Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/fpca-calibration/calibration_fpca")
+  
+  #Compute calibrated error
+  #results
+  est.PCs <- as.matrix(readMM(file=paste("../fpca-calibration/results","estimated_PCs.mtx",sep="/")))
+  est.Scores <- as.matrix(readMM(file=paste("../fpca-calibration/results","estimated_Scores.mtx",sep="/")))
+      
+  errors <- compute.errors.FPCA(data, 
+                    est.PCs = est.PCs,
+                    est.Scores = est.Scores
+                    )
+  #store results
+  test_results <- test_results %>%
+      add_row(rsvd="calibrated", replica=i, lambda=NULL)
+    new_row <- 
+      test_results$rsvd=="calibrated" & 
+      test_results$replica==i 
+  test_results[new_row, error_metrics] <- unlist(errors)
+  
+  norm.Scores <- sweep(est.Scores, 2, STATS=sqrt(colSums(est.Scores^2)), FUN="/")
+  test_results[new_row, "scores_orth"] <- sqrt(mean((eye(3)-t(norm.Scores)%*%norm.Scores)^2))
+  
+  for(curr_lambda in lambda_grid){
+  cat("Current lambda:", curr_lambda, "\n")
+    
+    for(rsvd_solver in c("monolithic","sequential","subspace")){
+      cat("Solver:", rsvd_solver, "\n")
+      
+      #params
+      json_data$RunParams$RSVDType <- unbox(rsvd_solver)
+      json_data$RunParams$fixed_lambda <- unbox(curr_lambda)
+      json_data$SubspaceIterations$lambdas <- rep(curr_lambda,3)
+      write_json(json_data, "params.json", pretty = TRUE)
+              
+      #run the program
+      system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/subspace_iterations/subspace_iterations")
+      
+      #results
+      est.PCs <- as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+      est.Scores <- as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+      
+      errors <- compute.errors.FPCA(data, 
+                        est.PCs = est.PCs,
+                        est.Scores = est.Scores
+                        )
+      
+      #store results
+      test_results <- test_results %>%
+          add_row(rsvd=rsvd_solver, replica=i, lambda=curr_lambda)
+        new_row <- 
+          test_results$rsvd==rsvd_solver & 
+          test_results$replica==i &
+          test_results$lambda==curr_lambda
+      test_results[new_row, error_metrics] <- unlist(errors)
+      
+      norm.Scores <- sweep(est.Scores, 2, STATS=sqrt(colSums(est.Scores^2)), FUN="/")
+      test_results[new_row, "scores_orth"] <- sqrt(mean((eye(3)-t(norm.Scores)%*%norm.Scores)^2))
+    }#rsvd_solver
+  }#lambdas
+}#replicas
+```
+
+
+## Visualization
+```{r}
+source("../r-utils/plot_utils.R")
+
+color_map <- c(
+  "sequential" = "#2297E6",
+  "monolithic" = "#DF536B",
+  "subspace" = "#F5C710"
+)
+
+plot_dir <- "plots/lambda-sensibility"
+```
+
+
+### Legend
+```{r}
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+dummy_plot <- 
+  ggplot(data.frame(x = 1:length(color_map), y=1:length(color_map),
+                  method=names(color_map)), 
+       aes(x = x, y = y, fill = method)) +
+  geom_boxplot() +  # Use points just for the purpose of displaying the legend
+  scale_fill_manual(values = color_map) +  # Use the custom color mapping
+  theme_void() +                            # Remove axes and background
+  labs(fill = NULL) +
+  guides(fill = guide_legend(nrow = 1))    
+
+
+
+legend <- cowplot::get_legend(dummy_plot)
+grid.newpage()
+grid.draw(legend)
+
+legend_grob <- grid.grabExpr(grid.draw(legend))
+
+ggsave(paste(plot_dir,"/legend",
+             ".pdf", sep=""), 
+       legend_grob, width = 5, height = 1)
+```
+
+
+### Accuracy
+```{r}
+test_results$lambda <- as.factor(test_results$lambda)
+```
+
+
+#### PCs
+```{r}
+save <- F
+
+for(i in 1:3){
+  errPC.plot <- ggplot(subset(subset(test_results,lambda %in% as.factor(10^(-4:2))),rsvd!="calibrated"), 
+                       aes(x=lambda, y=get(paste("errPC",i,sep="")), fill=rsvd)) + 
+    geom_hline(yintercept = median(test_results[test_results$rsvd=="calibrated",][[paste("errPC",i,sep="")]]),
+               linetype = "dashed", col="darkgrey",linewidth=1) +
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(x="lambda", y=paste("errPC",i,sep=""),fill=NULL)  +
+    theme(text = element_text(size=20)) +
+    guides(color="none",fill="none")  
+
+  print(errPC.plot)
+  
+  if(save){
+    ggsave(paste(plot_dir,
+               "/errPC",i,
+             ".pdf", sep=""), 
+       errPC.plot, width = 10, height = 5)
+  }
+}
+```
+
+#### Scores
+```{r}
+for(i in 1:3){
+  errScores.plot <- ggplot(subset(subset(test_results,lambda %in% as.factor(10^(-4:2))),rsvd!="calibrated"), 
+                       aes(x=lambda, y=get(paste("errScore",i,sep="")), fill=rsvd)) + 
+    geom_hline(yintercept = median(test_results[test_results$rsvd=="calibrated",][[paste("errScore",i,sep="")]]),
+               linetype = "dashed", col="darkgrey",linewidth=1) +
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(x="lambda", y=paste("errScore",i,sep=""),fill=NULL)  +
+    theme(text = element_text(size=20)) +
+    guides(color="none",fill="none")
+    
+  print(errScores.plot)
+  
+  if(save){
+    ggsave(paste(plot_dir,
+               "/errScore",i,
+             ".pdf", sep=""), 
+       errScores.plot, width = 10, height = 5)
+  }
+}
+```
+
+#### Signal
+```{r}
+errSignal.plot <- ggplot(subset(subset(test_results,lambda %in% as.factor(10^(-6:2))),rsvd!="calibrated"), 
+                       aes(x=lambda, y=signal_reconstruction_error, fill=rsvd)) + 
+    geom_hline(yintercept = 
+                 median(test_results[test_results$rsvd=="calibrated",][["signal_reconstruction_error"]]),
+               linetype = "dashed", col="darkgrey",linewidth=1) +
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(x="lambda", y="reconstruction error",fill=NULL)  +
+    theme(text = element_text(size=20),legend.position = "top") +
+    guides(color="none",fill="none") + scale_y_log10()
+  
+print(errSignal.plot)
+
+if(save){
+  ggsave(paste(plot_dir,
+              "/signal_rec",
+             ".pdf", sep=""), 
+       errSignal.plot, width = 10, height = 5)
+}
+```
+
+
+```{r}
+scores_orth.plot <- ggplot(subset(test_results,rsvd!="calibrated"), 
+                       aes(x=lambda, y=scores_orth, fill=rsvd)) + 
+    geom_hline(yintercept = 
+                 median(test_results[test_results$rsvd=="calibrated",][["scores_orth"]]),
+               linetype = "dashed", col="darkgrey",linewidth=1) +
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(x="lambda", y="scores orthonormality",fill=NULL)  +
+    theme(text = element_text(size=20),legend.position = "top") +
+    guides(color="none",fill="none") + scale_y_log10()
+  
+  
+ 
+print(scores_orth.plot)
+
+if(save){
+  ggsave(paste(plot_dir,
+              "/scores_orth",
+             ".pdf", sep=""), 
+       scores_orth.plot, width = 10, height = 5)
+}
+```
+
+## Save
+```{r}
+if(save){
+ write.csv(format(test_results, digits = 16),
+          paste("past-runs",
+                paste("lambda-sens",
+                      "-Mesh", 900,
+                      "-Obs", 200,
+                      "-LocsEQnod",
+                      ".csv",sep=""),
+          sep="/")
+) 
+}
+```
+

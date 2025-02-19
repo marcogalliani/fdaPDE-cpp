@@ -1,0 +1,229 @@
+---
+title: "Varying the number of observations"
+params: 
+  solver: "monolithic"
+  n_nodes: 900
+  n_replicas: 10
+  n_cores: 1
+---
+
+## Introduction
+
+In this experiment we're gonna test the behaviour of various types of fpca while varying the number of spatial locations at which the observations are measured
+
+Summing up, we got:
+- fixed number of nodes in the mesh, $N$
+- varying number of observations, $M$
+- fixed number of locations $n = N$
+
+The fpca we're gonna test are a combination of different RegularizedSVD solvers (monolithic and sequential) and different SVD solvers (exact or randomized)
+```{r}
+svd_versions <- c("exact", "randomized")
+```
+
+Recall that:
+- The monolithic approach involves a Cholesky decomposiyion of a matrix of dimensions $N^2 \times N^2$ and a single SVD of a matrix of dimensions $M \times N^2$
+
+- The sequential approach involves the solution of a single SVD of a matrix of dimensions $M \times n^2$ and the sequential update of the components
+
+```{r}
+library(fdaPDE)
+library(femR)
+
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_test"
+results_path <- "results"
+
+plot_path <- "plots-n_unitsVAR"
+
+n_replicas <- params$n_replicas
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+Set the hyperparameters for the experiment by changing the file `params.json` in the folder 
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox("sequential")
+json_data$RunParams$SVDType <- unbox("randomized")
+
+json_data$RunParams$n_replicas <- unbox(params$n_replicas)
+json_data$RunParams$lambda <- unbox(params$lambda)
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+- set the parameters to generate the data
+```{r}
+n_units <- params$n_statistical_units
+n_replicas <- params$n_replicas
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+## Data
+```{r}
+source("../r-utils/mesh_utils.R")
+generate.mesh_and_eigenfunctions <- function(n_nodes, mesh_path,
+                                    n_locs, locs_path){
+  ##(1) Mesh generation
+  mesh.2D <- unit_square.mesh(n_nodes, mesh_path)
+  #'define a dummy pde to get the stiffness and the mass matrices of the 
+  #'differential operator
+  mesh <- Mesh(
+    list(
+      nodes = mesh.2D$nodes,
+      elements = mesh.2D$triangles,
+      boundary = mesh.2D$nodesmarkers
+    )
+  )
+  Vh <- FunctionSpace(mesh, fe_order=1)
+  u <- Function(Vh)
+  
+  L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    1.5 #intensity
+    )
+  f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+  pde <- Pde(L(u), f)
+  
+  ##(2) Eigenfunctions
+  #evd
+  evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+  #at mesh nodes
+  f1_fem <- evd$vectors[,20]
+  f2_fem <- evd$vectors[,29]
+  f3_fem <- evd$vectors[,4]
+
+  ##(3) Evaluate at locations
+  locations.obs.2D <- unit_square.locs(n_locs,locs_path) #locations at nodes
+  Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+  #L2 norm
+  L2norm <- L2norm.factory(mesh.2D, L) #function to compute the norm
+  #final components
+  f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+  f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+  f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+  
+  return(cbind(f1,f2,f3))
+}
+```
+
+Actual generation (mesh & PCs)
+```{r}
+true_PCs <- generate.mesh_and_eigenfunctions(
+  params$n_nodes, mesh_data_path,
+  params$n_nodes, obs_data_path #locsEQnod
+)
+```
+
+## Run
+```{r}
+test_nobs <- c(50,100,200,300,400,600,800,1600)
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+To store the results
+```{r}
+library(dplyr)
+
+keys <- c("rsvd","svd","replica","n_units")
+
+error_metrics <- c("errPC1","errPC2","errPC3",
+                   "errScore1","errScore2","errScore3",
+                   "signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+time_metrics <- c("exe_time","svd_time","other_time")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,time_metrics))))
+names(test_results) <- c(keys, error_metrics,time_metrics)
+
+test_results[] <- lapply(test_results, function(x) numeric())
+
+test_results$rsvd <- character()
+test_results$svd <- character()
+```
+
+```{r}
+source("../r-utils/error_metrics.R")
+
+
+for(k in seq_along(test_nobs)){
+  ### number of statistical units
+  N <- test_nobs[k]
+  cat("\nNumber of observations: ",N,"\n")
+
+  for(ind_rep in 1:n_replicas) {
+    data <- 
+      data_generator(N,
+                     true_PCs = true_PCs,
+                     scores_sd = c(0.4,0.3,0.2),
+                     error_sd = 0.1,
+                     obs_path = obs_data_path,
+                     seed = seed + 4*ind_rep)
+    
+    #repeat the experiment for each svd_version
+    for(rsvd_version in c("sequential","monolithic")){
+      cat("RSVD version: ", rsvd_version, "\n")
+      json_data$RunParams$RSVDType <- unbox(rsvd_version)
+      for(svd_version in svd_versions){
+        cat("Svd version: ", svd_version, "\n")
+        
+        #modify the params.json
+        json_data$RunParams$SVDType <- unbox(svd_version)
+        write_json(json_data, "params.json", pretty = TRUE)
+        
+        #run the program
+        system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/fpca/fpca_test
+    ")
+        
+        #results
+        est.PCs <- as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+        est.Scores <- as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+        exe_time <- read.csv(file=paste(results_path,"execution_times.csv",sep="/"),header=F)[[1]][1]
+        time_svd <- read.csv(file=paste(results_path,"svd_time.csv",sep="/"),header=F)[[1]][1]
+        time_other <- exe_time - time_svd
+        
+        #compute errors & times
+        errors <- compute.errors.FPCA(data, 
+                                      est.PCs = est.PCs,
+                                      est.Scores = est.Scores
+                                      )
+        
+        test_results <- test_results %>%
+          add_row(rsvd=rsvd_version, svd=svd_version, replica=ind_rep, n_units=N)
+        new_row <- 
+          test_results$rsvd==rsvd_version & 
+          test_results$svd==svd_version & 
+          test_results$replica==ind_rep &
+          test_results$n_units==N
+        test_results[new_row, error_metrics] <- unlist(errors)
+        test_results[new_row, time_metrics] <- c(exe_time,time_svd,time_other)
+      }#svd version
+    }#rsvd version
+  }#replicas
+}#n_obs
+```
+
+
+## Saving the results
+```{r}
+write.csv(format(test_results, digits = 16),
+          paste("past-runs",
+                paste("overall-fpca-test",
+                      "-Mesh",params$n_nodes,
+                      "-Obs","VAR",
+                      "-LocsEQnod",
+                      ".csv",sep=""),
+          sep="/")
+)
+```
+

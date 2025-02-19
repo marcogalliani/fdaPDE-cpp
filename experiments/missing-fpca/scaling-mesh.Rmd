@@ -1,0 +1,260 @@
+---
+title: "Missing data"
+params: 
+  n_units: 200
+  n_pc: 3
+  lambda: 0.00001
+  n_replicas: 10
+---
+
+## Introduction
+
+- directories
+```{r}
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_miss_test"
+results_path <- "results"
+plot_path <- "plots/"
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+
+## Parameters
+- `params.json` 
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox("monolithic")
+json_data$RunParams$SVDType <- unbox("randomized")
+json_data$RunParams$lambda <- unbox(params$lambda)
+json_data$RunParams$n_pc <- unbox(params$n_pc)
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+- data generation params
+```{r}
+seed = 467897965 ## for reproducibility purposes
+
+n_units <- params$n_units
+```
+
+
+## Test
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+```{r}
+ind.space.NA <- function(data_vector,p=0.25){
+  size <- length(data_vector)
+  data_vector[sample(1:size,size-round(size*p))] <- NA
+  return(data_vector)
+}
+```
+
+### Metrics
+```{r}
+test_nodes <- c(100,400,900,1600,2500)
+```
+
+
+```{r}
+library(dplyr)
+
+keys <- c("rsvd","n_nodes","replica")
+
+error_metrics <- c("errPC1","errPC2","errPC3",
+                   "errScore1","errScore2","errScore3",
+                   "signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+time_metrics <- c("exe_time")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,time_metrics))))
+names(test_results) <- c(keys, error_metrics,time_metrics)
+
+test_results[] <- lapply(test_results, function(x) numeric())
+
+test_results$rsvd <- character()
+test_results$missing_policy <- character()
+```
+
+
+Compute error metrics
+```{r}
+source("../r-utils/error_metrics.R")
+```
+
+
+### Run
+```{r}
+for(curr_nnodes in test_nodes){
+  ##(1) Mesh generation
+  cat("\nNumber of Nodes: ", curr_nnodes,"\n")
+  mesh.2D <- unit_square.mesh(curr_nnodes,mesh_data_path)
+  L2norm <- L2norm.factory(mesh.2D) #function to compute the norm
+  
+  ##(2) Eigenfunctions
+  ## use n = N for the setting locations = mesh nodes
+  ## (in this case, \Psi is the identity matrix)
+  ## use n != N for the general case. Set n > N.
+  
+  locations.obs.2D <- unit_square.locs(curr_nnodes,obs_data_path)
+  
+  ## (2.1) at mesh nodes
+  ## evaluate eigenfunctions on mesh nodes (this is equivalent to get the FEM basis
+  ## expansion of the eigenfunctions ). change values of a and b to select eigenfunction
+  f1_fem <- square_eigenfunction(a = 1, b = 1, mesh.2D$nodes)
+  f2_fem <- square_eigenfunction(a = 2, b = 3, mesh.2D$nodes)
+  f3_fem <- square_eigenfunction(a = 4, b = 4, mesh.2D$nodes)
+  
+  ## (2.2) at locations (normalized)
+  Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+  
+  f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+  f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+  f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+  
+  true_PCs <- cbind(f1,f2,f3)
+  
+
+  for(ind_rep in 1:params$n_replicas){
+    ##(3) Data generation + missing
+    data <- data_generator(n_units,
+                         true_PCs = true_PCs,
+                         scores_sd = c(0.4,0.3,0.2),
+                         error_sd = 0.1,
+                         obs_path = obs_data_path,
+                         seed = seed+4*ind_rep)
+    #add missingness
+    data$data_w_missing <- t(apply(data$noisy_data, 1, ind.space.NA))
+    write.csv(format(data$data_w_missing, digits = 16),
+            paste(obs_data_path,"datamatrix_centred.csv",sep="/"))
+    
+    
+    for(rsvd_policy in c("monolithic","sequential")){
+        json_data$RunParams$RSVDType <- unbox(rsvd_policy)
+        write_json(json_data, "params.json", pretty = TRUE)
+        
+        #run the program
+        system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/missing-fpca/fpca_miss")
+        
+        #load results
+        est.PCs <- 
+          as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+        est.Scores <- 
+          as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/"))) 
+        exe_time <- read.csv(file=paste(results_path,"execution_time.csv",sep="/"),
+                             header = T)$V1
+        
+        #compute metrics
+        errors <- compute.errors.FPCA(data, est.PCs, est.Scores)
+        
+        test_results <- test_results %>%
+          add_row(rsvd = rsvd_policy, n_nodes=curr_nnodes,replica = ind_rep)
+        new_row <- test_results$rsvd==rsvd_policy & 
+          test_results$n_nodes==curr_nnodes & 
+          test_results$replica==ind_rep
+        
+        test_results[new_row, error_metrics] <- 
+          unlist(errors)
+        test_results[new_row, time_metrics] <- exe_time
+      
+    }#rsvd policy
+  }#replica
+}#n_nodes  
+```
+
+
+## Visualization
+```{r}
+source("../r-utils/plot_utils.R")
+
+test_results$n_nodes <- as.factor(test_results$n_nodes)
+
+plot_title <- paste("mesh: variable, ",
+               "locs: equal to nodes, ",
+               "stat_units: ",params$n_units,
+               sep = "")
+```
+
+```{r}
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+
+col_palette <- hue_pal()(2)
+color_map <- c(
+  "monolithic" = col_palette[1],
+  "sequential" = col_palette[2]
+)
+```
+
+### Errors
+```{r}
+save <- F
+
+for(err in error_metrics){
+  
+  plot <- grouped_boxplot(test_results, err,
+                var_name.x = "n_nodes", var_name.y = err,
+                group_name = "rsvd", color_map = color_map,
+                legend=T)
+  
+  print(plot)
+  
+  if(save){
+    ggsave(paste("plots/",
+                 "scaling-mesh-missing",
+                  "-Obs",params$n_obs,
+             ".pdf", sep=""), 
+         plot, width = 10, height = 5)
+  }
+}
+```
+
+### Times
+```{r}
+save <- F
+
+
+
+plot <- grouped_boxplot(test_results, "Execution time[s]",
+              var_name.x = "n_nodes", var_name.y = "exe_time",
+              group_name = "rsvd", color_map = color_map,
+              legend=T, log.y = T)
+
+print(plot)
+
+if(save){
+  ggsave(paste("plots/",
+              "scaling-mesh-missing-", 
+              "exe_time",
+             "-Obs",params$n_obs,
+           ".pdf", sep=""), 
+       plot, width = 10, height = 5)
+}
+
+```
+
+
+### Save the results
+```{r}
+write.csv(format(test_results, digits = 16),
+          paste("past-runs",
+                paste("missing-scaling-mesh",
+                      "-MeshVAR",
+                      "-Obs",params$n_statistical_units,
+                      "-LocsEqNod",
+                      ".csv",sep=""),
+          sep="/")
+)
+```

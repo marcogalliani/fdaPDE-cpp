@@ -1,0 +1,348 @@
+---
+title: "fpca test"
+---
+
+## Introduction
+```{r}
+file_name <- paste("overall-fpca-test",
+                    "-Mesh", 900,
+                    "-Obs", "VAR",
+                    "-Locs", "EQnod",
+                    ".csv",sep="")
+
+library(readr)
+test_results <- read_csv(paste("past-runs",file_name,sep="/"),
+                         col_types = cols(...1 = col_skip()))
+test_results$n_units <- as.factor(test_results$n_units)
+
+test_results$algorithm <- paste(test_results$rsvd,"-",test_results$svd,sep="")
+```
+
+
+Colors
+```{r}
+show_col(palette.colors(n=8, palette = "R4"))
+```
+
+
+```{r}
+source("../r-utils/plot_utils.R")
+
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+
+color_map <- c(
+  "sequential-exact" = "#2297E6",
+  "sequential-randomized" = "#28E2E5",
+  "monolithic-exact" = "#DF536B",
+  "monolithic-randomized" = "#F5C710"
+)
+
+dummy_plot <- 
+  ggplot(data.frame(x = 1:length(color_map), y=1:length(color_map),
+                  method=names(color_map)), 
+       aes(x = x, y = y, color = method)) +
+  geom_point(size = 5) +  # Use points just for the purpose of displaying the legend
+  scale_color_manual(values = color_map) +  # Use the custom color mapping
+  theme_void() +                            # Remove axes and background
+  labs(color = "Algorithm") +
+  guides()
+
+
+
+legend <- cowplot::get_legend(dummy_plot)
+grid.newpage()
+grid.draw(legend)
+
+legend_grob <- grid.grabExpr(grid.draw(legend))
+
+ggsave(paste("plots-n_unitsVAR/legend-fpca-n_unitsVAR",
+             ".pdf", sep=""), 
+       legend_grob, width = 2, height = 2)
+```
+
+
+
+## Accuracy analysis
+### PCs
+```{r}
+source("../r-utils/plot_utils.R")
+
+
+for(i in 1:3){
+  errPC.plot <- grouped_boxplot(test_results,
+                 "n_units", paste("errPC",i,sep=""),
+                 group_name = "algorithm", color_map
+                 ) 
+  print(errPC.plot)
+  
+  ggsave(paste("plots-n_unitsVAR/",
+             paste("errPC",i,sep=""),
+             "-fpca",
+             "-n_unitsVAR",
+             ".pdf", sep=""), 
+       errPC.plot, width = 10, height = 5)
+}
+```
+
+### Scores
+```{r}
+for(i in 1:3){
+  errScores.plot <- grouped_boxplot(test_results,
+                 "n_units", paste("errScore",i,sep=""),
+                 group_name = "algorithm", color_map
+                 ) 
+  print(errScores.plot)
+  
+  ggsave(paste("plots-n_unitsVAR/",
+             paste("errScore",i,sep=""),
+             "-fpca",
+             "-n_unitsVAR",
+             ".pdf", sep=""), 
+       errScores.plot, width = 10, height = 5)
+}
+```
+
+### Signal
+```{r}
+errSignal.plot <- grouped_boxplot(test_results,
+                 "n_units", "signal_reconstruction_error",
+                 group_name = "algorithm", color_map
+                 ) + ylab("reconstr_err")
+print(errSignal.plot)
+  
+ggsave(paste("plots-n_unitsVAR/",
+           "signal_reconstruction_error",
+           "-fpca",
+           "-n_unitsVAR",
+           ".pdf", sep=""), 
+     errSignal.plot, width = 10, height = 5)
+```
+
+
+```{r}
+plot <- ggplot(test_results, aes(x=n_units, 
+                                 y=signal_reconstruction_error, 
+                                 fill=algorithm)
+               ) + 
+    geom_boxplot() +
+    scale_fill_manual(values = color_map, 
+                      labels = c("sequential-exact" = "seq-exact", 
+                                 "sequential-randomized" = "seq-rand", 
+                                 "monolithic-exact" = "mono-exact",
+                                 "monolithic-randomized" = "mono-rand")) +
+    theme_light() +
+    labs(x="n_units", y="Reconstruction error",fill=NULL)  +
+    theme(text = element_text(size=20), legend.position = "top") + scale_y_log10()
+
+print(plot)
+
+ggsave(paste("plots-n_unitsVAR/",
+           "signal_reconstruction_error-report",
+           "-fpca",
+           "-n_unitsVAR",
+           ".pdf", sep=""), 
+     plot, width = 10, height = 5)
+```
+
+## Execution times
+
+### Overall
+```{r}
+source("../r-utils/plot_utils.R")
+
+med_exe_time <- test_results %>%
+  group_by(algorithm,n_units) %>%
+  summarise(exe_time = median(exe_time))
+
+
+exe_time.plot <- grouped_lineplot(med_exe_time,
+                 "n_units", "exe_time",
+                 group_name = "algorithm", color_map,
+                 log.x = T,
+                 log.y = T, 
+                 complexity.lines=c(1/2,1,2),
+                 ) 
+print(exe_time.plot)
+  
+ggsave(paste("plots-n_unitsVAR/",
+           "exe_time",
+           "-fpca",
+           "-n_unitsVAR",
+           ".pdf", sep=""), 
+     exe_time.plot, width = 10, height = 5)
+```
+
+
+### Profiling
+```{r}
+time_palette <- palette.colors(n=3, palette = "R4")
+color_map_time <- c(
+  "svd_time" = "#CD0BBC",
+  "other_time" = "#61D04F"
+)
+```
+
+#### Plain times
+```{r}
+time_composition <- 
+  test_results %>%
+    group_by(algorithm, n_units) %>%
+    summarise(svd_time = median(svd_time),
+              other_time = median(other_time)) %>%
+    tidyr::pivot_longer(cols = c("svd_time","other_time"),
+                                  names_to = "op_type", values_to = "op_time")
+
+svd_profile.plt <- ggplot(time_composition, aes(x=n_units, y=op_time, fill=op_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = color_map_time) +
+  labs(
+      y = "Execution time [s]",
+      fill = "Time composition"
+    ) +
+  facet_wrap(~algorithm, scales = "free_x") +
+  theme_light()  +
+  theme(text = element_text(size=15))
+
+print(svd_profile.plt)
+```
+Coloring the labels
+```{r}
+svd_profile.plt <- ggplot_gtable(ggplot_build(svd_profile.plt))
+grid.newpage()
+grid.draw(svd_profile.plt)
+
+strip <- which(grepl('strip-t', svd_profile.plt$layout$name))
+fills <- c(
+  "sequential-exact" = "#2297E6",
+  "sequential-randomized" = "#28E2E5",
+  "monolithic-exact" = "#DF536B",
+  "monolithic-randomized" = "#F5C710"
+)
+k <- 1
+for (i in strip) {
+j <- which(grepl('rect', svd_profile.plt$grobs[[i]]$grobs[[1]]$childrenOrder))
+svd_profile.plt$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+k <- k+1
+}
+
+grid.newpage()
+grid.draw(svd_profile.plt)
+
+ggsave(paste("plots-n_unitsVAR/",
+           "overall-time-profiling",
+           "-fpca",
+           "-n_unitsVAR",
+           ".pdf", sep=""), 
+     svd_profile.plt, width = 10, height = 5)
+```
+
+
+```{r}
+gtable_show_layout(svd_profile.plt)
+
+grid.newpage()
+grid.draw(svd_profile.plt[10:11,6:7])
+```
+
+
+#### % times
+```{r}
+svd_pct.plt <- ggplot(time_composition, aes(x=n_units, y=op_time, fill=op_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = color_map_time) +
+  scale_y_continuous(labels = scales::percent) + 
+  labs(
+      y = "SVD time [%]",
+      fill = "Time composition"
+    ) +
+  facet_wrap(~algorithm, scales = "free_x") +
+  theme_light() +
+  theme(text = element_text(size=15))
+
+print(svd_pct.plt)
+```
+
+Coloring the labels
+```{r}
+svd_pct.plt <- ggplot_gtable(ggplot_build(svd_pct.plt))
+grid.newpage()
+grid.draw(svd_pct.plt)
+
+strip <- which(grepl('strip-t', svd_pct.plt$layout$name))
+fills <- c(
+  "sequential-exact" = "#2297E6",
+  "sequential-randomized" = "#28E2E5",
+  "monolithic-exact" = "#DF536B",
+  "monolithic-randomized" = "#F5C710"
+)
+k <- 1
+for (i in strip) {
+j <- which(grepl('rect', svd_pct.plt$grobs[[i]]$grobs[[1]]$childrenOrder))
+svd_pct.plt$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+k <- k+1
+}
+
+
+grid.newpage()
+grid.draw(svd_pct.plt)
+
+
+ggsave(paste("plots-n_unitsVAR/",
+           "pct-time-profiling",
+           "-fpca",
+           "-n_unitsVAR",
+           ".pdf", sep=""), 
+     svd_pct.plt, width = 10, height = 5)
+```
+
+### Table for the presentation
+```{r}
+gtable_show_layout(svd_pct.plt)
+```
+
+```{r}
+width.plt <- 6
+height.plt <- 3
+
+
+#monolithic exact
+grid.newpage()
+grid.draw(svd_pct.plt[10:11,6:7])
+
+ggsave(paste("table-unitsVAR/",
+           "mono-exact",
+           ".png", sep=""), 
+     svd_pct.plt[10:11,6:7], width = width.plt, height = height.plt)
+
+#monolithic randomized
+grid.newpage()
+grid.draw(svd_pct.plt[10:11,c(6,11)])
+
+ggsave(paste("table-unitsVAR/",
+           "mono-rand",
+           ".png", sep=""), 
+     svd_pct.plt[10:11,c(6,11)], width = width.plt, height = height.plt)
+
+#sequential exact
+grid.newpage()
+grid.draw(svd_pct.plt[15:16,6:7])
+
+ggsave(paste("table-unitsVAR/",
+           "seq-exact",
+           ".png", sep=""), 
+     svd_pct.plt[15:16,6:7], width = width.plt, height = height.plt)
+
+#sequential randomized
+grid.newpage()
+grid.draw(svd_pct.plt[15:16,c(6,11)])
+
+ggsave(paste("table-unitsVAR/",
+           "seq-rand",
+           ".png", sep=""), 
+     svd_pct.plt[15:16,c(6,11)], width = width.plt, height = height.plt)
+```
+
+

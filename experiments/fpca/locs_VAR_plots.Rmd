@@ -1,0 +1,251 @@
+---
+title: "fpca test"
+---
+
+## Introduction
+```{r}
+file_name <- paste("overall-fpca-test",
+                    "-Mesh", 400,
+                    "-Obs", 200,
+                    "-Locs", "VAR",
+                    ".csv",sep="")
+
+library(readr)
+test_results <- read_csv(paste("past-runs",file_name,sep="/"),
+                         col_types = cols(...1 = col_skip()))
+test_results$n_locs <- as.factor(test_results$n_locs)
+
+test_results$algorithm <- paste(test_results$rsvd,"-",test_results$svd,sep="")
+```
+
+
+```{r}
+source("../r-utils/plot_utils.R")
+
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+
+color_map <- c(
+  "sequential-exact" = "#2297E6",
+  "sequential-randomized" = "#28E2E5",
+  "monolithic-exact" = "#DF536B",
+  "monolithic-randomized" = "#F5C710"
+)
+
+dummy_plot <- 
+  ggplot(data.frame(x = 1:length(color_map), y=1:length(color_map),
+                  method=names(color_map)), 
+       aes(x = x, y = y, color = method)) +
+  geom_point(size = 5) +  # Use points just for the purpose of displaying the legend
+  scale_color_manual(values = color_map) +  # Use the custom color mapping
+  theme_void() +                            # Remove axes and background
+  labs(color = "Algorithm") +
+  guides()
+
+
+
+legend <- cowplot::get_legend(dummy_plot)
+grid.newpage()
+grid.draw(legend)
+
+legend_grob <- grid.grabExpr(grid.draw(legend))
+
+ggsave(paste("plots-locsVAR/legend-fpca-locsVAR",
+             ".pdf", sep=""), 
+       legend_grob, width = 2, height = 2)
+```
+
+
+
+## Accuracy analysis
+### PCs
+```{r}
+for(i in 1:3){
+  errPC.plot <- grouped_boxplot(test_results,
+                 "n_locs", paste("errPC",i,sep=""),
+                 group_name = "algorithm", color_map
+                 ) 
+  print(errPC.plot)
+  
+  ggsave(paste("plots-locsVAR/",
+             paste("errPC",i,sep=""),
+             "-fpca",
+             "-locsVAR",
+             ".pdf", sep=""), 
+       errPC.plot, width = 10, height = 5)
+}
+```
+
+### Scores
+```{r}
+for(i in 1:3){
+  errScores.plot <- grouped_boxplot(test_results,
+                 "n_locs", paste("errScore",i,sep=""),
+                 group_name = "algorithm", color_map
+                 ) 
+  print(errScores.plot)
+  
+  ggsave(paste("plots-locsVAR/",
+             paste("errScore",i,sep=""),
+             "-fpca",
+             "-locsVAR",
+             ".pdf", sep=""), 
+       errScores.plot, width = 10, height = 5)
+}
+```
+
+### Signal
+```{r}
+errSignal.plot <- grouped_boxplot(test_results,
+                 "n_locs", "signal_reconstruction_error",
+                 group_name = "algorithm", color_map
+                 ) + ylab("reconstr_err")
+print(errSignal.plot)
+  
+ggsave(paste("plots-locsVAR/",
+           "signal_reconstruction_error",
+           "-fpca",
+           "-locsVAR",
+           ".pdf", sep=""), 
+     errSignal.plot, width = 10, height = 5)
+```
+## Execution times
+
+### Overall
+```{r}
+med_exe_time <- test_results %>%
+  group_by(algorithm,n_locs) %>%
+  summarise(exe_time = median(exe_time))
+
+exe_time.plot <- grouped_lineplot(med_exe_time,
+                 "n_locs", "exe_time",
+                 group_name = "algorithm", color_map,
+                 log.x = T,
+                 log.y = T, 
+                 complexity.lines=c(1/2,1,2),
+                 ) 
+print(exe_time.plot)
+  
+ggsave(paste("plots-locsVAR/",
+           "exe_time",
+           "-fpca",
+           "-locsVAR",
+           ".pdf", sep=""), 
+     exe_time.plot, width = 10, height = 5)
+```
+
+### Profiling
+```{r}
+color_map_time <- c(
+  "svd_time" = "#CD0BBC",
+  "other_time" = "#61D04F"
+)
+```
+
+#### Plain times
+```{r}
+time_composition <- 
+  test_results %>%
+    group_by(algorithm, n_locs) %>%
+    summarise(svd_time = median(svd_time),
+              other_time = median(other_time)) %>%
+    tidyr::pivot_longer(cols = c("svd_time","other_time"),
+                                  names_to = "op_type", values_to = "op_time")
+
+svd_profile.plt <- ggplot(time_composition, aes(x=n_locs, y=op_time, fill=op_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = color_map_time) +
+  labs(
+      y = "Execution time [s]",
+      fill = "Time composition"
+    ) +
+  facet_wrap(~algorithm, scales = "free_x") +
+  theme_light() +
+  theme(text = element_text(size=15))
+
+print(svd_profile.plt)
+```
+
+Adding colors
+```{r}
+svd_profile.plt <- ggplot_gtable(ggplot_build(svd_profile.plt))
+grid.newpage()
+grid.draw(svd_profile.plt)
+
+strip <- which(grepl('strip-t', svd_profile.plt$layout$name))
+fills <- c(
+  "sequential-exact" = "#2297E6",
+  "sequential-randomized" = "#28E2E5",
+  "monolithic-exact" = "#DF536B",
+  "monolithic-randomized" = "#F5C710"
+)
+k <- 1
+for (i in strip) {
+j <- which(grepl('rect', svd_profile.plt$grobs[[i]]$grobs[[1]]$childrenOrder))
+svd_profile.plt$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+k <- k+1
+}
+
+grid.newpage()
+grid.draw(svd_profile.plt)
+
+ggsave(paste("plots-locsVAR/",
+           "overall-time-profiling",
+           "-fpca",
+           "-locsVAR",
+           ".pdf", sep=""), 
+     svd_profile.plt, width = 10, height = 5)
+```
+
+
+#### % times
+```{r}
+svd_pct.plt <- ggplot(time_composition, aes(x=n_locs, y=op_time, fill=op_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = color_map_time) +
+  scale_y_continuous(labels = scales::percent) + 
+  labs(
+      y = "SVD time [%]",
+      fill = "Time composition"
+    ) +
+  facet_wrap(~algorithm, scales = "free_x") +
+  theme_light() +
+  theme(text = element_text(size=15))
+
+print(svd_pct.plt)
+```
+
+```{r}
+svd_pct.plt <- ggplot_gtable(ggplot_build(svd_pct.plt))
+grid.newpage()
+grid.draw(svd_pct.plt)
+
+strip <- which(grepl('strip-t', svd_pct.plt$layout$name))
+fills <- c(
+  "sequential-exact" = "#2297E6",
+  "sequential-randomized" = "#28E2E5",
+  "monolithic-exact" = "#DF536B",
+  "monolithic-randomized" = "#F5C710"
+)
+k <- 1
+for (i in strip) {
+j <- which(grepl('rect', svd_pct.plt$grobs[[i]]$grobs[[1]]$childrenOrder))
+svd_pct.plt$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+k <- k+1
+}
+
+
+grid.newpage()
+grid.draw(svd_pct.plt)
+
+ggsave(paste("plots-locsVAR/",
+           "pct-time-profiling",
+           "-fpca",
+           "-locsVAR",
+           ".pdf", sep=""), 
+     svd_pct.plt, width = 10, height = 5)
+```
+
+

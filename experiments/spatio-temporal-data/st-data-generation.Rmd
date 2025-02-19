@@ -1,0 +1,341 @@
+---
+title: "Generation of spatio-temporal data"
+params:
+  n_nodes: 100
+  t_steps: 10
+---
+
+## Introduction
+```{r}
+library(fdaPDE)
+library(femR)
+```
+
+
+## Parameters
+- set the parameters to generate the data
+```{r}
+n_nodes <- params$n_nodes
+t_steps <- params$t_steps
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+- params.json
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$EVDType <- unbox("exact")
+json_data$RunParams$n_eigenvectors <- unbox(30)
+
+json_data$DiffusionOp$alpha1 <- unbox(1/3*pi)
+json_data$DiffusionOp$alpha2 <- unbox(4/3*pi)
+json_data$DiffusionOp$gamma1 <- unbox(2)
+json_data$DiffusionOp$gamma2 <- unbox(1.5)
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+## Data
+Utils
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+### Mesh
+```{r}
+mesh.2D <- unit_square.mesh(n_nodes)
+time.grid <- seq(0,1,length.out=t_steps)
+
+
+mesh.st <- expand.grid(seq(0,1,length.out=sqrt(n_nodes)),
+                       seq(0,1,length.out=sqrt(n_nodes)),
+                       seq(0,1,length.out=t_steps))
+```
+
+### Eigenfunctions
+
+#### Inside the kernel
+```{r}
+square_eigenfunction.ST.factory <- function(alpha,beta,gamma){
+  return(function(st.grid){
+    cos(alpha*pi*st.grid[,1])*cos(beta*pi*st.grid[,2])*cos(gamma*pi*st.grid[,3])
+  })
+}
+
+f1 <- matrix(square_eigenfunction.ST.factory(1,1,2)(mesh.st),ncol=t_steps)
+f2 <- matrix(square_eigenfunction.ST.factory(1,3,2)(mesh.st),ncol=t_steps)
+f3 <- matrix(square_eigenfunction.ST.factory(4,2,3)(mesh.st),ncol=t_steps)
+```
+
+```{r}
+source("../r-utils/plot_utils.R")
+
+plot_eigenfunction(f2[,9],mesh.2D$nodes,"PC1")
+```
+
+
+```{r}
+plot(f3[1,])
+for(i in 1:t_steps){
+  print(plot_eigenfunction(f1[,i],mesh.2D$nodes,"PC1"))
+}
+```
+
+
+#### Outside the kernel
+
+- Triangularization of the 3D-cube
+```{r}
+## build tetrahedrons (each subcube can be split in 5 tetrahedrons)
+build_tetrahedrons <- function(n.x,n.y,n.z){
+  
+  tetrahedrons <- matrix(0, nrow = 5*(n.x-1)*(n.y-1)*(n.z-1), ncol = 4)
+  j <- 1
+  for (z in seq_len(n.z - 1)) {
+    for (y in seq_len(n.y - 1)) {
+      for (x in seq_len(n.x - 1)) {
+        ## build vector of vertices of i-th subcube
+        p <- x + (y - 1) * n.y + (z - 1) * n.z^2 ## base point
+        v <- c(p, p + 1, p + n.y, p + n.y + 1, p + n.z^2, p + n.z^2 + 1, p + n.z^2 + n.y, p + n.z^2 + n.y + 1)
+        ## compute vertices of each thetraedron in the subcube
+        tetrahedrons[j,     ] <- c(v[1], v[2], v[3], v[5])
+        tetrahedrons[j + 1, ] <- c(v[2], v[3], v[4], v[8])
+        tetrahedrons[j + 2, ] <- c(v[2], v[3], v[5], v[8])
+        tetrahedrons[j + 3, ] <- c(v[2], v[5], v[6], v[8])
+        tetrahedrons[j + 4, ] <- c(v[3], v[5], v[7], v[8])
+        j <- j + 5
+      }
+    }
+  }
+  return(tetrahedrons)
+}
+```
+
+- define the 3D-cube
+```{r}
+mesh_path <- "../data/mesh/unit_cube"
+
+nodes.grid <- expand.grid(seq(0,1,length.out=sqrt(n_nodes)),
+                       seq(0,1,length.out=sqrt(n_nodes)),
+                       seq(0,1,length.out=t_steps))
+mesh.3D <- fdaPDE::create.mesh.3D(nodes.grid,
+                                  build_tetrahedrons(sqrt(n_nodes),sqrt(n_nodes),t_steps))
+if(!is.null(mesh_path)){
+  write.csv(format(mesh.3D$nodes, digits = 16), 
+            paste(mesh_path,"points.csv", sep = "/"))
+  write.csv(format(mesh.3D$tetrahedrons, digits = 16), 
+            paste(mesh_path,"elements.csv", sep = "/"))
+  write.csv(format(1 * mesh.3D$nodesmarkers, digits = 16), 
+            paste(mesh_path,"boundary.csv", sep = "/"))
+  write.csv(format(mesh.3D$neighbors, digits = 16), 
+            paste(mesh_path,"neigh.csv", sep = "/"))
+  write.csv(format(mesh.3D$edges, digits = 16), 
+            paste(mesh_path,"edges.csv", sep = "/"))
+}
+```
+
+- discretize the diffusion operator over the cube
+```{r}
+system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/spatio-temporal-data/st-data-generation")
+
+R0 <- as.matrix(readMM(file=paste("results","R0.mtx",sep="/")))
+R1.eigenvectors <- as.matrix(readMM(file=paste("results","eigenvectorR1.mtx",sep="/")))
+```
+
+- extract some orthogonal functions over the cube
+```{r}
+L2norm <- function(f){
+  return(sqrt(as.numeric(t(f) %*% R0 %*% f)))
+}
+
+i1 <- 5
+i2 <- 10
+i3 <- 15
+
+
+f1 <- matrix(R1.eigenvectors[,i1]/L2norm(R1.eigenvectors[,i1]), ncol=t_steps)
+f2 <- matrix(R1.eigenvectors[,i2]/L2norm(R1.eigenvectors[,i2]), ncol=t_steps)
+f3 <- matrix(R1.eigenvectors[,i3]/L2norm(R1.eigenvectors[,i3]), ncol=t_steps)
+```
+
+
+#### Visualization
+PC1
+```{r}
+source("../r-utils/plot_utils.R")
+
+plot(f1[1,])
+for(i in 1:t_steps){
+  print(plot_eigenfunction(f1[,i],mesh.2D$nodes,"PC1"))
+}
+```
+
+PC2
+```{r}
+source("../r-utils/plot_utils.R")
+
+plot(f2[1,])
+for(i in 1:t_steps){
+  print(plot_eigenfunction(f2[,i],mesh.2D$nodes,"PC2"))
+}
+```
+
+PC3
+```{r}
+source("../r-utils/plot_utils.R")
+
+plot(f3[1,])
+for(i in 1:t_steps){
+  print(plot_eigenfunction(f3[,i],mesh.2D$nodes,"PC3"))
+}
+```
+
+
+
+### Actual data generation
+```{r}
+data <- data_generator(50, 
+                       true_PCs = cbind(c(f1),c(f2),c(f3)), 
+                       scores_sd=c(0.4,0.3,0.2),
+                       error_sd=0.1,
+                       seed=42,obs_path=NULL)
+```
+
+
+### Missingness
+```{r}
+source("../r-utils/NA_generation.R")
+```
+
+
+```{r}
+data$data_w_missing <- t(apply(data$noisy_data, 1, 
+                                  createNA,
+                                  p=0.5,
+                                  schema="d",
+                                  mesh_ref=mesh.2D,
+                                  locations=mesh.2D$nodes,
+                                  RDD_groups=40,
+                                  timelocations=time.grid,
+                                  mesh_ref_time = c(0,1)))
+```
+
+
+
+```{r}
+plot_eigenfunction <- function(data, locs, title) {
+  ## define data.frame for plotting
+  df <- data.frame(
+    x = locs[,1],
+    y = locs[,2],
+    f = data
+  )
+
+  ## Ensure the plot dimensions match the full range of locs
+  x_range <- range(locs[,1], na.rm = TRUE)
+  y_range <- range(locs[,2], na.rm = TRUE)
+
+  ## Check if all data are NA
+  if (all(is.na(data))) {
+    p <- ggplot() +
+      geom_rect(aes(xmin = x_range[1], xmax = x_range[2], ymin = y_range[1], ymax = y_range[2]), fill = "white") +
+      coord_fixed(xlim = x_range, ylim = y_range) +
+      theme_void() +
+      ggtitle(title)
+    return(p)
+  }
+
+  ## colors
+  n_breaks <- 50
+  mybreaks <- c(-Inf, seq(min(data, na.rm = TRUE), max(data, na.rm = TRUE), length.out = n_breaks), Inf)
+  mycolors <- function(x) {
+    colors <- colorRampPalette(viridis(11))(x + 1)
+    colors
+  }
+
+  ## plot
+  p <- ggplot() +
+    geom_contour_filled(data = df, aes(x, y, z = f),
+                        breaks = mybreaks) +
+    scale_fill_manual(
+      aesthetics = "fill",
+      values = c("white", mycolors(n_breaks + 1)), name = "Value", drop = FALSE,
+      na.value = "white"  # Ensure NA is explicitly white
+    ) +
+    coord_fixed(xlim = x_range, ylim = y_range, expand=F) +  # Fix dimensions to match the square
+    theme_void() +
+    theme(legend.position = "none", 
+          plot.title = element_text(hjust = 0.5),
+          panel.border = element_rect(color = "black", fill = NA, size = 0.2)
+          ) + 
+    ggtitle(title)
+  p
+}
+```
+
+
+
+
+```{r}
+ind.obs <- 30
+obs.miss <- matrix(data$data_w_missing[ind.obs,],ncol=t_steps)
+
+for (t_index in 1:t_steps) {
+  
+  plt <- plot_eigenfunction(obs.miss[,t_index],mesh.2D$nodes,paste("t = ",round(time.grid[t_index],digits=1),sep=""))
+  print(plt)
+  
+  ggsave(paste("plots/",
+           "sampled-signal",
+           "-t",t_index,
+           ".pdf", sep=""), 
+     plt, width = 5, height = 5)
+}
+```
+
+```{r}
+library(tidyr)
+library(dplyr)
+col_palette <- palette.colors(n=6, palette = "R4")
+
+# Convert the matrix to a data frame
+df <- as.data.frame(obs.miss[c(3,22,34,74,89,95),])
+var_names <- names(df)
+
+t_vect <- time.grid
+names(t_vect) <- var_names
+
+
+# Add a row identifier (row number)
+df$RowID <- 1:nrow(df)
+
+# Reshape the data into long format (to plot it)
+df_long <- df %>%
+  gather(key = "Variable", value = "Value", -RowID)
+
+
+# Plot using ggplot, handle NA by not connecting points with lines
+plt <- ggplot(df_long, aes(x = t_vect[Variable], y = Value, color = as.factor(RowID), group = RowID)) +
+  geom_point() +  # Add points
+  geom_line(na.rm = TRUE) +  # Add lines, ignoring NA values
+  labs(title = NULL, x = "t", y = NULL, color = NULL) +
+  guides(group="none",color="none") +
+  theme_minimal() + 
+  scale_color_manual(values = col_palette)
+
+print(plt)
+
+ggsave(paste("plots/",
+           "sampled-signal-at.locs",
+           ".pdf", sep=""), 
+     plt, width = 10, height = 5)
+```
+
+
+
+
+
+

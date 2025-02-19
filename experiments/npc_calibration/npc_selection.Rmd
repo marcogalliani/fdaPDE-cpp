@@ -1,0 +1,236 @@
+---
+title: "Selecting the number of PCs"
+params:
+  n_nodes: 100
+  n_locs: 144 #squared
+  n_statistical_units: 50 #[200,400,800,"VAR"]
+---
+
+
+## Params
+```{r}
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_test"
+results_path <- "results"
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+
+```{r}
+n_units <- params$n_statistical_units
+n_nodes <- params$n_nodes
+n_locs <- params$n_locs
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+# grid for the number of components
+json_data$npc_grid$left <- unbox(1)
+json_data$npc_grid$right <- unbox(5)
+
+# grid for the lambdas
+json_data$lambda_grid$dim <- unbox(30)
+json_data$lambda_grid$left <- unbox(-12)
+json_data$lambda_grid$right <- unbox(-5)
+
+#Calibration strategy
+json_data$Calibration$strategy <- unbox("kcv")
+json_data$Calibration$n_folds <- unbox(50)
+
+write_json(json_data, 
+           "params.json", 
+           pretty = TRUE)
+```
+
+```{r}
+lambda_grid <- 10^seq(json_data$lambda_grid$left,json_data$lambda_grid$right,length.out=json_data$lambda_grid$dim)
+npc_grid <- seq(json_data$npc_grid$left,json_data$npc_grid$right)
+```
+
+
+## Data
+Utils
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+
+```{r}
+##(1) Mesh generation
+mesh.2D <- unit_square.mesh(n_nodes, mesh_data_path)
+mesh <- Mesh(
+  list(
+    nodes = mesh.2D$nodes,
+    elements = mesh.2D$triangles,
+    boundary = mesh.2D$nodesmarkers
+  )
+)
+Vh <- FunctionSpace(mesh, fe_order=1)
+u <- Function(Vh)
+
+##(2) Eigenfunctions
+## use n = N for the setting locations = mesh nodes
+## (in this case, \Psi is the identity matrix)
+## use n != N for the general case. Set n > N.
+
+locations.obs.2D <- unit_square.locs(n_locs,obs_data_path)
+
+## (2.1) at mesh nodes
+## evaluate eigenfunctions on mesh nodes (this is equivalent to get the FEM basis
+## expansion of the eigenfunctions ). change values of a and b to select eigenfunction
+L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    1.5 #intensity
+    )
+f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+
+#evd
+evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+  
+#eigen functions
+f1_fem <- evd$vectors[,20]
+f2_fem <- evd$vectors[,29]
+f3_fem <- evd$vectors[,4]
+
+## (2.2) at locations (normalized)
+L2norm <- L2norm.factory(mesh.2D) #function to compute the norm
+Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+
+f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+
+true_PCs <- cbind(f1,f2,f3)
+
+##(3) Data generation
+data <- data_generator(n_units,
+                       true_PCs = true_PCs,
+                       scores_sd = c(0.9,0.8,0.7),
+                       error_sd = 0.1,
+                       obs_path = obs_data_path,
+                       seed = seed)
+```
+
+Visually
+```{r}
+source("../r-utils/plot_utils.R")
+
+print(plot_eigenfunction(true_PCs[,1],locations.obs.2D,paste("PC1,"))) 
+print(plot_eigenfunction(true_PCs[,2],locations.obs.2D,paste("PC2,")))
+print(plot_eigenfunction(true_PCs[,3],locations.obs.2D,paste("PC3,")))
+```
+
+
+## RMSE w.r.t. (lambda,n_pc)
+```{r}
+source("../r-utils/error_metrics.R")
+rec_err <- matrix(nrow = length(lambda_grid),
+                  ncol = length(npc_grid))
+
+for(i in 1:length(lambda_grid)){
+  for(j in 1:length(npc_grid)){
+    json_data$Calibration$strategy <- unbox("off")
+    json_data$RunParams$fixed_lambda <- unbox(lambda_grid[i])
+    json_data$RunParams$fixed_npc <- unbox(npc_grid[j])
+    write_json(json_data,"params.json",pretty = TRUE)
+    
+    system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/npc_calibration/npc_calibration")
+    
+    est.PCs <- as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+    est.Scores <- as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+    
+    #compute errors & times
+    errors <- compute.errors.FPCA(data, 
+                                  est.PCs = est.PCs,
+                                  est.Scores = est.Scores
+                                  )
+    rec_err[i,j] <- errors$signal_reconstruction
+  }
+}
+```
+
+```{r}
+for(i in npc_grid){
+  plot <- ggplot(mapping=aes(x=lambda_grid,y=rec_err[,i])) +
+    geom_line() +
+    xlim(min(lambda_grid), max(lambda_grid)) +
+    scale_x_log10() + 
+    geom_point(mapping = aes(x=lambda_grid[which.min(rec_err[,i])],y=min(rec_err[,i])),
+                   color="red", size=4) +
+    theme_minimal()
+  
+        
+  print(plot)
+}
+```
+
+
+## Run
+```{r}
+json_data$Calibration$strategy <- unbox("kcv")
+write_json(json_data,"params.json",pretty = TRUE)
+
+system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/npc_calibration/npc_calibration")
+```
+
+
+## Visualization
+```{r}
+CV.values <- 
+        as.matrix(readMM(file=paste("results","CV_values.mtx",sep="/")))
+
+which(CV.values == min(CV.values), arr.ind = TRUE)
+```
+
+```{r}
+matplot(x = lambda_grid,
+        CV.values,type="l", log="x")
+legend("top", legend=paste(npc_grid),
+       col=npc_grid,cex=0.8,fill=npc_grid)
+xlim(c(1e-10,1e-5))
+```
+```{r}
+min.CV <- min(rec_err[,5])
+max.CV <- max(rec_err[,5])
+plot <- ggplot(mapping=aes(x=lambda_grid,y=rec_err[,5])) +
+    geom_line() +
+    xlim(min(lambda_grid), max(lambda_grid)) +
+    scale_x_log10() + 
+    geom_point(mapping = aes(x=lambda_grid[which.min(rec_err[,i])],y=min(rec_err[,i])),color="red", size=4) +
+    theme_minimal()
+
+
+
+min.CV <- min(CV.values[,5])
+max.CV <- max(CV.values[,5])
+
+plot + geom_line(mapping=aes(x=lambda_grid,y=(CV.values[,5]-min.CV)/(max.CV-min.CV)))
+```
+
+
+```{r}
+for(i in npc_grid){
+  plot <- ggplot(mapping=aes(x=lambda_grid,y=CV.values[,i])) +
+    geom_line() +
+    scale_x_log10() + 
+    geom_point(mapping = aes(x=lambda_grid[which.min(CV.values[,i])],y=min(CV.values[,i])),
+                   color="red", size=4) +
+    geom_vline(xintercept = lambda_grid[which.min(rec_err[,i])], 
+                   linetype = "dashed", color = "green") +
+    theme_minimal() +
+    labs(x = "lambda", y = "CV score")
+  
+        
+  print(plot)
+}
+```
+

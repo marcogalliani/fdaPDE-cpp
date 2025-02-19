@@ -8,6 +8,11 @@
 *.o
 *.so
 .DS_Store
+*.pdf
+*.pdf
+*.mtx
+*.png
+*.csv
 
 test/fdapde_test
 test/.cache
@@ -29,4 +34,6 @@ CMakeFiles/
 test/data/
 test/data/mesh/
 
-experiments/
+docs/
+
+#experiments folder

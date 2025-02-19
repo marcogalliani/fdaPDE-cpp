@@ -1,0 +1,176 @@
+---
+title: "Missing data"
+params: 
+  solver: "sequential"
+  n_nodes: 400
+  n_locs: 625 #squared
+  n_statistical_units: 200 #[200,400,800,"VAR"]
+  n_pc: 3
+  lambda: 0.00001
+---
+
+## Introduction
+
+- directories
+```{r}
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_miss_test"
+results_path <- "results"
+plot_path <- "plots/"
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+
+## Parameters
+- `params.json` 
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox(params$solver)
+json_data$RunParams$SVDType <- unbox("randomized")
+json_data$RunParams$lambda <- unbox(params$lambda)
+json_data$RunParams$n_pc <- unbox(params$n_pc)
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+- data generation params
+```{r}
+seed = 467897965 ## for reproducibility purposes
+
+n_nodes <- params$n_nodes #mesh nodes
+n_locs <- params$n_locs #sampling at nodes
+n_units <- params$n_statistical_units
+```
+
+
+## Test
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+
+```{r}
+ind.space.NA <- function(data_vector,p=0.75){
+  size <- length(data_vector)
+  data_vector[sample(1:size,size-round(size*p))] <- NA
+  return(data_vector)
+}
+```
+
+
+### Data generation
+```{r}
+##(1) Mesh generation
+cat("\nNumber of Nodes: ", n_nodes,"\n")
+mesh.2D <- unit_square.mesh(n_nodes,mesh_data_path)
+L2norm <- L2norm.factory(mesh.2D) #function to compute the norm
+
+##(2) Eigenfunctions
+## use n = N for the setting locations = mesh nodes
+## (in this case, \Psi is the identity matrix)
+## use n != N for the general case. Set n > N.
+
+locations.obs.2D <- unit_square.locs(n_locs,obs_data_path)
+
+## (2.1) at mesh nodes
+## evaluate eigenfunctions on mesh nodes (this is equivalent to get the FEM basis
+## expansion of the eigenfunctions ). change values of a and b to select eigenfunction
+f1_fem <- square_eigenfunction(a = 1, b = 1, mesh.2D$nodes)
+f2_fem <- square_eigenfunction(a = 2, b = 3, mesh.2D$nodes)
+f3_fem <- square_eigenfunction(a = 4, b = 4, mesh.2D$nodes)
+
+## (2.2) at locations (normalized)
+Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+
+f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+
+true_PCs <- cbind(f1,f2,f3)
+
+##(3) Data generation + missing
+data <- data_generator(n_units,
+                       true_PCs = true_PCs,
+                       scores_sd = c(0.4,0.3,0.2),
+                       error_sd = 0.1,
+                       obs_path = obs_data_path,
+                       seed = seed)
+
+data$data_w_missing <- t(apply(data$noisy_data, 1, ind.space.NA,0.5))
+write.csv(format(data$data_w_missing, digits = 16),
+          paste(obs_data_path,"datamatrix_centred.csv",sep="/"))
+```
+
+### Run
+```{r}
+json_data$RunParams$RSVDType <- unbox("sequential")
+write_json(json_data, "params.json", pretty = TRUE)
+
+#run the program
+system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/missing-fpca/fpca_miss
+")
+    
+#load results
+est.PCs.seq <- 
+  as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+est.Scores.seq <- 
+  as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+```
+
+```{r}
+json_data$RunParams$RSVDType <- unbox("monolithic")
+write_json(json_data, "params.json", pretty = TRUE)
+
+system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/missing-fpca/fpca_miss
+")
+
+est.PCs.mono <- 
+  as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+est.Scores.mono <- 
+  as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+```
+
+```{r}
+max(abs(est.PCs.seq-est.PCs.mono))
+```
+
+
+
+## Visualization
+```{r}
+source("../r-utils/plot_utils.R")
+```
+
+### Components
+```{r}
+plot_eigenfunction(est.PCs.seq[,1],locations.obs.2D,"PC1")
+plot_eigenfunction(est.PCs.seq[,2],locations.obs.2D,"PC2")
+plot_eigenfunction(est.PCs.seq[,3],locations.obs.2D,"PC3")
+```
+### Missingness
+```{r}
+plot <- plot_stat_units(data$noisy_data[6,],
+                           locations.obs.2D,
+                        "complete")
+print(plot)
+ggsave(paste("PC.example/",
+              "complete_obs",
+             ".pdf", sep=""), 
+         plot, width = 5, height = 5)
+
+plot <- plot_stat_units(data$data_w_missing[6,],
+                           locations.obs.2D,
+                        "censored")
+print(plot)
+ggsave(paste("PC.example/",
+              "censored_obs",
+             ".pdf", sep=""), 
+         plot, width = 5, height = 5)
+```
+

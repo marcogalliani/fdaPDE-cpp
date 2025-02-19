@@ -1,0 +1,311 @@
+---
+title: "fpca calibration"
+params:
+  n_nodes: 400
+  n_locs: 400 #squared
+  n_statistical_units: 100 #[200,400,800,"VAR"]
+  n_replicas: 40
+  n_folds: 10
+---
+
+## Introduction
+```{r}
+library(fdaPDE)
+library(femR)
+
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_test"
+results_path <- "results"
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+
+## Parameters
+- `params.json` modifies the run parameters
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox(params$solver)
+json_data$RunParams$n_pc <- unbox(3)
+
+json_data$calibration$grid_dim <- unbox(100)
+json_data$calibration$strategy <- unbox("gcv")
+json_data$calibration$left <- unbox(-7)
+json_data$calibration$right <- unbox(-2)
+json_data$calibration$n_folds <- unbox(params$n_folds)
+json_data$calibration$fixed <- unbox(1e-5)
+
+write_json(json_data, 
+           "params.json", 
+           pretty = TRUE)
+```
+
+- set the parameters to generate the data
+```{r}
+n_units <- params$n_statistical_units
+n_nodes <- params$n_nodes
+n_locs <- params$n_locs
+n_replicas <- params$n_replicas
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+
+## Data
+Utils
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+
+```{r}
+##(1) Mesh generation
+mesh.2D <- unit_square.mesh(n_nodes, mesh_data_path)
+#define a dummy pde to get the stiffness matrix
+mesh <- Mesh(
+  list(
+    nodes = mesh.2D$nodes,
+    elements = mesh.2D$triangles,
+    boundary = mesh.2D$nodesmarkers
+  )
+)
+Vh <- FunctionSpace(mesh, fe_order=1)
+u <- Function(Vh)
+
+##(2) Eigenfunctions
+## use n = N for the setting locations = mesh nodes
+## (in this case, \Psi is the identity matrix)
+## use n != N for the general case. Set n > N.
+
+locations.obs.2D <- unit_square.locs(n_locs,obs_data_path)
+
+
+## (2.1) at mesh nodes
+## evaluate eigenfunctions on mesh nodes (this is equivalent to get the FEM basis
+## expansion of the eigenfunctions ). change values of a and b to select eigenfunction
+L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    2 #intensity
+    )
+f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+
+#evd
+evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+  
+#eigen functions
+f1_fem <- evd$vectors[,4]
+f2_fem <- evd$vectors[,9]
+f3_fem <- evd$vectors[,10]
+
+## (2.2) at locations (normalized)
+#L2 norm
+L2norm <- L2norm.factory(mesh.2D, L) #function to compute the norm
+
+Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+
+f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+
+true_PCs <- cbind(f1,f2,f3)
+
+##(3) Data generation
+#-> generated for each replica
+```
+
+Visually
+```{r}
+source("../r-utils/plot_utils.R")
+
+print(plot_eigenfunction(true_PCs[,1],locations.obs.2D, title = "PC1")) 
+print(plot_eigenfunction(true_PCs[,2],locations.obs.2D,paste("PC2,")))
+print(plot_eigenfunction(true_PCs[,3],locations.obs.2D,paste("PC3,")))
+```
+
+
+## Metrics
+```{r}
+library(dplyr)
+
+keys <- c("rsvd","calibration","replica")
+
+error_metrics <- c("errPC1","errPC2","errPC3",
+                   "errScore1","errScore2","errScore3",
+                   "signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+time_metrics <- c("calibration_time", "factorization_time","fit_time")
+
+#time_metrics <- c("exe_time","svd_time","other_time")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,time_metrics))))
+names(test_results) <- c(keys, error_metrics,time_metrics)
+
+test_results[] <- lapply(test_results, function(x) numeric())
+
+test_results$rsvd <- character()
+test_results$calibration <- character()
+```
+
+```{r}
+source("../r-utils/error_metrics.R")
+```
+
+## Run
+```{r}
+for(ind_rep in 1:n_replicas){
+  #data 
+  data <- data_generator(n_units,
+                       true_PCs = true_PCs,
+                       scores_sd = c(0.4,0.3,0.2),
+                       error_sd = 0.1,
+                       obs_path = obs_data_path,
+                       seed = seed + 4*ind_rep)
+  
+  for(rsvd_solver in c("monolithic","sequential","subspace")){
+    cat("Solver: ", rsvd_solver, "\n")
+    
+    for(cal_policy in c("gcv","kcv")){
+      cat("Calibration policy: ", cal_policy, "\n")
+    
+      
+      json_data$RunParams$RSVDType <- unbox(rsvd_solver)
+      json_data$calibration$strategy <- unbox(cal_policy)
+      
+      if(cal_policy=="gcv" & rsvd_solver=="monolithic"){
+        json_data$calibration$strategy <- unbox("full_smooth_gcv")
+      }
+      
+      write_json(json_data, "params.json", pretty = TRUE)
+      #run the program
+  
+      system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/fpca-calibration/calibration_fpca")
+      
+      #load results
+      est.PCs <- 
+        as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+      est.Scores <- 
+        as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+      
+      
+      #compute errors & times
+      errors <- compute.errors.FPCA(data, 
+                                    est.PCs = est.PCs,
+                                    est.Scores = est.Scores
+                                    )
+      
+      test_results <- test_results %>%
+        add_row(rsvd=rsvd_solver, calibration=cal_policy, replica=ind_rep)
+      new_row <- test_results$rsvd==rsvd_solver & 
+        test_results$calibration==cal_policy & 
+        test_results$replica==ind_rep
+      test_results[new_row, error_metrics] <- unlist(errors)
+    }
+  }
+}
+```
+
+### Visualizations
+```{r}
+source("../r-utils/plot_utils.R")
+```
+
+```{r}
+plot_eigenfunction(est.PCs[,1],locations.obs.2D,"PC1")
+plot_eigenfunction(est.PCs[,2],locations.obs.2D,"PC2")
+plot_eigenfunction(-est.PCs[,3],locations.obs.2D,"PC3")
+```
+
+
+```{r}
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+
+color_map <- c(
+  "sequential" = "#2297E6",
+  "monolithic" = "#DF536B",
+  "subspace" = "#F5C710"
+)
+```
+
+```{r}
+test_results <- test_results %>% 
+  filter(!(rsvd == "sequential" & calibration %in% c("ocv","kcv_cols","full_smooth_gcv")))
+
+
+```
+
+
+#### PCs & Scores
+```{r}
+save <- F
+
+for(err in c("errPC1","errPC2","errPC3",
+             "errScore1","errScore2","errScore3")){
+  plot <- 
+    grouped_boxplot(subset(test_results,!(calibration=="kcv_svd_extraction"&rsvd=="monolithic")), 
+                var_name.x = "calibration", var_name.y = err,
+                group_name = "rsvd", color_map = color_map) + labs(x=NULL)
+  print(plot)
+  
+  if(save){
+    ggsave(paste("plots/calibration-comparison/",
+               err,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_statistical_units,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+         plot, width = 10, height = 5)
+  }
+}
+```
+
+#### Signal
+```{r}
+plot <- 
+    grouped_boxplot(test_results, 
+                var_name.x = "calibration", var_name.y = "signal_reconstruction_error",
+                group_name = "rsvd", color_map = color_map, legend = T) +
+  labs(y="reconstruction",fill=NULL,x=NULL) +
+  theme(legend.position = "top")
+
+print(plot)
+  
+if(save){
+  ggsave(paste("plots/calibration-comparison/",
+               "signal_reconstruction_error",
+             "-Mesh",params$n_nodes,
+             "-Obs",params$n_statistical_units,
+             "-Locs",params$n_locs,
+           ".pdf", sep=""), 
+       plot, width = 10, height = 5)
+}
+```
+
+
+### Save the results
+```{r}
+if(save){
+  write.csv(format(test_results, digits = 16),
+          paste("past-runs",
+                paste("cal_comp",
+                      "-Mesh",params$n_nodes,
+                      "-Obs",params$n_statistical_units,
+                      "-Locs",params$n_locs,
+                      ".csv",sep=""),
+          sep="/")
+)
+}
+```
+
+
+
+

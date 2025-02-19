@@ -1,0 +1,352 @@
+---
+title: "Varying the number of locations"
+params: 
+  n_nodes: 400
+  n_units: 200
+  n_replicas: 15
+  lambda: 0.0001
+---
+
+## Introduction
+```{r}
+library(fdaPDE)
+library(femR)
+
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_test"
+results_path <- "results"
+
+plot_path <- "plots/scaling-n_locs"
+
+n_replicas <- params$n_replicas
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+Set the hyperparameters for the experiment by changing the file `params.json` in the folder 
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox("sequential")
+json_data$RunParams$fixed_lambda <- unbox(params$lambda)
+
+json_data$SubspaceIterations$max_iter <- unbox(50)
+json_data$SubspaceIterations$lambdas <- rep(params$lambda,3)
+
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+- set the parameters to generate the data
+```{r}
+n_units <- params$n_units
+n_nodes <- params$n_nodes
+n_replicas <- params$n_replicas
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+## Data
+```{r}
+source("../r-utils/mesh_utils.R")
+generate.mesh_and_eigenfunctions <- function(n_nodes, mesh_path,
+                                    n_locs, locs_path){
+  ##(1) Mesh generation
+  mesh.2D <- unit_square.mesh(n_nodes, mesh_path)
+  #'define a dummy pde to get the stiffness and the mass matrices of the 
+  #'differential operator
+  mesh <- Mesh(
+    list(
+      nodes = mesh.2D$nodes,
+      elements = mesh.2D$triangles,
+      boundary = mesh.2D$nodesmarkers
+    )
+  )
+  Vh <- FunctionSpace(mesh, fe_order=1)
+  u <- Function(Vh)
+  
+  L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    1.5 #intensity
+    )
+  f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+  pde <- Pde(L(u), f)
+  
+  ##(2) Eigenfunctions
+  #evd
+  evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+  #at mesh nodes
+  f1_fem <- evd$vectors[,4]
+  f2_fem <- evd$vectors[,9]
+  f3_fem <- evd$vectors[,10]
+
+  ##(3) Evaluate at locations
+  locations.obs.2D <- unit_square.locs(n_locs,locs_path) #locations at nodes
+  Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+  
+  L2norm <- L2norm.factory(mesh.2D = mesh.2D, diff_op = L)
+  
+  #final components
+  f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+  f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+  f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+  
+  return(cbind(f1,f2,f3))
+}
+```
+
+## Run
+```{r}
+test_nlocs <- c(400,900,1600,3600)
+```
+
+```{r}
+library(dplyr)
+
+keys <- c("rsvd","replica","n_locs")
+
+error_metrics <- c("errPC1","errPC2","errPC3",
+                   "errScore1","errScore2","errScore3",
+                   "signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+time_metrics <- c("exe_time")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,time_metrics))))
+names(test_results) <- c(keys, error_metrics,time_metrics)
+
+test_results[] <- lapply(test_results, function(x) numeric())
+
+test_results$rsvd <- character()
+```
+
+
+```{r}
+source("../r-utils/error_metrics.R")
+
+for(k in seq_along(test_nlocs)){
+  
+  ##(1) Mesh generation
+  L <- test_nlocs[k] ## number of nodes in spatial domain
+  cat("\nNumber of Locations: ", L,"\n")
+  
+  true_PCs <- generate.mesh_and_eigenfunctions(
+    n_nodes, mesh_data_path,
+    L, obs_data_path
+  )
+  
+  for(ind_rep in 1:n_replicas) {
+    data <- data_generator(n_units,
+                       true_PCs = true_PCs,
+                       scores_sd = c(0.4,0.3,0.2),
+                       error_sd = 0.1,
+                       obs_path = obs_data_path,
+                       seed = seed + 4*ind_rep)
+    
+    for(rsvd_version in c("sequential","monolithic","subspace")){
+      cat("RSVD version: ", rsvd_version, "\n")
+      
+      #->Set the parameters
+      json_data$RunParams$RSVDType <- unbox(rsvd_version)
+      write_json(json_data, "params.json", pretty = TRUE)
+        
+      #->Run the algorithm
+      system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/subspace_iterations/subspace_iterations")
+      
+      #->Load results
+      est.PCs <- as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+      est.Scores <- as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+
+      #->Compute errors&times
+      errors <- compute.errors.FPCA(data, 
+                                    est.PCs = est.PCs,
+                                    est.Scores = est.Scores
+                                    )
+      
+      exe_time <- read.csv(file=paste(results_path,"execution_times.csv",sep="/"),header=F)[[1]][1]
+      
+      #->Store results
+      test_results <- test_results %>%
+        add_row(rsvd=rsvd_version, replica=ind_rep, n_locs=L)
+      new_row <- 
+        test_results$rsvd==rsvd_version & 
+        test_results$replica==ind_rep &
+        test_results$n_locs==L
+      test_results[new_row, error_metrics] <- unlist(errors)
+      test_results[new_row, time_metrics] <- exe_time
+    }#rsvd version
+  }#replica
+}#n_nodes
+```
+
+## Visualization
+```{r}
+source("../r-utils/plot_utils.R")
+
+color_map <- c(
+  "sequential" = "#2297E6",
+  "monolithic" = "#DF536B",
+  "subspace" = "#F5C710"
+)
+
+test_results$n_locs <- as.factor(test_results$n_locs)
+```
+
+### Legend
+```{r}
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+dummy_plot <- 
+  ggplot(data.frame(x = 1:length(color_map), y=1:length(color_map),
+                  method=names(color_map)), 
+       aes(x = x, y = y, color = method)) +
+  geom_point(size = 5) +  # Use points just for the purpose of displaying the legend
+  scale_color_manual(values = color_map) +  # Use the custom color mapping
+  theme_void() +                            # Remove axes and background
+  labs(color = "Algorithm") +
+  guides()
+
+
+
+legend <- cowplot::get_legend(dummy_plot)
+grid.newpage()
+grid.draw(legend)
+
+legend_grob <- grid.grabExpr(grid.draw(legend))
+
+ggsave(paste(plot_path, "/legend",
+             ".pdf", sep=""), 
+       legend_grob, width = 2, height = 2)
+```
+
+
+### Accuracy
+#### PCs
+```{r}
+save <- F
+
+for(i in 1:3){
+  errPC.plot <- grouped_boxplot(test_results,
+                 "n_locs", paste("errPC",i,sep=""),
+                 group_name = "rsvd", color_map
+                 ) 
+  print(errPC.plot)
+  
+  if(save){
+    ggsave(paste(plot_path,
+               "/errPC",i,
+             ".pdf", sep=""), 
+       errPC.plot, width = 10, height = 5)
+  }
+}
+```
+
+#### Scores
+```{r}
+for(i in 1:3){
+  errScores.plot <- grouped_boxplot(test_results,
+                 "n_locs", paste("errScore",i,sep=""),
+                 group_name = "rsvd", color_map
+                 ) 
+  print(errScores.plot)
+  
+  if(save){
+    ggsave(paste(plot_path,
+               "/errScore",i,
+             ".pdf", sep=""), 
+       errScores.plot, width = 10, height = 5)
+  }
+}
+```
+
+#### Signal
+```{r}
+errSignal.plot <- grouped_boxplot(test_results,
+                 "n_locs", "signal_reconstruction_error",
+                 group_name = "rsvd", color_map
+                 ) +
+  labs(y="reconstruction",fill=NULL) +
+  theme(legend.position = "top")
+print(errSignal.plot)
+
+if(save){
+  ggsave(paste(plot_path,
+              "/signal_rec",
+             ".pdf", sep=""), 
+       errSignal.plot, width = 10, height = 5)
+}
+```
+
+### Times
+```{r}
+test_results.grouped <- test_results %>% 
+    group_by(group=rsvd, x=n_locs) %>%
+    summarize(y = median(exe_time)) %>%
+    mutate(x = as.numeric(as.character(x)))
+  
+#initialise the plot
+plot <- ggplot(test_results.grouped, 
+                 aes(x=x, y=y, color=group)) 
+
+#plot complexity lines in the background
+min.x <- min(test_results.grouped$x)
+min.y <- min(test_results.grouped$y)
+for(line in c(1/4,1/2,1)){
+  plot <- plot + geom_abline(intercept = log10(min.y/min.x^line), slope = line,
+                             linetype = "dashed", color = "grey", linewidth = 0.5)
+  label_x <- 0.8 * max(test_results.grouped$x)  # Place label near the right edge of the plot
+  label_y <- 10^(log10(min.y/min.x^line) + line * log10(label_x))
+  
+  plot <- plot + annotate("text", 
+                          x = label_x, 
+                          y = label_y, 
+                          label = bquote(n_locs^.(line)), 
+                          hjust = 0.5, color = "darkgrey", size = 5)
+}
+
+#add lines corresponding to exe_time
+plot <- plot +
+  geom_line(linewidth=1.2,alpha=1) +
+  theme_light() +
+  labs(x="n_locs", y="execution time",color=NULL, label=NULL) +
+  scale_color_manual(values=color_map) +
+  theme(text = element_text(size=25), legend.position = "top") +
+  scale_x_log10() +
+  scale_y_log10()
+
+print(plot)
+
+ggsave(paste(plot_path,
+              "/exe_time",
+             ".pdf", sep=""), 
+       plot, width = 10, height = 5)
+```
+
+
+
+
+
+```{r}
+write.csv(format(test_results, digits = 16),
+          paste("past-runs",
+                paste("scaling-fpca-test",
+                      "-Mesh", n_nodes,
+                      "-Obs", n_units,
+                      "-LocsVAR",
+                      ".csv",sep=""),
+          sep="/")
+)
+```
+
+
+
+
+
+

@@ -1,0 +1,607 @@
+---
+title: "test fPCA with missing against competitors"
+params:
+  n_nodes: 400
+  n_statistical_units: 100 
+  n_locs: 400
+  lambda: 0.001
+  n_replicas: 10
+---
+
+## Parameters
+- directories
+```{r}
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_miss_test"
+results_path <- "results"
+plot_path <- "plots/"
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+- set the parameters to generate the data
+```{r}
+n_units <- params$n_statistical_units
+n_nodes <- params$n_nodes
+n_locs <- params$n_locs
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+- set the hyperparameters to run the c++ code
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox("monolithic")
+json_data$RunParams$SVDType <- unbox("randomized")
+json_data$RunParams$lambda <- unbox(params$lambda)
+json_data$RunParams$n_pc <- unbox(3)
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+## Data
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+```{r}
+##(1) Mesh generation
+mesh.2D <- unit_square.mesh(n_nodes, mesh_data_path)
+mesh <- Mesh(
+  list(
+    nodes = mesh.2D$nodes,
+    elements = mesh.2D$triangles,
+    boundary = mesh.2D$nodesmarkers
+  )
+)
+Vh <- FunctionSpace(mesh, fe_order=1)
+u <- Function(Vh)
+
+##(2) Eigenfunctions
+## use n = N for the setting locations = mesh nodes
+## (in this case, \Psi is the identity matrix)
+## use n != N for the general case. Set n > N.
+
+locations.obs.2D <- unit_square.locs(n_locs,obs_data_path)
+
+## (2.1) at mesh nodes
+## evaluate eigenfunctions on mesh nodes (this is equivalent to get the FEM basis
+## expansion of the eigenfunctions ). change values of a and b to select eigenfunction
+L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    2#intensity
+    )
+f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+
+#evd
+evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+  
+#eigen functions
+f1_fem <- evd$vectors[,20]
+f2_fem <- evd$vectors[,29]
+f3_fem <- evd$vectors[,4]
+
+## (2.2) at locations (normalized)
+L2norm <- L2norm.factory(mesh.2D) #function to compute the norm
+Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+
+f1 <- as.matrix(Psi %*% f1_fem/L2norm(f1_fem))
+f2 <- as.matrix(Psi %*% f2_fem/L2norm(f2_fem))
+f3 <- as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+
+true_PCs <- cbind(f1,f2,f3)
+
+##(3) Data generation
+#-> at each replica
+```
+
+### Missingness
+```{r}
+library(RANN)
+
+# Optimized distance function
+de <- function(x, y, w = 1) {
+  res <- sum((x[1:2] - y[1:2])^2)
+  if (length(x) == 3) {
+    res <- res + w^2 * (x[3] - y[3])^2
+  }
+  sqrt(res)
+}
+
+# Optimized nearest neighbor function
+nearest <- function(p, points, w = 1) {
+  distances <- apply(points, 1, de, y = p, w = w)
+  which.min(distances)
+}
+
+dep_space.NA_fast <- function(Data, 
+                              p = 0.75, 
+                              schema = "a", 
+                              mesh_ref = NULL, 
+                              locations = NULL, 
+                              RDD_groups = NULL, 
+                              w = 8) {
+  if (schema == "c") {
+    data_vector <- as.vector(Data)
+    size <- length(data_vector)
+
+    nodes <- mesh_ref$nodes
+    nobs <- ceiling(RDD_groups * p)
+    pts <- locations
+
+    # Use precomputed seeds if possible
+    seeds <- nodes[sample(nrow(nodes), RDD_groups), , drop = FALSE]
+    obs_marker <- rep(0, RDD_groups)
+    obs_marker[sample(RDD_groups, nobs)] <- 1
+
+    # Fast nearest neighbor search using RANN
+    nn_results <- nn2(seeds, pts, k = 1)  # Finds nearest seed for each location
+    nearest_idxs <- nn_results$nn.idx  # Index of the nearest seed
+
+    # Vectorized NA assignment
+    data_vector[obs_marker[nearest_idxs] == 0] <- NA
+
+    Data <- matrix(data = data_vector, nrow = 1, ncol = size)
+  }
+
+  Data
+}
+```
+
+
+## Competitors
+```{r}
+suppress_print <- function(expr) {
+  capture.output(suppressMessages(suppressWarnings(expr)), file = "/dev/null")
+}
+```
+
+```{r}
+MV_PCA_wrapped <- function(X, center = TRUE, n_comp = 3) {
+
+  ## centering
+  X_mean_locs <- rep(0, ncol(X))
+  if(center) {
+    X_mean_locs <- colMeans(X)
+    X <- scale(X, center = TRUE, scale = FALSE)
+  }
+
+  # MV-PCA
+  model_MV_PCA <- prcomp(X, center = FALSE, rank. = n_comp)
+
+  ## results
+  loadings_locs <- model_MV_PCA$rotation
+  scores <- model_MV_PCA$x
+  X_hat_locs <- scores %*% t(loadings_locs) + rep(1, nrow(scores)) %*% t(X_mean_locs)
+  
+  return(list(
+    model = model_MV_PCA,
+    results = list(
+      loadings = NULL,
+      loadings_locs = loadings_locs,
+      scores = scores,
+      X_mean = NULL,
+      X_mean_locs = X_mean_locs,
+      X_hat = NULL,
+      X_hat_locs = X_hat_locs
+    )
+  ))
+}
+```
+
+## Storage of the results
+```{r}
+library(dplyr)
+
+keys <- c("method","replica")
+
+error_metrics <- c("errPC1","errPC2","errPC3",
+                   "errScore1","errScore2","errScore3",
+                   "signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,"exe_time"))))
+names(test_results) <- c(keys, error_metrics,"exe_time")
+
+test_results[] <- lapply(test_results, function(x) numeric())
+
+test_results$method <- character()
+```
+
+```{r}
+source("../r-utils/mesh_utils.R")
+
+append_results <- function(method_name, ind_replica,
+                           test_results,
+                           est.PCs,est.Scores,data,
+                           exe_time){
+  errors <- compute.errors.FPCA(data, 
+                                est.PCs = est.PCs,
+                                est.Scores = est.Scores
+                                )
+        
+  test_results <- test_results %>%
+          add_row(method=method_name, replica=ind_replica)
+  new_row <- 
+    test_results$method==method_name & 
+    test_results$replica==ind_replica 
+        
+  test_results[new_row, error_metrics] <- unlist(errors)
+  test_results[new_row, "exe_time"] <- unlist(exe_time)
+
+  return(test_results)
+}
+```
+
+## Run
+```{r}
+source("../r-utils/error_metrics.R")
+
+L2norm <- function(f) { return(sqrt(as.numeric(t(f) %*% f))) }
+
+n_replicas <- 10
+for(ind_rep in 1:n_replicas){
+  cat("Replica ", ind_rep,"\n")
+  
+  data <- data_generator(n_units, 
+                       true_PCs = cbind(c(f1),c(f2),c(f3)), 
+                       scores_sd=c(0.4,0.3,0.2),
+                       error_sd=0.1,
+                       seed=seed+4*ind_rep,
+                       obs_path=NULL)
+  #add missingness
+  data$data_w_missing <- t(apply(data$noisy_data, 1, 
+                              dep_space.NA_fast,
+                              p=0.5,
+                              schema="c",
+                              mesh_ref=mesh.2D,
+                              locations=locations.obs.2D,
+                              RDD_groups=12,
+                              w=8))
+  
+  write.csv(format(data$data_w_missing, digits = 16),
+          paste(obs_data_path,"datamatrix_centred.csv",sep="/"))
+  
+  
+  ## (1.1) monolithic fPCA - randSVD
+  json_data$RunParams$lambda <- unbox(1e-5)
+  
+  cat("Mono\n")
+  json_data$RunParams$SVDType <- unbox("randomized")
+  json_data$RunParams$RSVDType <- unbox("monolithic")
+  write_json(json_data, "params.json", pretty = TRUE)
+  
+  start.time <- Sys.time()
+  system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/missing-fpca/fpca_miss")
+  end.time <- Sys.time()
+  
+  
+  est.PCs <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+  est.Scores <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/"))) 
+  
+  loadings_norm <- apply(est.PCs,MARGIN=2,L2norm)
+  test_results <- append_results("mono-randSVD",ind_rep,test_results,
+                                  est.PCs = t(t(est.PCs) / loadings_norm),
+                                  est.Scores = t(t(est.Scores)*loadings_norm),
+                                  data = data,
+                                  exe_time = difftime(end.time, start.time, units = "secs")[[1]]
+                                 )
+  
+  ## (1.2) monolithic fPCA - exactSVD
+  json_data$RunParams$lambda <- unbox(1e-5)
+  
+  cat("Mono\n")
+  json_data$RunParams$SVDType <- unbox("exact")
+  json_data$RunParams$RSVDType <- unbox("monolithic")
+  write_json(json_data, "params.json", pretty = TRUE)
+  
+  start.time <- Sys.time()
+  system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/missing-fpca/fpca_miss")
+  end.time <- Sys.time()
+  
+  
+  est.PCs <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+  est.Scores <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/"))) 
+  
+  loadings_norm <- apply(est.PCs,MARGIN=2,L2norm)
+  test_results <- append_results("mono-exactSVD",ind_rep,test_results,
+                                  est.PCs = t(t(est.PCs) / loadings_norm),
+                                  est.Scores = t(t(est.Scores)*loadings_norm),
+                                  data = data,
+                                  exe_time = difftime(end.time, start.time, units = "secs")[[1]]
+                                 )
+  
+  ## (2) sequential fPCA
+  cat("Seq\n")
+  json_data$RunParams$SVDType <- unbox("randomized")
+  json_data$RunParams$RSVDType <- unbox("monolithic")
+  write_json(json_data, "params.json", pretty = TRUE)
+  
+  start.time <- Sys.time()
+  system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/missing-fpca/fpca_miss")
+  end.time <- Sys.time()
+  
+  est.PCs <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+  est.Scores <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/"))) 
+  
+  loadings_norm <- apply(est.PCs,MARGIN=2,L2norm)
+  test_results <- append_results("seq-randSVD",ind_rep,test_results,
+                                  est.PCs = t(t(est.PCs) / loadings_norm),
+                                  est.Scores = t(t(est.Scores)*loadings_norm),
+                                  data = data,
+                                  exe_time = difftime(end.time, start.time, units = "secs")[[1]])
+  
+  ## (2) sequential fPCA-exact
+  cat("Seq\n")
+  json_data$RunParams$SVDType <- unbox("exact")
+  json_data$RunParams$RSVDType <- unbox("monolithic")
+  write_json(json_data, "params.json", pretty = TRUE)
+  
+  start.time <- Sys.time()
+  system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/missing-fpca/fpca_miss")
+  end.time <- Sys.time()
+  
+  est.PCs <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+  est.Scores <- 
+      as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/"))) 
+  
+  loadings_norm <- apply(est.PCs,MARGIN=2,L2norm)
+  test_results <- append_results("seq-exactSVD",ind_rep,test_results,
+                                  est.PCs = t(t(est.PCs) / loadings_norm),
+                                  est.Scores = t(t(est.Scores)*loadings_norm),
+                                  data = data,
+                                  exe_time = difftime(end.time, start.time, units = "secs")[[1]])
+  
+  ## (4) DINEOF+MV.pca
+  cat("DINEOF\n")
+  library(sinkr)
+  
+  start.time <- Sys.time()
+  suppress_print(
+    interpolated_data <- sinkr::dineof(data$data_w_missing)
+  )
+  dineof.MV.pca <- MV_PCA_wrapped(interpolated_data$Xa)
+  end.time <- Sys.time()
+  
+  loadings_norm <- apply(dineof.MV.pca$results$loadings_locs,MARGIN=2,L2norm)
+  test_results <- append_results("DINEOF-MV-PCA",ind_rep,test_results,
+                                 est.PCs = t(t(dineof.MV.pca$results$loadings_locs) /
+                                                 loadings_norm),
+                                 est.Scores = t(t(dineof.MV.pca$results$scores)*loadings_norm),
+                                 data = data,
+                                 exe_time = difftime(end.time, start.time, units = "secs")[[1]])
+
+
+  ## (5) PPCA
+  cat("PPCA\n")
+  fit.ppca <- NULL
+  
+  start.time <- Sys.time()
+  fit.ppca <- pcaMethods::ppca(data$data_w_missing, nPcs=3,maxIterations = 1e4)
+  end.time <- Sys.time()
+  
+  loadings_norm <- apply(fit.ppca@loadings,MARGIN=2,L2norm)
+  
+  
+  test_results <- append_results("PPCA",ind_rep,test_results,
+                                 est.PCs = t(t(fit.ppca@loadings) / loadings_norm),
+                                 est.Scores = t(t(fit.ppca@scores)*loadings_norm),
+                                 data = data,
+                                 exe_time = difftime(end.time, start.time, units = "secs")[[1]])
+
+  # ## (6) IPPCA
+  # cat("IPPCA\n")
+  # 
+  # start.time <- Sys.time()
+  # fit.IPPCA <- missMDA::MIPCA(data$data_w_missing, ncp=3)
+  # IPPCA.MV.pca <- MV_PCA_wrapped(fit.IPPCA$res.imputePCA)
+  # end.time <- Sys.time()
+  # 
+  # loadings_norm <- apply(IPPCA.MV.pca$results$loadings_locs,MARGIN=2,L2norm)
+  # test_results <- append_results("IPPCA-MV-PCA",ind_rep,test_results,
+  #                                est.PCs = t(t(IPPCA.MV.pca$results$loadings_locs) /
+  #                                                loadings_norm),
+  #                                est.Scores = t(t(IPPCA.MV.pca$results$scores)*loadings_norm),
+  #                                data = data,
+  #                                exe_time = difftime(end.time, start.time, units = "secs")[[1]])
+}#n_replicas
+```
+
+## Visualization
+```{r}
+file_name <-paste("miss-fpca-competitors",
+                    "-Mesh",params$n_nodes,
+                    "-Obs",params$n_statistical_units,
+                    ".csv",sep="")
+
+save <- T
+if(save){
+  write.csv(format(test_results, digits = 16),
+          paste("past-runs", file_name, sep="/")
+)
+}
+
+```
+
+```{r}
+library(readr)
+file_name <-paste("miss-fpca-competitors",
+                    "-Mesh","900",
+                    "-Obs","400",
+                    ".csv",sep="")
+
+test_results <- read_csv(paste("past-runs",file_name, sep="/"),
+                         col_types = cols(...1 = col_skip()))
+
+library(plyr)
+test_results$method <- mapvalues(test_results$method, 
+                          from=c("mono-randSVD","mono-exactSVD", "seq-randSVD","seq-exactSVD", "DINEOF-MV-PCA",
+                                 "PPCA"), 
+                          to=c("mono-rand","mono-exact", "seq-rand","seq-exact", "DINEOF","PPCA"))
+```
+
+```{r}
+source("../r-utils/plot_utils.R")
+
+col_palette <- palette.colors(n=8, palette = "R4")
+color_map <- c(
+  "mono-rand" = col_palette[2],
+  "mono-exact" = "darkred",
+  "seq-rand" = col_palette[3],
+  "seq-exact" = "darkgreen",
+  "DINEOF" = col_palette[4],
+  "PPCA" = col_palette[5],
+  "IPPCA" = col_palette[6]
+)
+
+test_results$method <- factor(test_results$method, levels = names(color_map))  
+```
+
+```{r}
+show_col(col_palette)
+"darkred"
+"darkgreen"
+```
+
+
+```{r}
+for(i in 1:3){
+  errPC.plot <- grouped_boxplot(test_results,
+                 "method", paste("errPC",i,sep=""),
+                 group_name = "method", color_map,
+                 text.size = 25
+                 )
+  print(errPC.plot)
+  
+  ggsave(paste("plots-competitors/",
+           "errPC",i,
+           "-Mesh",params$n_nodes,
+            "-Obs",params$n_statistical_units,
+           ".pdf", sep=""), 
+     errPC.plot, width = 10, height = 8)
+}
+```
+
+```{r}
+for(i in 1:3){
+  errScore.plot <- grouped_boxplot(test_results,
+                 "method", paste("errScore",i,sep=""),
+                 group_name = "method", color_map,
+                 text.size = 25
+                 ) 
+  print(errScore.plot)
+  
+  ggsave(paste("plots-competitors/",
+           "errScore",i,
+           "-Mesh",params$n_nodes,
+            "-Obs",params$n_statistical_units,
+           ".pdf", sep=""), 
+     errScore.plot, width = 10, height = 8)
+  
+}
+```
+
+```{r}
+signal_rec_err.plot <- grouped_boxplot(test_results,
+                 "method", "signal_reconstruction_error",
+                 group_name = "method", color_map,
+                 text.size = 25
+                 ) 
+
+
+print(signal_rec_err.plot)
+
+
+
+ggsave(paste("plots-competitors/",
+           "signal_reconstruction_err",
+           "-Mesh",params$n_nodes,
+            "-Obs",params$n_statistical_units,
+           ".pdf", sep=""), 
+     signal_rec_err.plot, width = 10, height = 7)
+```
+
+```{r}
+plt <- grouped_boxplot(subset(test_results, method != "PPCA"),
+                 "method", "signal_reconstruction_error",
+                 group_name = "method", color_map,
+                 text.size = 25, legend=T
+                 ) + labs(y="Reconstruction Error",fill=NULL) + theme(legend.position="top") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+print(plt)
+
+ggsave(paste("plots-competitors/",
+           "rec_err-report",
+           ".pdf", sep=""), 
+     plt, width = 10, height = 5)
+```
+
+
+```{r}
+plt <- grouped_boxplot(subset(test_results, method != "PPCA"),
+                 "method", "exe_time",
+                 group_name = "method", color_map,
+                 text.size = 25, legend=T
+                 ) + labs(y="Execution Times",fill=NULL) + theme(legend.position="top") +
+  scale_y_log10() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+print(plt)
+
+ggsave(paste("plots-competitors/",
+           "exe_time-report",
+           ".pdf", sep=""), 
+     plt, width = 10, height = 5)
+```
+
+
+
+### PCs & NAs
+```{r}
+data <- data_generator(n_units, 
+                       true_PCs = cbind(c(f1),c(f2),c(f3)), 
+                       scores_sd=c(0.4,0.3,0.2),
+                       error_sd=0.1,
+                       seed=seed+4,
+                       obs_path=NULL)
+#add missingness
+test <- t(apply(data$noisy_data, 1, 
+                            dep_space.NA_fast,
+                            p=0.5,
+                            schema="c",
+                            mesh_ref=mesh.2D,
+                            locations=locations.obs.2D,
+                            RDD_groups=12,
+                            w=8))
+```
+
+```{r}
+
+for(i in 1:4){
+  plot <- plot_stat_units(test[i,],locations = locations.obs.2D)
+  print(plot)
+  
+  ggsave(paste("PC.example/",
+           "dep-censoring","-sample",i,
+           ".pdf", sep=""), 
+     plot, width = 5, height = 5)
+}
+```
+

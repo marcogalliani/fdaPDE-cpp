@@ -1,0 +1,482 @@
+---
+title: "Test against competitor methods"
+params:
+  n_nodes: 400
+  n_locs: 400
+  n_units: 50
+  n_replicas: 10
+  lambda: 0.1
+---
+
+## Introduction
+```{r}
+library(fdaPDE)
+library(femR)
+
+mesh_data_path <- "../data/mesh/unit_square"
+obs_data_path <- "../data/models/fpca/2D_test"
+results_path <- "results"
+
+plot_path <- "plots-competitors"
+
+n_replicas <- params$n_replicas
+
+file.remove(list.files(path = mesh_data_path, full.names = TRUE))
+file.remove(list.files(path = obs_data_path, full.names = TRUE))
+file.remove(list.files(path = results_path, full.names = TRUE))
+```
+
+Set the hyperparameters for the experiment by changing the file `params.json` in the folder 
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$RSVDType <- unbox("sequential")
+json_data$RunParams$SVDType <- unbox("randomized")
+
+json_data$RunParams$lambda <- unbox(params$lambda)
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+- set the parameters to generate the data
+```{r}
+n_units <- params$n_units
+n_nodes <- params$n_nodes
+n_locs <- params$n_locs
+n_replicas <- params$n_replicas
+
+seed = 467897965 ## for reproducibility purposes
+```
+
+## Data
+```{r}
+source("../r-utils/mesh_utils.R")
+```
+
+
+### Mesh
+```{r}
+mesh.2D <- unit_square.mesh(n_nodes, mesh_data_path)
+```
+
+### Eigenfunctions
+```{r}
+#'define a dummy pde to get the stiffness and the mass matrices of the 
+#'differential operator
+mesh <- Mesh(
+  list(
+    nodes = mesh.2D$nodes,
+    elements = mesh.2D$triangles,
+    boundary = mesh.2D$nodesmarkers
+  )
+)
+Vh <- FunctionSpace(mesh, fe_order=1)
+u <- Function(Vh)
+
+L <- anisothropic_diffusion_op(
+  pi/3, #angle
+  1.5 #intensity
+  )
+f <- function(points) { return(0*points[,1])} #forcing term set to 0 
+pde <- Pde(L(u), f)
+
+##(2) Eigenfunctions
+#evd
+evd <- eigen(Pde(L(u),f)$stiff(), symmetric = T, only.values = F)
+#at mesh nodes
+f1_fem <- evd$vectors[,20]
+f2_fem <- evd$vectors[,29]
+f3_fem <- evd$vectors[,4]
+
+#L2 norm
+L2norm <- L2norm.factory(mesh.2D, L) #function to compute the norm
+```
+
+### Locations
+```{r}
+locations.obs.2D <- unit_square.locs(n_locs, obs_data_path)
+
+Psi <- Psi.matrix(mesh.2D, locations.obs.2D)
+
+true_PCs <- cbind(as.matrix(Psi %*% f1_fem/L2norm(f1_fem)),
+                  as.matrix(Psi %*% f2_fem/L2norm(f2_fem)),
+                  as.matrix(Psi %*% f3_fem/L2norm(f3_fem))
+)
+```
+
+## Competitors 
+
+```{r}
+MV_PCA_wrapped <- function(X, center = TRUE, n_comp = 3) {
+
+  ## centering
+  X_mean_locs <- rep(0, ncol(X))
+  if(center) {
+    X_mean_locs <- colMeans(X)
+    X <- scale(X, center = TRUE, scale = FALSE)
+  }
+
+  # MV-PCA
+  model_MV_PCA <- prcomp(X, center = FALSE, rank. = n_comp)
+
+  ## results
+  loadings_locs <- model_MV_PCA$rotation
+  scores <- model_MV_PCA$x
+  X_hat_locs <- scores %*% t(loadings_locs) + rep(1, nrow(scores)) %*% t(X_mean_locs)
+  
+  return(list(
+    model = model_MV_PCA,
+    results = list(
+      loadings = NULL,
+      loadings_locs = loadings_locs,
+      scores = scores,
+      X_mean = NULL,
+      X_mean_locs = X_mean_locs,
+      X_hat = NULL,
+      X_hat_locs = X_hat_locs
+    )
+  ))
+}
+
+
+library(mgcv)
+# Define the smoothing function
+tps.smoother <- function(values, locations) {
+  # Fit thin-plate spline model
+  fit <- gam(target ~ s(x1, x2, bs="tp"), 
+             data = data.frame(
+               target = values, 
+               x1=locations[[1]], 
+               x2=locations[[2]])
+             )
+  # Predict smoothed values
+  return(fitted.values(fit))
+}
+
+library(fdaPDE)
+
+suppress_print <- function(expr) {
+  capture.output(suppressMessages(suppressWarnings(expr)), file = "/dev/null")
+}
+
+# Define the smoothing function
+SRPDE.2D.smoother.factory <- function(mesh) {
+  SRPDE.2D.smoother <- function(values,locations){
+    suppress_print(
+      fit.SRPDE <- smooth.FEM(
+        locations = locations,
+        observations = values,
+        FEMbasis = create.FEM.basis(mesh)
+        )
+    )
+    return(fit.SRPDE$solution$z_hat)
+  }
+  return(SRPDE.2D.smoother)
+}
+
+SRPDE.2D.smoother <- function(values,locations,mesh){
+  return(SRPDE.2D.smoother.factory(mesh)(values,locations))
+}
+```
+
+
+## Run
+```{r}
+library(dplyr)
+
+keys <- c("method","replica")
+
+error_metrics <- c("errPC1","errPC2","errPC3",
+                   "errScore1","errScore2","errScore3",
+                   "signal_reconstruction_error",
+                   "space_reconstruction_error")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics))))
+names(test_results) <- c(keys, error_metrics)
+
+test_results[] <- lapply(test_results, function(x) numeric())
+
+test_results$method <- character()
+```
+
+
+```{r}
+compute.errors.FPCA <- function(
+    data, est.PCs, est.Scores,
+    est.center=0){
+  
+  #compute errors & times
+  errors <- list()
+  errors$RMSE.PCs <- vector()
+  errors$Scores <- vector()
+  
+  for(ind_pc in 1:min(ncol(est.PCs),ncol(data$pcs))){
+    errors$RMSE.PCs[ind_pc] <- 
+      min(RMSE.vector(data$pcs[,ind_pc],est.PCs[,ind_pc]),
+          RMSE.vector(data$pcs[,ind_pc],-est.PCs[,ind_pc]))
+    errors$Scores[ind_pc] <- 
+      min(RMSE.vector(data$scores[,ind_pc],est.Scores[,ind_pc]),
+          RMSE.vector(data$scores[,ind_pc],-est.Scores[,ind_pc]))
+  }
+  
+  errors$signal_reconstruction <- RMSE.matrix(data$scores%*%t(data$pcs),
+                                              est.Scores%*%t(est.PCs)+est.center)
+  errors$space_reconstruction <- subspace(data$pcs,est.PCs)
+  
+  return(errors)
+}
+```
+
+
+```{r}
+append_results <- function(method_name, ind_replica,
+                           test_results,est.PCs,est.Scores,data,est.center=0){
+  errors <- compute.errors.FPCA(data, 
+                                est.PCs = est.PCs,
+                                est.Scores = est.Scores
+                                )
+        
+  test_results <- test_results %>%
+          add_row(method=method_name, replica=ind_replica)
+  new_row <- 
+    test_results$method==method_name & 
+    test_results$replica==ind_replica 
+        
+  test_results[new_row, error_metrics] <- unlist(errors)
+  
+  return(test_results)
+}
+```
+
+
+```{r}
+source("../r-utils/error_metrics.R")
+
+for(ind_rep in 1:n_replicas){
+    data <- data_generator(n_units,
+                       true_PCs = true_PCs,
+                       scores_sd = c(0.4,0.3,0.2),
+                       error_sd = 0.1,
+                       obs_path = obs_data_path,
+                       seed = seed + 4*ind_rep)
+    
+
+    #(1) monolithic
+    json_data$RunParams$RSVDType <- unbox("monolithic")
+    write_json(json_data, "params.json", pretty = TRUE)
+    #run the program
+    system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/fpca/fpca_test")
+    #results
+    est.PCs <- as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+    est.Scores <- as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+        
+    test_results <- append_results("monolithic",ind_rep,test_results,
+                                   est.PCs = est.PCs, est.Scores = est.Scores,
+                                   data = data)
+    
+    #(2) sequential
+    json_data$RunParams$RSVDType <- unbox("sequential")
+    write_json(json_data, "params.json", pretty = TRUE)
+    #run the program
+    system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/fpca/fpca_test")
+    #results
+    est.PCs <- as.matrix(readMM(file=paste(results_path,"estimated_PCs.mtx",sep="/")))
+    est.Scores <- as.matrix(readMM(file=paste(results_path,"estimated_Scores.mtx",sep="/")))
+        
+    test_results <- append_results("sequential",ind_rep,test_results,
+                                   est.PCs = est.PCs, est.Scores = est.Scores,
+                                   data = data)
+    
+    #(3) MV-PCA
+    MV.pca <- MV_PCA_wrapped(data$noisy_data)
+    loadings_norm <- apply(MV.pca$results$loadings_locs,MARGIN=2,L2norm)
+    test_results <- append_results("MV-PCA",ind_rep,test_results,
+                                   est.PCs = t(t(MV.pca$results$loadings_locs) /
+                                                 loadings_norm), 
+                                   est.Scores = t(t(MV.pca$results$scores)*loadings_norm),
+                                   data = data)
+    # #(4) tps-smoothing+MV-PCA
+    # # Apply smoothing to each row
+    # smoothed_data <- t(apply(data$noisy_data,
+    #                    MARGIN=1, FUN = tps.smoother, locations.obs.2D))
+    # tps.MV.pca <- MV_PCA_wrapped(smoothed_data)
+    # loadings_norm <- apply(tps.MV.pca$results$loadings_locs,MARGIN=2,L2norm)
+    # test_results <- append_results("tps-MV-PCA",ind_rep,test_results,
+    #                                est.PCs = t(t(tps.MV.pca$results$loadings_locs) /
+    #                                              loadings_norm), 
+    #                                est.Scores = t(t(tps.MV.pca$results$scores)*loadings_norm),
+    #                                data = data,
+    #                                est.center = tps.MV.pca$results$X_mean_locs)
+    # 
+    # 
+    # #(5) SRPDE-smoothing+MV-PCA
+    # # Apply smoothing to each row
+    # smoothed_data <- t(apply(data$noisy_data,
+    #                    MARGIN=1, FUN = SRPDE.2D.smoother,locations.obs.2D,mesh.2D))
+    # SRPDE.MV.pca <- MV_PCA_wrapped(smoothed_data)
+    # loadings_norm <- apply(SRPDE.MV.pca$results$loadings_locs,MARGIN=2,L2norm)
+    # test_results <- append_results("SRPDE-MV-PCA",ind_rep,test_results,
+    #                                est.PCs = t(t(SRPDE.MV.pca$results$loadings_locs) /
+    #                                              loadings_norm), 
+    #                                est.Scores = 
+    #                                  t(t(SRPDE.MV.pca$results$scores)*loadings_norm),
+    #                                data = data,
+    #                                est.center = SRPDE.MV.pca$results$X_mean_locs)
+}#replicas
+```
+
+## Debug
+SRPDE
+```{r}
+actual_data <- data$scores%*%t(data$pcs)
+SRPDE.smoothed_data <- t(apply(data$noisy_data,
+                       MARGIN=1, FUN = SRPDE.2D.smoother,locations.obs.2D,mesh.2D))
+SRPDE.MV.pca <- MV_PCA_wrapped(SRPDE.smoothed_data)
+
+RMSE.matrix(actual_data,
+            SRPDE.smoothed_data)
+
+rec_data <- SRPDE.MV.pca$results$scores%*%t(SRPDE.MV.pca$results$loadings_locs)+matrix(rep(SRPDE.MV.pca$results$X_mean_locs,50),nrow=50)
+
+RMSE.matrix(actual_data,
+            rec_data)
+```
+
+
+tps
+
+```{r}
+tps.smoother <- function(values, locations) {
+  knots = data.frame(x1=locations[[1]],x2=locations[[2]])
+  
+  # Fit thin-plate spline model
+  fit <- gam(target ~ s(x1, x2,bs="tp"), 
+             data = data.frame(
+               target = values, 
+               x1=locations[[1]], 
+               x2=locations[[2]]),
+             method="GCV.Cp",
+             knots = knots
+             )
+  # Predict smoothed values
+  return(fitted.values(fit))
+}
+```
+
+```{r}
+actual_data <- data$scores%*%t(data$pcs)
+tps.smoothed_data <- t(apply(data$noisy_data,
+                       MARGIN=1, FUN = tps.smoother, locations.obs.2D))
+tps.MV.pca <- MV_PCA_wrapped(tps.smoothed_data)
+
+RMSE.matrix(actual_data,
+            tps.smoothed_data)
+
+rec_data <- tps.MV.pca$results$scores%*%t(tps.MV.pca$results$loadings_locs)+matrix(rep(tps.MV.pca$results$X_mean_locs,50),nrow=50)
+
+RMSE.matrix(actual_data,
+            rec_data)
+```
+
+
+```{r}
+plot_eigenfunction(tps.smoothed_data[,1],locations.obs.2D,"test")
+plot_eigenfunction(SRPDE.smoothed_data[,1],locations.obs.2D,"test")
+```
+
+
+```{r}
+plot_eigenfunction(SRPDE.MV.pca$results$loadings_locs[,1],locations.obs.2D,"test")
+plot_eigenfunction(tps.MV.pca$results$loadings_locs[,1],locations.obs.2D,"test")
+```
+
+
+## Visualization
+
+```{r}
+write.csv(format(test_results, digits = 16),
+          paste("past-runs",
+                paste("fpca-competitors",
+                      "-Mesh",params$n_nodes,
+                      "-Obs",params$n_units,
+                      "-Locs",params$n_locs,
+                      ".csv",sep=""),
+          sep="/")
+)
+```
+
+```{r}
+library(readr)
+test_results <- read_csv("past-runs/fpca-competitors-Mesh400-Obs50-Locs400.csv",
+                         col_types = cols(...1 = col_skip()))
+
+test_results$method <- factor(test_results$method, 
+                              levels = c("monolithic", "sequential", "MV-PCA", "tps-MV-PCA",
+                                         "SRPDE-MV-PCA"))
+```
+
+
+```{r}
+source("../r-utils/plot_utils.R")
+
+col_palette <- palette.colors(n=6, palette = "R4")
+color_map <- c(
+  "monolithic" = col_palette[2],
+  "sequential" = col_palette[3],
+  "MV-PCA" = col_palette[4],
+  "tps-MV-PCA" = col_palette[5],
+  "SRPDE-MV-PCA" = col_palette[6]
+)
+```
+
+```{r}
+for(i in 1:3){
+  errPC.plot <- grouped_boxplot(subset(test_results,method!="tps-MV-PCA"),
+                 paste("Error on PC",i,sep=""),
+                 "method", paste("errPC",i,sep=""),
+                 group_name = "method", color_map
+                 ) 
+  print(errPC.plot)
+  
+  ggsave(paste("plots-competitors/",
+               "errPC",i,
+             ".pdf", sep=""), 
+       errPC.plot, width = 10, height = 5)
+}
+```
+
+```{r}
+for(i in 1:3){
+  errScore.plot <- grouped_boxplot(subset(test_results,method!="tps-MV-PCA"),
+                 paste("Error on Score",i,sep=""),
+                 "method", paste("errScore",i,sep=""),
+                 group_name = "method", color_map
+                 ) 
+  print(errScore.plot)
+  
+  ggsave(paste("plots-competitors/",
+               "errScore",i,
+             ".pdf", sep=""), 
+       errScore.plot, width = 10, height = 5)
+}
+```
+
+```{r}
+signal_rec_err.plot <- grouped_boxplot(subset(test_results,method!="tps-MV-PCA"),
+                 "Signal reconstruction error",
+                 "method", "signal_reconstruction_error",
+                 group_name = "method", color_map
+                 ) 
+
+print(signal_rec_err.plot)
+
+ggsave(paste("plots-competitors/",
+               "signal_rec_err",
+             ".pdf", sep=""), 
+       signal_rec_err.plot, width = 10, height = 5)
+```
+
+

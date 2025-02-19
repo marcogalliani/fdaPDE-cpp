@@ -1,0 +1,429 @@
+---
+title: "Generation of spatial data"
+params:
+  n_eigvects: 30
+---
+
+## Parameters
+- params.json
+```{r}
+library(jsonlite)
+
+json_data <- fromJSON("params.json")
+
+json_data$RunParams$EVDType <- unbox("randomized")
+json_data$RunParams$n_eigenvectors <- unbox(params$n_eigvects)
+json_data$RunParams$tol <- unbox(1e-4)
+json_data$RunParams$max_iter <- unbox(1e10)
+
+json_data$DiffusionOp$alpha <- unbox(1/3*pi)
+json_data$DiffusionOp$gamma <- unbox(1.5)
+
+write_json(json_data, "params.json", pretty = TRUE)
+```
+
+- directories
+```{r}
+mesh_data_path <- "../data/mesh/unit_square"
+results_path <- "results"
+```
+
+## Error metrics
+```{r}
+source("../r-utils/error_metrics.R")
+
+compute_errors <- function(exact.eigVals, exact.eigVects,
+                           est.eigVals, est.eigVects){
+  rank <- length(est.eigVals)
+
+  errors <- list()
+  errors$error.eigVals <- sqrt(sum((exact.eigVals[1:rank]-est.eigVals)^2))
+  
+  eigVects.diff <- apply(exact.eigVects[,1:rank]-est.eigVects,
+                         MARGIN=2,
+                         function(x){
+                           sqrt(mean(x^2))
+                         })
+  eigVects.sum <- apply(exact.eigVects[,1:rank]+est.eigVects,
+                        MARGIN=2,
+                         function(x){
+                           sqrt(mean(x^2))
+                         })
+  errors$RMSE.eigVects <- max(pmin(eigVects.diff,eigVects.sum))
+  
+  errors$reconstruction_err <- 
+    sqrt(mean((est.eigVects%*%diag(est.eigVals)%*%t(est.eigVects)-exact.eigVects[,1:rank]%*%diag(exact.eigVals[1:rank])%*%t(exact.eigVects[,1:rank]))^2))
+  
+  
+  return(errors)
+}
+```
+
+```{r}
+time_diff.seconds <- function(start_time, end_time){
+  t_diff <- end_time - start_time
+  as.numeric(t_diff) * 
+                        switch(attr(t_diff, "units"),
+                               secs = 1,
+                               mins = 60,
+                               hours = 3600,
+                               days = 86400,
+                               1)  # Default multiplier
+}
+```
+
+
+## Run
+```{r}
+tested_nnodes <- c(100,400,900,1600,2500,3600,5000)
+```
+
+To store the results
+```{r}
+library(dplyr)
+
+keys <- c("evd","n_nodes","replica")
+
+error_metrics <- c("err_eigvals","err_eigvects","rec_err")
+
+time_metrics <- c("exe_time")
+
+test_results <- 
+   data.frame(matrix(nrow=0,ncol=length(c(keys,error_metrics,time_metrics,"norm_R1"))))
+names(test_results) <- c(keys, error_metrics,time_metrics,"norm_R1")
+
+test_results[] <- lapply(test_results, function(x) numeric())
+
+test_results$evd <- character()
+```
+
+
+```{r}
+source("../r-utils/mesh_utils.R")
+
+for(curr_nnodes in tested_nnodes){
+  
+  cat("n_nodes: ",curr_nnodes,"\n")
+  mesh.2D <- unit_square.mesh(curr_nnodes, mesh_data_path)
+  
+  #->exact version
+  cat("evd: ","exact","\n")
+  json_data$RunParams$EVDType <- unbox("exact")
+  write_json(json_data, "params.json", pretty = TRUE)
+  
+
+  system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/data-generation-test/spatial-data-generation")
+
+  
+  exact.eigenvectors <- as.matrix(readMM(file=paste(results_path,
+                                                "eigenvectorsR1.mtx",sep="/")))
+  exact.eigenvalues <- as.vector(readMM(file=paste(results_path,
+                                             "eigenvaluesR1.mtx",sep="/")))
+  
+  test_results <- test_results %>%
+    add_row(evd="exact", n_nodes=curr_nnodes, replica=1)
+  new_row <- 
+    test_results$evd=="exact" & 
+    test_results$n_nodes==curr_nnodes &
+    test_results$replica==1
+
+  test_results[new_row, "exe_time"] <- 
+    read.csv("results/test_report.csv",header = F)$V1
+  
+  #->randomized version
+  cat("evd: ","randomized","\n")
+  for (ind_rep in 1:10) {
+    cat("Replica: ",ind_rep,"\n")
+    json_data$RunParams$EVDType <- unbox("randomized")
+    write_json(json_data, "params.json", pretty = TRUE)
+    
+    system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/data-generation-test/spatial-data-generation")
+    
+    est.eigenvectors <- as.matrix(readMM(file=paste(results_path,
+                                                  "eigenvectorsR1.mtx",sep="/")))
+    est.eigenvalues <- as.vector(readMM(file=paste(results_path,
+                                               "eigenvaluesR1.mtx",sep="/")))
+    
+    #->load R0 matrix
+    R0 <- as.matrix(readMM(file=paste(results_path,"R0.mtx",sep="/")))
+    R1 <- as.matrix(readMM(file=paste(results_path,"R1.mtx",sep="/")))
+    
+    #compute errors & times
+    errors <- compute_errors(exact.eigVals=exact.eigenvalues, 
+                             exact.eigVects=exact.eigenvectors,
+                             est.eigVals=est.eigenvalues, 
+                             est.eigVects=est.eigenvectors)
+    
+    test_results <- test_results %>%
+      add_row(evd="randomized", n_nodes=curr_nnodes, replica=ind_rep)
+    new_row <- 
+      test_results$evd=="randomized" & 
+      test_results$n_nodes==curr_nnodes &
+      test_results$replica==ind_rep
+    test_results[new_row, error_metrics] <- unlist(errors)
+    test_results[new_row, "exe_time"] <- 
+      read.csv("results/test_report.csv",header = F)$V1
+    test_results[new_row, "norm_R1"] <- norm(R1)
+    
+  }
+}
+```
+
+```{r}
+plot(exact.eigenvalues)
+```
+
+
+## Visualization
+```{r}
+write.csv(format(test_results, digits = 16),
+          paste("past-runs",
+                paste("data-generation-test",
+                      ".csv",sep=""),
+          sep="/")
+)
+```
+
+```{r}
+library(readr)
+source("../r-utils/plot_utils.R")
+
+
+test_results <- read.csv("past-runs/data-generation-test.csv")
+test_results$X <- NULL
+
+rand.accuracy_test <- subset(test_results,evd=="randomized") 
+rand.accuracy_test$n_nodes <- as.factor(rand.accuracy_test$n_nodes)
+rand.accuracy_test$replica <- as.factor(rand.accuracy_test$replica)
+
+error_metrics <- c("err_eigvals","err_eigvects","rec_err")
+
+rand.accuracy_test[,error_metrics] <- 
+  sapply(rand.accuracy_test[,error_metrics], as.numeric)
+
+```
+
+```{r}
+library(purrr)
+library(dplyr)
+
+rand.accuracy_test <- rand.accuracy_test %>%
+  group_by(evd, n_nodes) %>%
+  summarise_if(is.numeric,list(median))
+
+rand.accuracy_test
+```
+
+Table
+```{r}
+library(kableExtra)
+
+what_is <- rand.accuracy_test[,c("n_nodes",error_metrics)] %>%
+  kbl(caption="Accuracy analysis of randomized SVD algorithms on matrices with slow singular values decay",
+      digits = 10,
+      format="latex",
+      col.names = c("nodes","eigVals","eigVects","reconstruction"),
+      align="r") %>%
+  kable_minimal(full_width = F,  html_font = "Source Sans Pro")
+```
+
+
+```{r}
+col_palette <- palette.colors(n=3, palette = "R4")
+color_map <- c(
+  "exact" = col_palette[2],
+  "randomized" = col_palette[3]
+)
+```
+
+
+
+### Accuracy
+```{r}
+eigVals.plt <- grouped_boxplot(rand.accuracy_test,
+                 var_name.x = "n_nodes", 
+                 var_name.y = "err_eigvals",
+                 group_name = "evd", log.y = T,
+                 color_map = color_map
+                 ) 
+
+print(eigVals.plt)
+
+ggsave(paste("plots/",
+               "eigVals-err",
+             ".pdf", sep=""), 
+       eigVals.plt, width = 10, height = 5)
+```
+
+```{r}
+eigVect.plt <- grouped_boxplot(subset(test_results,evd=="randomized"),
+                 "Eigenvectors error",
+                 var_name.x = "n_nodes", 
+                 var_name.y = "err_eigvects",
+                 group_name = "evd", log.y = T,
+                 color_map = color_map
+                 )
+
+print(eigVect.plt)
+
+ggsave(paste("plots/",
+               "eigVects-err",
+             ".pdf", sep=""), 
+       eigVect.plt, width = 10, height = 5)
+```
+
+```{r}
+rec_err.plt <- grouped_boxplot(rand.accuracy_test,
+                 var_name.x = "n_nodes", 
+                 var_name.y = "rec_err",
+                 group_name = "evd",
+                 color_map = color_map
+                 ) + labs(y="reconstruction")
+
+print(rec_err.plt)
+
+ggsave(paste("plots/",
+               "rec_err",
+             ".pdf", sep=""), 
+       rec_err.plt, width = 10, height = 5)
+```
+
+### Times
+```{r}
+med.exe_time <- test_results %>% 
+  group_by(evd,n_nodes) %>%
+  summarise(exe_time = median(exe_time))
+
+
+exe_time.plt <- grouped_lineplot(med.exe_time,
+                 var_name.x = "n_nodes", 
+                 var_name.y = "exe_time",
+                 group_name = "evd",
+                 color_map = color_map,
+                 log.x = F, log.y = F,
+                 complexity.lines = c(1,2,3),
+                 legend = T
+                 ) + labs(color="EVD")
+
+print(exe_time.plt)
+
+ggsave(paste("plots/",
+               "exe_time",
+             ".pdf", sep=""), 
+       exe_time.plt, width = 10, height = 5)
+
+```
+
+
+
+## Consistency with r
+```{r}
+mesh.2D <- unit_square.mesh(900, mesh_data_path)
+```
+
+```{r}
+#->exact version
+json_data$RunParams$EVDType <- unbox("exact")
+write_json(json_data, "params.json", pretty = TRUE)
+
+system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/data-generation-test/spatial-data-generation")
+
+exact.eigenvectors <- as.matrix(readMM(file=paste(results_path,
+                                              "eigenvectorsR1.mtx",sep="/")))
+exact.eigenvalues <- as.vector(readMM(file=paste(results_path,
+                                           "eigenvaluesR1.mtx",sep="/")))
+
+
+#->randomized version
+json_data$RunParams$EVDType <- unbox("randomized")
+write_json(json_data, "params.json", pretty = TRUE)
+
+system("/Users/marcogalliani/Desktop/fdaPDE-cpp/cmake-build-default/experiments/data-generation-test/spatial-data-generation")
+
+est.eigenvectors <- as.matrix(readMM(file=paste(results_path,
+                                              "eigenvectorsR1.mtx",sep="/")))
+est.eigenvalues <- as.vector(readMM(file=paste(results_path,
+                                           "eigenvaluesR1.mtx",sep="/")))
+
+#->load R0 matrix
+R0 <- as.matrix(readMM(file=paste(results_path,"R0.mtx",sep="/")))
+R1 <- as.matrix(readMM(file=paste(results_path,"R1.mtx",sep="/")))
+```
+
+Errors
+```{r}
+compute_errors(exact.eigVals=exact.eigenvalues, 
+                exact.eigVects=exact.eigenvectors,
+                est.eigVals=est.eigenvalues, 
+                est.eigVects=est.eigenvectors
+               )
+```
+
+```{r}
+norm(R1-est.eigenvectors%*%diag(est.eigenvalues)%*%t(est.eigenvectors))
+
+rank <- length(est.eigenvalues)
+norm(R1-exact.eigenvectors[,1:rank]%*%diag(exact.eigenvalues[1:rank])%*%t(exact.eigenvectors[,1:rank]))
+
+sqrt(mean((est.eigenvectors%*%diag(est.eigenvalues)%*%t(est.eigenvectors)-exact.eigenvectors[,1:rank]%*%diag(exact.eigenvalues[1:rank])%*%t(exact.eigenvectors[,1:rank]))^2))
+
+sqrt(mean((est.eigenvectors%*%diag(est.eigenvalues)%*%t(est.eigenvectors)-R1)^2))
+sqrt(mean((R1-exact.eigenvectors[,1:rank]%*%diag(exact.eigenvalues[1:rank])%*%t(exact.eigenvectors[,1:rank]))^2))
+```
+
+
+Discretization in r
+```{r}
+mesh <- Mesh(
+    list(
+      nodes = mesh.2D$nodes,
+      elements = mesh.2D$triangles,
+      boundary = mesh.2D$nodesmarkers
+    )
+  )
+Vh <- FunctionSpace(mesh, fe_order=1)
+u <- Function(Vh)
+L <- anisothropic_diffusion_op(
+    pi/3, #angle
+    1.5 #intensity
+    )
+
+Lu <- L(u) 
+f <- function(points) { return(0*points[,1])}
+pde <- Pde(Lu, f)
+```
+
+Comparing to the c++ code
+```{r}
+R0.r_version <- pde$mass() ## mass matrix
+R0 <- as.matrix(readMM(file=paste(results_path,"R0.mtx",sep="/")))
+norm(R0.r_version-R0)
+
+R1.r_version <- pde$stiff() ## stiffnes matrix
+R1 <- as.matrix(readMM(file=paste(results_path,"R1.mtx",sep="/")))
+norm(R1.r_version-R1)
+```
+
+R1 appears to be different
+```{r}
+evd.R1_cpp <- eigen(R1, symmetric = T, only.values = F)
+evd.R1_r <- eigen(R1.r_version, symmetric = T, only.values = F)
+
+plot_eigenfunction(evd.R1_cpp$vectors[,96],
+                   mesh.2D$nodes,
+                   "cpp")
+
+plot_eigenfunction(-evd.R1_r$vectors[,96],
+                   mesh.2D$nodes,
+                   "r")
+
+plot_eigenfunction(-exact.eigenvectors[,96],
+                   mesh.2D$nodes,
+                   "selfadjointeigensolver")
+
+plot_eigenfunction(est.eigenvectors[,5],
+                   mesh.2D$nodes,
+                   "REVD")
+```
+
+

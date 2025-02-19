@@ -1,0 +1,254 @@
+---
+title: "Test Report"
+params:
+  rsvd_solver:
+    value: "monolithic"
+    input: select
+    choices: ["monolithic","sequential"]
+output:
+  html_document:
+    code_folding: hide
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      results = 'hide', 
+                      fig.show = 'asis',
+                      warning = F,
+                      message = F)
+```
+
+
+## Loading the data
+```{r}
+file_name <- with(params, paste("spchol_monolithic",
+                                "-Mesh", "VAR",
+                                "-Obs", 400,
+                                "-Locs", "EQnod",
+                                ".csv",sep=""))
+
+
+
+library(readr)
+test_results <- read_csv(paste("past-runs",file_name,sep="/"),
+                         col_types = cols(...1 = col_skip()))
+test_results[["n_nodes"]] <- as.factor(test_results[["n_nodes"]])
+test_results[["rsvd"]] <- as.factor(test_results[["rsvd"]])
+```
+
+
+## Source
+```{r}
+source("../r-utils/plot_utils.R")
+```
+
+Color palette
+```{r}
+library(scales)
+library(cowplot)
+library(grid)
+library(gridExtra) 
+
+col_palette <- hue_pal()(2)
+color_map <- c(
+  "simple_monolithic" = col_palette[1],
+  "spchol_monolithic" = col_palette[2]
+)
+
+dummy_plot <- 
+  ggplot(data.frame(x = 1:length(color_map), y=1:length(color_map),
+                  method=names(color_map)), 
+       aes(x = x, y = y, color = method)) +
+  geom_point(size = 5) +  # Use points just for the purpose of displaying the legend
+  scale_color_manual(values = color_map) +  # Use the custom color mapping
+  theme_void() +                            # Remove axes and background
+  labs(color = "Method")
+
+
+legend <- cowplot::get_legend(dummy_plot)
+grid.newpage()
+grid.draw(legend)
+
+legend_grob <- grid.grabExpr(grid.draw(legend))  # Capture the legend as a grob
+```
+
+
+## Execution times
+
+### Grouped boxplot
+```{r}
+exeTime.plt <- grouped_boxplot(test_results,
+                title=NULL,
+                var_name.x = "n_nodes",
+                var_name.y = "exe_time",
+                group_name = "rsvd", color_map,
+                log.y = T, lines = T
+                ) + guides(color)
+
+print(exeTime.plt)
+```
+
+```{r}
+otherTime.plt <- grouped_boxplot(test_results,
+                title=NULL,
+                var_name.x = "n_nodes",
+                var_name.y = "other_time",
+                group_name = "rsvd", color_map,
+                log.y = T, lines = T
+                )
+
+print(otherTime.plt)
+```
+
+
+
+### Grouped lineplot
+```{r}
+exeTime.complexity.plt <- grouped_lineplot(test_results,
+                title = NULL,
+                var_name.x = "n_nodes",
+                var_name.y = "exe_time",
+                group_name = "rsvd", color_map,
+                log.x = T, log.y = T, 
+                complexity.lines = c(1,2),
+                legend = T)
+
+print(exeTime.complexity.plt)
+```
+
+### Profiling
+```{r}
+svd_pct.plt <- stacked_barplot(test_results,
+                var_name.x = "n_nodes",
+                var_name.part1 = "svd_time",
+                var_name.part2 = "other_time",
+                group_name = "rsvd",title = "")
+
+print(svd_pct.plt)
+```
+
+### Overall plots
+```{r}
+time.plt <- arrangeGrob(
+    svd_pct.plt, 
+    arrangeGrob(
+      exeTime.plt,
+      exeTime.complexity.plt
+    ),
+    ncol=2, nrow=1)
+
+ggsave(paste("plots/varying-",var_name,"/exe-times/",
+               "overall",
+               "-",params$rsvd_solver,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_obs,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+       time.plt, width = 10, height = 5)
+```
+
+
+
+## Accuracy analysis
+
+### Signal
+Signal reconstruction error
+
+```{r}
+signal.plt <- grouped_boxplot(test_results,
+                "tmp",
+                var_name.x = "n_nodes",
+                var_name.y = "signal_reconstruction_error",
+                group_name = "rsvd", color_map)
+
+ggsave(paste("plots/varying-",var_name,"/signal-reconstruction-error/",
+               "signal",
+               "-",params$rsvd_solver,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_obs,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+       signal.plt, width = 10, height = 5)
+```
+### Space
+Space reconstruction error
+
+```{r}
+space.plt <- grouped_boxplot(test_results,
+                "tmp",
+                var_name.x = "n_nodes",
+                var_name.y = "space_reconstruction_error",
+                group_name = "rsvd", color_map)
+
+ggsave(paste("plots/varying-",var_name,"/space-reconstruction-error/",
+               "space",
+               "-",params$rsvd_solver,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_obs,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+       space.plt, width = 10, height = 5)
+```
+
+### PCs
+Principal components
+
+```{r}
+PCs.accuracy <- list()
+
+for(err in c("errPC1","errPC2","errPC3")){
+  PCs.accuracy[[err]] <- grouped_boxplot(test_results,
+                paste(fixed_var,"=",params[[fixed_var]]),
+                var_name.x = var_name,
+                var_name.y = err,
+                group_name = "svd", color_map)
+}
+
+
+PCs.accuracy.plt <- arrangeGrob(
+    PCs.accuracy[["errPC1"]],
+    PCs.accuracy[["errPC2"]],
+    PCs.accuracy[["errPC3"]], 
+    ncol=3, nrow=1)
+
+ggsave(paste("plots/varying-",var_name,"/PC-errors/",
+               "overall_accuracyPC",
+               "-",params$rsvd_solver,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_obs,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+       PCs.accuracy.plt, width = 10, height = 5)
+```
+
+### Scores
+Scores
+
+```{r}
+Scores.accuracy <- list()
+
+for(err in c("errScore1","errScore2","errScore3")){
+  Scores.accuracy[[err]] <- grouped_boxplot(test_results,
+                paste(fixed_var,"=",params[[fixed_var]]),
+                var_name.x = var_name,
+                var_name.y = err,
+                group_name = "svd", color_map)
+}
+
+Scores.accuracy.plt <- arrangeGrob(
+    Scores.accuracy[["errScore1"]],
+    Scores.accuracy[["errScore2"]],
+    Scores.accuracy[["errScore3"]], 
+    ncol=3, nrow=1)
+
+ggsave(paste("plots/varying-",var_name,"/Scores-errors/",
+               "overall_accuracyScores",
+               "-",params$rsvd_solver,
+               "-Mesh",params$n_nodes,
+               "-Obs",params$n_obs,
+               "-Locs",params$n_locs,
+             ".pdf", sep=""), 
+       Scores.accuracy.plt, width = 10, height = 5)
+```
+
