@@ -119,7 +119,7 @@ class RegularizedSVD<sequential,SVDType_> {
             solver_.compute(X_, optimal_lambda, f0);
             X_ -= solver_.s() * solver_.fn().transpose() * solver_.f_norm();   // X <- X - s*f_n^\top (deflation step)
             rsvd_->selected_lambdas_.push_back(optimal_lambda);                // store optimal smoothing level
-
+            std::cout << optimal_lambda << std::endl;
             return;
         }
        public:

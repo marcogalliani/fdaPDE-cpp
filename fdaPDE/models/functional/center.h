@@ -18,6 +18,7 @@
 #define __CENTER_H__
 
 #include <fdaPDE/utils.h>
+#include <fdaPDE/models/model_macros.h>
 
 namespace fdapde {
 namespace models {
@@ -28,7 +29,7 @@ template <typename SmootherType_, typename CalibratorType_>
 DMatrix<double> smooth_mean(
   const DMatrix<double>& X, const DVector<double>& w, SmootherType_&& smoother, CalibratorType_&& calibrator) {
     fdapde_assert(X.rows() == w.rows());
-    BlockFrame<double, int> df;
+    core::BlockFrame<double, int> df;
     // let O_{p_i} the set of index where x_j is observed at location p_i, compute smoother data {y_i}_i
     // y_i = \sum_{j \in O_{p_i}} x_j(p_i)*w_j / \sum_{j \in O_{p_i}} w_j
     DMatrix<double> X_ = X.array().isNaN().select(0, X).transpose() * w;

@@ -221,11 +221,11 @@ public:
         return;
     }
     //calibration
-    double gcv(const DMatrix<double>& X){
+    double gcv(const DMatrix<double>& X, double gcv_correction=1.0){
         DMatrix<double> S_norm = S_.array().rowwise() / f_norm_.transpose().array();
         DMatrix<double> F_unnorm = F_.array().rowwise() * f_norm_.transpose().array();
         int n_locs = X.cols();
-        return n_locs*(S_norm.transpose()*X-(solver_.Psi() * F_unnorm).transpose()).squaredNorm()/std::pow(n_locs-gcv_.eval_edfs(),2);
+        return n_locs*(S_norm.transpose()*X-(solver_.Psi() * F_unnorm).transpose()).squaredNorm()/std::pow(n_locs-gcv_correction*gcv_.eval_edfs(),2);
     }
     // getters
     const DMatrix<double>& F() const { return F_; }   // loadings matrix

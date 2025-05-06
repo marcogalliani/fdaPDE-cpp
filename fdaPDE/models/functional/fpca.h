@@ -74,7 +74,6 @@ class FPCA : public FunctionalBase<FPCA<RegularizationType_>, RegularizationType
     const DMatrix<double>& loadings() const { return solver_.loadings(); }
     const DMatrix<double>& scores() const { return solver_.scores(); }
     const DVector<double>& loadings_norm() const { return solver_.loadings_norm(); }
-    // setters
     void set_npc(int n_pc) { n_pc_ = n_pc; }
     template <typename SolverType_> void set_solver(SolverType_&& solver) { solver_ = solver; }
 };

@@ -13,6 +13,7 @@ using fdapde::models::FPCA;
 using fdapde::models::RegularizedSVD;
 using fdapde::models::Sampling;
 using fdapde::models::PowerIteration;
+using fdapde::models::StochasticEDF;
 
 #include "test/src/utils/constants.h"
 #include "test/src/utils/mesh_loader.h"
@@ -35,7 +36,7 @@ void seqFPCA_calibration(ModelType &model, int rank,
                           int seed = fdapde::random_seed){
     //(1) Calibration
     DVector<double> optimal_lambda;
-    const DMatrix<double> &X = model.X();
+    const DMatrix<double> X = model.X();
     BlockFrame<double, int> df;
 
     DVector<double> cv_values(lambda_grid.size());
@@ -43,16 +44,18 @@ void seqFPCA_calibration(ModelType &model, int rank,
     const auto start{std::chrono::steady_clock::now()};
     switch (calibration) {
         case Calibration::gcv:{
-            DMatrix<double> X_d = X;
             RSVD<DMatrix<double>> svd;
-            svd.compute(X_d, rank);
-            PowerIteration<ModelType> solver(model,1e-6,20,seed);
-            solver.init();
+            svd.compute(X, rank);
             // select \lambda minimizing the GCV index
             ScalarField<Dynamic> gcv([&](const DVector<double>& lambda) -> double {
-                DMatrix<double> scores(X.rows(),rank);
-                DMatrix<double> loadings(model.n_basis(),rank);
+                model.set_lambda(lambda);
+                model.init();
+                PowerIteration<ModelType> solver(model,1e-6,20,seed);
+                solver.init();
 
+                DMatrix<double> S(X.rows(),rank);
+                DMatrix<double> F(model.n_basis(),rank);
+                DMatrix<double> X_d = X;
                 //->sequential estimation of the components
                 for (int index = 0; index < rank; index++) {
                     //fit on the imputed data
@@ -60,11 +63,10 @@ void seqFPCA_calibration(ModelType &model, int rank,
                     //deflation
                     X_d -= solver.s() * solver.fn().transpose() * solver.f_norm();
                     //normalization
-                    loadings.col(index) = solver.f()*solver.f_norm();
-                    scores.col(index) = solver.s() ;
+                    F.col(index) = solver.f()*solver.f_norm();
+                    S.col(index) = solver.s() ;
                 }
-                double gcv_score = (scores.transpose()*X-loadings.transpose()*model.Psi().transpose()).squaredNorm()*X.cols()/std::pow(X.cols()-solver.edfs(),2);
-                return gcv_score;
+                return (S.transpose()*X-(model.Psi()*F).transpose()).squaredNorm()*X.cols()/std::pow(X.cols()-gcv_correction*solver.edfs(),2);
             });
             DVector<double> current_lambda = optimal_lambda =  lambda_grid.row(0);
             cv_values(0) =  gcv(current_lambda);

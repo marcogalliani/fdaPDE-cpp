@@ -26,7 +26,7 @@ using fdapde::testing::read_mtx;
 #include <Eigen/Eigenvalues>
 #include <Eigen/SparseCholesky>
 
-void subFPCA_calibration_test(DMatrix<double> lambda_grid, Calibration calibration, int n_folds=10, int n_pcs=3, int seed=fdapde::random_seed){
+void subFPCA_calibration_test(DMatrix<double> lambda_grid, Calibration calibration, int n_pcs=3, int n_folds=10, double gcv_correction = 1.0, int seed=fdapde::random_seed){
     // define domain
     MeshLoader<Triangulation<2, 2>> domain("unit_square");
     // import locations
@@ -62,7 +62,7 @@ void subFPCA_calibration_test(DMatrix<double> lambda_grid, Calibration calibrati
             svd.compute(y,3);
             ScalarField<Dynamic> gcv([&](const DVector<double>& lambda) -> double {
                 subspace_solver.compute(y, 3, lambda, svd.matrixV().leftCols(3));
-                return subspace_solver.gcv(y);   // return GCV index at convergence
+                return subspace_solver.gcv(y,gcv_correction);   // return GCV index at convergence
             });
             DVector<double> current_lambda = optimal_lambda =  lambda_grid.row(0);
             cv_values(0) =  gcv(current_lambda);
