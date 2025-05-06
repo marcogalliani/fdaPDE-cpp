@@ -1,0 +1,52 @@
+@startuml
+'https://plantuml.com/class-diagram
+
+class FunctionalBase
+
+class FPCA{
+- solver
+--
++ init()
++ solve()
+..getters..
++ loadings()
++ scores()
+}
+
+FunctionalBase --> FPCA
+
+class RegularizedSVD<SolutionPolicy_>
+
+FPCA::solver - RegularizedSVD
+RegularizedSVD -- "ReguralizedSVD<monolithic>" : full_spec >
+RegularizedSVD -- "ReguralizedSVD<sequential>" : full_spec >
+
+class "ReguralizedSVD<monolithic>"{
+..
++ compute()
++ loadings()
++ scores()
+}
+
+class "ReguralizedSVD<sequential>"{
+- rsvd_iterator
+..
++ compute()
++ loadings()
++ scores()
+}
+"ReguralizedSVD<sequential>" *-- rsvd_iterator
+
+
+class PowerMethod {
+    + init()
+    + solve()
+}
+class rsvd_iterator{
+    - solver
+}
+rsvd_iterator::solver - PowerMethod
+
+
+
+@enduml

@@ -1,0 +1,49 @@
+@startuml
+skinparam componentStyle rectangle
+
+package "CORE" {
+    rectangle {
+    [PDE]
+    [FEM]
+    [IGA]
+    [SPLINE]
+
+    [PDE] <--> [FEM]
+    [PDE] <--> [SPLINE]
+    [PDE] <--> [IGA]
+    [MESH]
+    [FEM] <--> [MESH]
+    [IGA] <--> [MESH]
+    [SPLINE] <--> [MESH]
+    }
+
+    [LINEAR ALGEBRA]
+    [OPTIMIZATION]
+
+    [LOW LEVEL UTILS]
+}
+
+package MODELS{
+    frame "REGRESSION"{
+    }
+    frame "FUNCTIONAL"{
+    }
+    frame "DENSITY ESTIMATION"{
+    [DENSITY BASE]
+    }
+    [MODEL BASE]
+
+    frame "FEM STACK"{
+        [SPACE ONLY]
+        [SPACE TIME]
+        [SEPARABLE] <--> [SPACE TIME]
+        [PARABOLIC] <--> [SPACE TIME]
+    }
+}
+
+[MODEL BASE] <--> "CORE"
+"FEM STACK" <--> [MODEL BASE]
+"REGRESSION" <--> "FEM STACK"
+"FUNCTIONAL" <--> "FEM STACK"
+"DENSITY ESTIMATION" <--> "FEM STACK"
+@enduml
