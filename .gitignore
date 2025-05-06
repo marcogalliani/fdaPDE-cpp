@@ -13,3 +13,9 @@ test/build/
 test/CMakeFiles/
 test/_deps/
 test/libs/
+.DS_Store
+.idea
+cmake-build-debug/
+cmake-build-default/
+experiments/
+
