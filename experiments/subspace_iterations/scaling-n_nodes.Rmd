@@ -314,11 +314,12 @@ plot <- plot +
   geom_line(data = subset(test_results.grouped, group == "sequential"), size = 2) +
   geom_line(linewidth=1.2,alpha=1) +
   theme_light() +
-  labs(x="n_nodes", y="execution time",color=NULL, label=NULL) +
+  labs(x="Nodes in the mesh", y="Execution time [s]", label=NULL, color=NULL) +
   scale_color_manual(values=color_map) +
   theme(text = element_text(size=25), legend.position = "top") +
   scale_x_log10() +
-  scale_y_log10()
+  scale_y_log10() +
+  guides(color = guide_legend(override.aes = list(linetype = "solid", linewidth = 2)))
 
 print(plot)
 

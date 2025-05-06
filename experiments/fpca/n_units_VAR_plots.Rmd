@@ -110,7 +110,7 @@ for(i in 1:3){
 errSignal.plot <- grouped_boxplot(test_results,
                  "n_units", "signal_reconstruction_error",
                  group_name = "algorithm", color_map
-                 ) + ylab("reconstr_err")
+                 ) + ylab("reconstruction")
 print(errSignal.plot)
   
 ggsave(paste("plots-n_unitsVAR/",
@@ -204,7 +204,7 @@ svd_profile.plt <- ggplot(time_composition, aes(x=n_units, y=op_time, fill=op_ty
     ) +
   facet_wrap(~algorithm, scales = "free_x") +
   theme_light()  +
-  theme(text = element_text(size=15))
+  theme(text = element_text(size=20), legend.position = "none")
 
 print(svd_profile.plt)
 ```
@@ -260,7 +260,7 @@ svd_pct.plt <- ggplot(time_composition, aes(x=n_units, y=op_time, fill=op_type))
     ) +
   facet_wrap(~algorithm, scales = "free_x") +
   theme_light() +
-  theme(text = element_text(size=15))
+  theme(text = element_text(size=25), legend.position = "none")
 
 print(svd_pct.plt)
 ```

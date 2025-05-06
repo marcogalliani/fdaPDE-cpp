@@ -51,6 +51,7 @@ int main(int argc, char **argv){
     //number of components
     int n_pc = data["RunParams"].value("n_pc",4);
     int n_folds = data["calibration"].value("n_folds",10);
+    double gcv_correction = data["calibration"].value("gcv_correction",1.0);
 
     double fixed_lambda = data["calibration"].value("fixed",0.00001);
     if(cal_map[cal_strategy] == Calibration::off){
@@ -59,9 +60,9 @@ int main(int argc, char **argv){
         else if (rsvd_version == "subspace") fpca_subspace_fixed(fixed_lambda, 100);
 
     }else{
-        if (rsvd_version == "monolithic") monoFPCA_calibration_test(lambda_grid, cal_map[cal_strategy],n_pc,n_folds);
-        else if (rsvd_version=="sequential") seqFPCA_calibration_test(lambda_grid, cal_map[cal_strategy],n_pc,n_folds);
-        else if (rsvd_version=="subspace") subFPCA_calibration_test(lambda_grid, cal_map[cal_strategy],n_folds);
+        if (rsvd_version == "monolithic") monoFPCA_calibration_test(lambda_grid, cal_map[cal_strategy],n_pc,n_folds,gcv_correction);
+        else if (rsvd_version=="sequential") seqFPCA_calibration_test(lambda_grid, cal_map[cal_strategy],n_pc, n_folds,gcv_correction);
+        else if (rsvd_version=="subspace") subFPCA_calibration_test(lambda_grid, cal_map[cal_strategy],n_pc, n_folds, gcv_correction);
     }
     return 0;
 }

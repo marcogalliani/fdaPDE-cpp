@@ -38,6 +38,7 @@ json_data$calibration$left <- unbox(-13)
 json_data$calibration$right <- unbox(2)
 json_data$calibration$n_folds <- unbox(params$n_folds)
 json_data$calibration$fixed <- unbox(1e-5)
+json_data$calibration$gcv_correction <- unbox(1)
 
 write_json(json_data, 
            "params.json", 
@@ -309,7 +310,7 @@ proj_rec_err_seq <- results$proj_rec_err
 
 ```{r}
 plot <- ggplot(data = CV_score[["sequential"]], aes(x = lambda)) +
-    geom_vline(xintercept = lambda_grid[which.min(rec_err_mono)],
+    geom_vline(xintercept = lambda_grid[which.min(rec_err_seq)],
                  color = "grey",
                  linetype = "dashed", linewidth=1) +
     geom_line(aes(y = gcv / sqrt(3 * params$n_statistical_units), 
@@ -383,23 +384,23 @@ plot <- ggplot(data = CV_score[["subspace"]], aes(x = lambda)) +
                                color="K-Fold CV"), size=3) +
     geom_line(aes(y = rec_err_sub, 
                   color = "Reconstruction"), 
-              linewidth = 1) +
+              linewidth = 1, linetype="twodash") +
     geom_point(mapping = aes(x=lambda_grid[which.min(rec_err_sub)],
                                  y=min(rec_err_sub),
                                  color="Reconstruction"), size=3) +
-    geom_line(aes(y = proj_rec_err_sub, 
-                  color = "Proj.Rec."), 
-              linewidth = 1) +
-    geom_point(mapping = aes(x=lambda_grid[which.min(proj_rec_err_sub)],
-                                   y=min(proj_rec_err_sub),
-                                   color="Proj.Rec."), size=3) +
+    # geom_line(aes(y = proj_rec_err_sub, 
+    #               color = "Proj.Rec."), 
+    #           linewidth = 1) +
+    # geom_point(mapping = aes(x=lambda_grid[which.min(proj_rec_err_sub)],
+    #                                y=min(proj_rec_err_sub),
+    #                                color="Proj.Rec."), size=3) +
     scale_x_log10() +
     scale_y_log10() +
     scale_color_manual(values = color_map) +
     theme_light() +
     ylab("CV-score") +
-    theme(legend.position = "top",text = element_text(size=20)) +
-    labs(color = NULL)  # Legend title
+    theme(legend.position = "top",text = element_text(size=25)) +
+    labs(x=expression(lambda), color = NULL)  # Legend title
 
 print(plot)
 
@@ -409,6 +410,13 @@ if(save){
              ".pdf", sep=""), 
        plot, width = 10, height = 5)
 }
+```
+
+```{r}
+ggsave(paste(plot_dir,
+              "/sub-CV",
+             ".pdf", sep=""), 
+       plot, width = 10, height = 5)
 ```
 
 

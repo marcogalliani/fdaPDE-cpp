@@ -154,7 +154,7 @@ plot_eigenfunction <- function(data, locs, title=NULL) {
   p
 }
 
-plot_stat_units <- function(stat_unit, locations, title=NULL){
+plot_stat_units <- function(stat_unit, locations, title=NULL, mybreaks=NULL, isolines=FALSE){
   ## data
   df <- data.frame(
     x = locations[,1],
@@ -163,9 +163,11 @@ plot_stat_units <- function(stat_unit, locations, title=NULL){
   )
   ## colors
   n_breaks <- 50
-  mybreaks <- c(-Inf, seq(min(df$f,na.rm=T), max(df$f,na.rm=T),
-                          length.out = n_breaks), 
-                Inf)
+  if(is.null(mybreaks)){
+    mybreaks <- c(-Inf, seq(min(df$f,na.rm=T), max(df$f,na.rm=T),
+                            length.out = n_breaks), 
+                  Inf)
+  }
   mycolors <- colorRampPalette(viridis(11))(length(mybreaks) - 1)
   
   x_range <- range(locations[,1], na.rm = TRUE)
@@ -188,6 +190,11 @@ plot_stat_units <- function(stat_unit, locations, title=NULL){
   
   if(!is.null(title)){
     plot <- plot + ggtitle(title)
+  }
+  
+  if(isolines){
+    plot <- plot + geom_contour(data=df, aes(x = x, y = y, z = f), 
+                                color = "black", breaks = mybreaks, size=0.2)
   }
   return(plot)
   

@@ -1,14 +1,15 @@
 {
   "RunParams": {
     "n_pc": 3,
-    "RSVDType": "sequential"
+    "RSVDType": "subspace"
   },
   "calibration": {
-    "strategy": "gcv",
-    "grid_dim": 100,
-    "left": -7,
-    "right": -2,
-    "fixed": 1e-05,
+    "strategy": "off",
+    "grid_dim": 50,
+    "left": -13,
+    "right": 2,
+    "fixed": 100,
+    "gcv_correction": 1,
     "n_folds": 10
   }
 }

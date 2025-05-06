@@ -4,7 +4,7 @@ params:
   n_nodes: 400
   n_locs: 400 #squared
   n_statistical_units: 100 #[200,400,800,"VAR"]
-  n_replicas: 40
+  n_replicas: 30
   n_folds: 10
 ---
 
@@ -33,12 +33,13 @@ json_data <- fromJSON("params.json")
 json_data$RunParams$RSVDType <- unbox(params$solver)
 json_data$RunParams$n_pc <- unbox(3)
 
-json_data$calibration$grid_dim <- unbox(100)
+json_data$calibration$grid_dim <- unbox(75)
 json_data$calibration$strategy <- unbox("gcv")
 json_data$calibration$left <- unbox(-7)
-json_data$calibration$right <- unbox(-2)
+json_data$calibration$right <- unbox(-3)
 json_data$calibration$n_folds <- unbox(params$n_folds)
 json_data$calibration$fixed <- unbox(1e-5)
+json_data$calibration$gcv_correction <- unbox(1.0)
 
 write_json(json_data, 
            "params.json", 
