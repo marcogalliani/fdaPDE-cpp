@@ -69,6 +69,8 @@ f1_fem <- square_eigenfunction(a = 1, b = 1, mesh.2D$nodes)
 f2_fem <- square_eigenfunction(a = 2, b = 3, mesh.2D$nodes)
 f3_fem <- square_eigenfunction(a = 4, b = 4, mesh.2D$nodes)
 
+t(f1_fem) %*% R0 %*% f1_fem
+
 ## normalize
 f1_norm <- L2norm(f1_fem)
 f2_norm <- L2norm(f2_fem)
@@ -117,6 +119,37 @@ plot_eigenfunction <- function(data, locs) {
         theme(legend.position = "none")
     p
 }
+plot_eigenfunction(f1, locations.obs.2D)
+plot_eigenfunction(f2, locations.obs.2D)
+plot_eigenfunction(f3, locations.obs.2D)
+
+## define eigenfunctions of laplace operator over square with neumann boundary conditions
+translated_eigenfunction <- function(a, b, locs,x_translation, y_translation) {
+  return(cos(a * pi * (locs[,1]-x_translation)) * cos(b * pi * (locs[, 2]-y_translation)))
+}
+
+## evaluate eigenfunctions on mesh nodes (this is equivalent to get the FEM basis
+## expansion of the eigenfunctions ). change values of a and b to select eigenfunction
+f1_fem <- translated_eigenfunction(a = 1, b = 1, mesh.2D$nodes,0.1,0.1)
+f2_fem <- translated_eigenfunction(a = 2, b = 3, mesh.2D$nodes,0.1,0.1)
+f3_fem <- translated_eigenfunction(a = 4, b = 4, mesh.2D$nodes,0.1,0.1)
+
+## normalize
+f1_norm <- L2norm(f1_fem)
+f2_norm <- L2norm(f2_fem)
+f3_norm <- L2norm(f3_fem)
+
+f1_normalized <- f1_fem / f1_norm
+f2_normalized <- f2_fem / f2_norm
+f3_normalized <- f3_fem / f3_norm
+
+## obervations are evaluation of L^2 normalized eigenfunctions at data locations
+Psi <- Vh$basis()$eval(as.matrix(locations.obs.2D))
+
+f1 <- as.matrix(Psi %*% f1_normalized)
+f2 <- as.matrix(Psi %*% f2_normalized)
+f3 <- as.matrix(Psi %*% f3_normalized)
+
 plot_eigenfunction(f1, locations.obs.2D)
 plot_eigenfunction(f2, locations.obs.2D)
 plot_eigenfunction(f3, locations.obs.2D)
