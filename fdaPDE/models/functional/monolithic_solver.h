@@ -62,7 +62,7 @@ public:
         DMatrix<double> normalized_scores = scores_.array().rowwise() / scores_norms.transpose().array();
         DMatrix<double> loadings = loadings_.array().rowwise() * scores_norms.transpose().array();
 
-        DMatrix<double> S_m = model_.Psi()*(invD_.transpose()*invD_)*model_.Psi();
+        DMatrix<double> S_m = model_.Psi()*(invD_.transpose()*invD_)*model_.Psi().transpose();
 
         int n_locs = model_.X().cols();
         return n_locs*(normalized_scores.transpose()*model_.X()-(model_.Psi() * loadings).transpose()).squaredNorm()/std::pow(n_locs-edf_discount*S_m.trace(),2);

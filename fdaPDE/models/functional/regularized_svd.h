@@ -99,10 +99,10 @@ class RegularizedSVD<sequential,SVDType_, /*missing*/false > {
                 });
                 core::Grid<Dynamic> optimizer;
 		        optimal_lambda = optimizer.optimize(gcv, rsvd_->lambda_grid_);
-                if (rsvd_->log_cv_scores) {
-                    DVector<double> cv_values = optimizer.objective_history();
-                    Eigen::saveMarket(cv_values,"results/CV_values"+ std::to_string(index_+1) +".mtx");
-                }
+                // if (rsvd_->log_cv_scores) {
+                //     DVector<double> cv_values = optimizer.objective_history();
+                //     Eigen::saveMarket(cv_values,"results/CV_values"+ std::to_string(index_+1) +".mtx");
+                // }
             } break;
             case Calibration::kcv: {
                 // select \lambda minimizing the reconstruction error in cross-validation
@@ -122,8 +122,8 @@ class RegularizedSVD<sequential,SVDType_, /*missing*/false > {
                 };
                 calibration::KCV calibrator{rsvd_->n_folds_, rsvd_->seed_};
                 optimal_lambda = calibrator.fit(model_, rsvd_->lambda_grid_, cv_score);
-                DVector<double> cv_values = calibrator.avg_scores();
-                Eigen::saveMarket(cv_values,"results/CV_values"+ std::to_string(index_+1) +".mtx");
+                // DVector<double> cv_values = calibrator.avg_scores();
+                // Eigen::saveMarket(cv_values,"results/CV_values"+ std::to_string(index_+1) +".mtx");
             } break;
             }
             solver_.compute(X_, optimal_lambda, f0);
@@ -243,8 +243,8 @@ public:
                 });
                 core::Grid<Dynamic> optimizer;
                 optimal_lambda = optimizer.optimize(gcv, lambda_grid_);
-                DVector<double> cv_values = optimizer.objective_history();
-                Eigen::saveMarket(cv_values,"results/CV_values.mtx");
+                // DVector<double> cv_values = optimizer.objective_history();
+                // Eigen::saveMarket(cv_values,"results/CV_values.mtx");
             } break;
             case Calibration::kcv:{
                 // select \lambda minimizing the reconstruction error in cross-validation
@@ -260,8 +260,8 @@ public:
                 };
                 calibration::KCV calibrator{n_folds_, seed_};
                 optimal_lambda = calibrator.fit(model, lambda_grid_, cv_score);
-                DVector<double> cv_values = calibrator.avg_scores();
-                Eigen::saveMarket(cv_values,"results/CV_values.mtx");
+                // DVector<double> cv_values = calibrator.avg_scores();
+                // Eigen::saveMarket(cv_values,"results/CV_values.mtx");
             } break;
         }
         //Run using the optimal lambda
