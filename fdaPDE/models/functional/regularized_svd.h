@@ -47,7 +47,7 @@ template <typename SolutionPolicy_, typename SVDType_, bool MissingData_=false> 
 // Finds a low-rank approximation of X while penalizing for the eigenfunctions of \mathcal{X} by sequentially solving
 // \argmin_{s,f} \norm_F{X - s^\top*f}^2 + (s^\top*s)*P_{\lambda}(f), up to a desired rank
 template<typename SVDType_>
-class RegularizedSVD<sequential,SVDType_> {
+class RegularizedSVD<sequential,SVDType_, /*missing*/false > {
    private:
     Calibration calibration_;    // PC function's smoothing parameter selection strategy
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
@@ -56,6 +56,9 @@ class RegularizedSVD<sequential,SVDType_> {
     double tolerance_ = 1e-6;   // relative tolerance between Jnew and Jold, used as stopping criterion
     int max_iter_ = 20;         // maximum number of allowed iterations
     int seed_ = fdapde::random_seed;
+
+    // for debugging
+    bool log_cv_scores = false;
 
     // problem solution
     DMatrix<double> loadings_;        // PC functions' expansion coefficients
@@ -94,7 +97,12 @@ class RegularizedSVD<sequential,SVDType_> {
                     solver_.compute(X_, lambda, f0);
                     return solver_.gcv();   // return GCV index at convergence
                 });
-		optimal_lambda = core::Grid<Dynamic> {}.optimize(gcv, rsvd_->lambda_grid_);
+                core::Grid<Dynamic> optimizer;
+		        optimal_lambda = optimizer.optimize(gcv, rsvd_->lambda_grid_);
+                if (rsvd_->log_cv_scores) {
+                    DVector<double> cv_values = optimizer.objective_history();
+                    Eigen::saveMarket(cv_values,"results/CV_values"+ std::to_string(index_+1) +".mtx");
+                }
             } break;
             case Calibration::kcv: {
                 // select \lambda minimizing the reconstruction error in cross-validation
@@ -112,14 +120,15 @@ class RegularizedSVD<sequential,SVDType_> {
                              .squaredNorm() /
                            test_set.count() * X_.cols();
                 };
-                optimal_lambda =
-                  calibration::KCV {rsvd_->n_folds_, rsvd_->seed_}.fit(model_, rsvd_->lambda_grid_, cv_score);
+                calibration::KCV calibrator{rsvd_->n_folds_, rsvd_->seed_};
+                optimal_lambda = calibrator.fit(model_, rsvd_->lambda_grid_, cv_score);
+                DVector<double> cv_values = calibrator.avg_scores();
+                Eigen::saveMarket(cv_values,"results/CV_values"+ std::to_string(index_+1) +".mtx");
             } break;
             }
             solver_.compute(X_, optimal_lambda, f0);
             X_ -= solver_.s() * solver_.fn().transpose() * solver_.f_norm();   // X <- X - s*f_n^\top (deflation step)
             rsvd_->selected_lambdas_.push_back(optimal_lambda);                // store optimal smoothing level
-            std::cout << optimal_lambda << std::endl;
             return;
         }
        public:
@@ -189,13 +198,15 @@ class RegularizedSVD<sequential,SVDType_> {
     void set_tolerance(double tolerance) { tolerance_ = tolerance; }
     void set_max_iter(int max_iter) { max_iter_ = max_iter; }
     void set_seed(int seed) { seed_ = seed; }
+    void set_cv_log(bool flag){ log_cv_scores = flag; }
+
     RegularizedSVD& set_lambda(const DMatrix<double>& lambda_grid) {
         fdapde_assert(calibration_ != Calibration::off);
         lambda_grid_ = lambda_grid;
         return *this;
     }
     RegularizedSVD& set_nfolds(int n_folds) {
-        fdapde_assert(calibration_ == Calibration::kcv);
+        // fdapde_assert(calibration_ == Calibration::kcv);
         n_folds_ = n_folds;
         return *this;
     }
@@ -203,7 +214,7 @@ class RegularizedSVD<sequential,SVDType_> {
 
 // finds a rank r matrix U minimizing \norm{X - U*\Psi^\top}_F^2 + Tr[U*P_{\lambda}(f)*U^\top]
 template<typename SVDType_>
-class RegularizedSVD<monolithic,SVDType_> {
+class RegularizedSVD<monolithic,SVDType_,/*missing*/false> {
 private:
     Calibration calibration_;    // PC function's smoothing parameter selection strategy
     int n_folds_ = 10;   // for a kcv calibration strategy, the number of folds
@@ -230,7 +241,10 @@ public:
                     mono_solver.compute(X,rank);
                     return mono_solver.gcv();
                 });
-                optimal_lambda = core::Grid<Dynamic> {}.optimize(gcv, lambda_grid_);
+                core::Grid<Dynamic> optimizer;
+                optimal_lambda = optimizer.optimize(gcv, lambda_grid_);
+                DVector<double> cv_values = optimizer.objective_history();
+                Eigen::saveMarket(cv_values,"results/CV_values.mtx");
             } break;
             case Calibration::kcv:{
                 // select \lambda minimizing the reconstruction error in cross-validation
@@ -244,8 +258,10 @@ public:
                     //evaluate the error on the test set
                     return mono_solver.reconstruction_error(test_set.repeat(1,X.cols()).select(X));
                 };
-                optimal_lambda =
-                        calibration::KCV{n_folds_, seed_}.fit(model, lambda_grid_, cv_score);
+                calibration::KCV calibrator{n_folds_, seed_};
+                optimal_lambda = calibrator.fit(model, lambda_grid_, cv_score);
+                DVector<double> cv_values = calibrator.avg_scores();
+                Eigen::saveMarket(cv_values,"results/CV_values.mtx");
             } break;
         }
         //Run using the optimal lambda
@@ -271,6 +287,9 @@ public:
     const DMatrix<double>& lambda_grid() const { return lambda_grid_; }
     Calibration calibration() const { return calibration_; }
 
+
+
+
     //setters
     void set_seed(int seed) { seed_ = seed; }
     RegularizedSVD& set_lambda(const DVector<double>& lambda_grid) {
@@ -293,7 +312,7 @@ public:
 
 
 template<typename SVDType_>
-class RegularizedSVD<monolithic,SVDType_,true>{
+class RegularizedSVD<monolithic,SVDType_,/*missing*/true>{
 private:
     //algorithm parameters
     int seed_ = fdapde::random_seed;
@@ -359,7 +378,7 @@ private:
 };
 
 template<typename SVDType_>
-class RegularizedSVD<sequential,SVDType_,true>{
+class RegularizedSVD<sequential,SVDType_,/*missing*/true>{
 private:
     // power iteration parameters
     double tolerance_ = 1e-6;   // relative tolerance between Jnew and Jold, used as stopping criterion

@@ -57,11 +57,15 @@ public:
     }
     //gcv score (has to be preceded by a call to compute())
     double gcv(double edf_discount=1.0){
-        DMatrix<double> S_m = model_.Psi()*loadings_;
-        S_m = S_m*S_m.transpose();
-        double gcv_score = model_.X().cols()/std::pow(model_.X().cols()-edf_discount*S_m.trace(),2)*
-                           (model_.X()*(DMatrix<double>::Identity(model_.X().cols(), model_.X().cols()) - S_m)).squaredNorm();
-        return gcv_score;
+
+        DVector<double> scores_norms = (scores_.transpose()*scores_).diagonal().cwiseSqrt();
+        DMatrix<double> normalized_scores = scores_.array().rowwise() / scores_norms.transpose().array();
+        DMatrix<double> loadings = loadings_.array().rowwise() * scores_norms.transpose().array();
+
+        DMatrix<double> S_m = model_.Psi()*(invD_.transpose()*invD_)*model_.Psi();
+
+        int n_locs = model_.X().cols();
+        return n_locs*(normalized_scores.transpose()*model_.X()-(model_.Psi() * loadings).transpose()).squaredNorm()/std::pow(n_locs-edf_discount*S_m.trace(),2);
     }
     //test the reconstruction on a different portion of the data (has to be preceded by a call to compute())
     double reconstruction_error(const DMatrix<double>& X_test){
