@@ -397,14 +397,14 @@ template <typename fPCASolver> class fpca_na_impl {
 
     fpca_na_impl() noexcept = default;
     fpca_na_impl(fPCASolver& fpca) noexcept :
-        fpca_(std::addressof(fpca)), smoother_(fpca.smoother()), n_dofs_(smoother_->n_dofs()) { }
+        fpca_(std::addressof(fpca)), smoother_(fpca.smoother()), n_dofs_(fpca.smoother()->n_dofs()) { }
 
     template <typename DataT>
     auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
         matrix_t X = data.transpose();         // create temporary of mapped data
         binary_t nan_pattern = na_matrix(X);   // compute missingness pattern
 
-        int n_locs_ = X.cols(), n_units_ = X.rows();
+        n_locs_ = X.cols(), n_units_ = X.rows();
         // initialization
         f_.resize(n_dofs_, rank);
         s_.resize(n_units_, rank);
@@ -459,7 +459,7 @@ template <typename fPCASolver> class fpca_na_impl {
                     }
                     binary_t train_nan_pattern = na_matrix(X_train);   // compute missingness pattern
 
-                    const auto& [F, S] = solve_(X_train, train_nan_pattern, rank, std::vector<double>{lambda_grid[i]}, flag);
+                    const auto& [F, S] = solve_(X_train, train_nan_pattern, rank, std::vector<double>{lambda_grid[i]}, flag & 0x1);
 
                     double loss = 0.0;
                     double n_test_obs = 0.0;
@@ -476,14 +476,14 @@ template <typename fPCASolver> class fpca_na_impl {
                 rmse.push_back(std::accumulate(fold_rmse.begin(), fold_rmse.end(), 0.0) / fold_rmse.size());
             }
             auto idx = std::distance(rmse.begin(), std::min_element(rmse.begin(), rmse.end()));
-            opt_lambda.fill(lambda_grid[idx]);
+            opt_lambda = std::vector<double>{lambda_grid[idx]};
         } break;
         default: {
             throw std::runtime_error("Unrecognized calibration option.");
         }
         }
         // fit with optimal lambda
-        const auto& [F, S] = solve_(X, nan_pattern, rank, opt_lambda, flag);
+        const auto& [F, S] = solve_(X, nan_pattern, rank, opt_lambda, flag & 0x1);
         // store results
         for (int i = 0; i < rank; ++i) {
             for (int j = 0; j < n_lambda; ++j) { lambda_(i, j) = opt_lambda[j]; }
@@ -503,11 +503,11 @@ template <typename fPCASolver> class fpca_na_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, const binary_t& nan, int rank, const LambdaT& lambda, int flag) {
         for (int i = 0; i < lambda.size(); ++i) { fdapde_assert(lambda[i] > 0); }
-	matrix_t F(n_dofs_ , rank);
-	matrix_t S(n_units_, rank);
+	    matrix_t F(n_dofs_ , rank);
+	    matrix_t S(n_units_, rank);
         matrix_t U  = matrix_t::Zero(n_units_, n_dofs_);
-	matrix_t Un = matrix_t::Zero(n_units_, n_dofs_);
-	// repeat for increasing rank
+	    matrix_t Un = matrix_t::Zero(n_units_, n_locs_);
+	    // repeat for increasing rank
         for (int k = 1; k <= rank; ++k) {
             int n_iter = 0;
             double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
@@ -516,7 +516,7 @@ template <typename fPCASolver> class fpca_na_impl {
                 matrix_t Xn = (~nan).select(X, Un);
                 Xn.rowwise() -= Xn.colwise().mean();   // re-center
                 // rank-k fPCA on imputed data
-                const auto& [f, s] = fpca_->fit(X, k, lambda, flag);
+                const auto& [f, s] = fpca_->fit(Xn.transpose(), k, lambda, flag);
                 U = s * f.transpose();   // reconstruction update
                 // prepare for next iteration
                 n_iter++;
@@ -593,7 +593,7 @@ template <typename VariationalSolver> class fPCA {
         smoother_(), data_(gf[0].data().template col<double>(colname).as_matrix()) {
         fdapde_assert(gf.n_layers() == 1);
         n_locs_ = data_.rows();
-	n_units_ = data_.cols();
+	    n_units_ = data_.cols();
         if constexpr (requires(Penalty p) { p.get(); }) {
             smoother_ = smoother_t(gf, penalty.get());
         } else {
@@ -644,11 +644,11 @@ template <typename VariationalSolver> class fPCA {
         return std::tie(f_, s_);
     }
     // observers
-    const matrix_t& scores() const { return s_; }
-    const matrix_t& loading() const { return f_; }
+    const matrix_t& S() const { return s_; }   // scoring matrix
+    const matrix_t& F() const { return f_; }   // loading matrix
+    matrix_t Fn() const { return smoother_.Psi() * f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
-    const smoother_t smoother() const { return smoother_; }
    private:
     data_t data_;           // mapped geoframe data
     smoother_t smoother_;   // variational solver used in the smoothing step
