@@ -443,8 +443,10 @@ template <typename fPCASolver> class fpca_na_impl {
             // store the rmse estimated via KCV for each pair (lambda,rank)
             matrix_t rmse_table = matrix_t::Zero(lambda_grid.size(),rank);
             for(int i = 0; i < lambda_grid.size(); ++i) {
+                std::cout << "Lambda: " << lambda_grid[i] << std::endl;
                 matrix_t mse_per_fold = matrix_t::Zero(n_folds_, rank);
                 for(int j = 0; j < n_folds_; ++j) {
+                    std::cout << "Fold: " << j << std::endl;
                     auto [train_mask, test_mask] = split(X, n_folds_, j);
 
                     matrix_t X_train = X;
@@ -566,6 +568,7 @@ template <typename fPCASolver> class fpca_na_impl {
                     S.leftCols(k) = s;
                 }
             }
+            if (n_iter>=max_iter_){ std::cout << "convergence issues" << std::endl;}
         }
 	    return std::make_pair(F, S);
     }
@@ -579,7 +582,7 @@ template <typename fPCASolver> class fpca_na_impl {
     matrix_t lambda_;              // selected PCs smoothing level
 
     // MM scheme parameters
-    double tol_ = 1e-6;
+    double tol_ = 1e-5;
     int max_iter_ = 100;
 };
 
