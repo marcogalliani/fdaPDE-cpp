@@ -228,12 +228,12 @@ struct fe_ls_elliptic {
         fdapde_assert(Psi_.rows() > 0 && y.rows() == n_locs_ && y.cols() == 1);
         y_ = y;
         // correct \Psi for missing observations
-        auto nan_pattern = na_matrix(y);
-	int old_n_obs = n_obs_;
-        if (nan_pattern.any()) {
-            n_obs_ = n_locs_ - nan_pattern.count();
-            B_ = (~nan_pattern).repeat(1, n_dofs_).select(Psi_, 0);
-            y_ = (~nan_pattern).select(y_, 0);
+        nan_pattern_ = na_matrix(y);
+	    int old_n_obs = n_obs_;
+        if (nan_pattern_.any()) {
+            n_obs_ = n_locs_ - nan_pattern_.count();
+            B_ = (~nan_pattern_).repeat(1, n_dofs_).select(Psi_, 0);
+            y_ = (~nan_pattern_).select(y_, 0);
         }
         if (old_n_obs != n_obs_) { W_ *= (double)old_n_obs / n_obs_; }
         b_.block(0, 0, n_dofs_, 1) = -PsiNA().transpose() * D_ * W_ * y_;
@@ -244,7 +244,7 @@ struct fe_ls_elliptic {
     template <typename WeightMatrix> void update_weights(const WeightMatrix& W) {
         fdapde_assert(Psi_.rows() > 0 && W.rows() == n_locs_ && W.rows() == W.cols());
         W_ = W;
-	W_ /= n_obs_;
+	    W_ /= n_obs_;
         if (n_covs_ == 0) {
             b_.block(0, 0, n_dofs_, 1) = -PsiNA().transpose() * D_ * W_ * y_;
         } else {
@@ -266,11 +266,11 @@ struct fe_ls_elliptic {
           Psi_.rows() > 0 && y.rows() == n_locs_ && y.cols() == 1 && W.rows() == W.cols() && W.rows() == n_locs_);
         y_ = y;
         // correct \Psi for missing observations
-        auto nan_pattern = na_matrix(y);
-        if (nan_pattern.any()) {	  
-            n_obs_ = n_locs_ - nan_pattern.count();
-            B_ = (~nan_pattern).repeat(1, n_dofs_).select(Psi_, 0);
-            y_ = (~nan_pattern).select(y_, 0);
+        nan_pattern_ = na_matrix(y);
+        if (nan_pattern_.any()) {
+            n_obs_ = n_locs_ - nan_pattern_.count();
+            B_ = (~nan_pattern_).repeat(1, n_dofs_).select(Psi_, 0);
+            y_ = (~nan_pattern_).select(y_, 0);
         }
         update_weights(W);
         return;
@@ -318,7 +318,7 @@ struct fe_ls_elliptic {
             // assemble and factorize system matrix for nonparameteric part
             SparseBlockMatrix<double, 2, 2> A(
               -PsiNA().transpose() * D_ * W_ * PsiNA(), lambda * R1_.transpose(), lambda * R1_, lambda * R0_);
-	    enforce_lhs_dirichlet_bc_(A);
+	        enforce_lhs_dirichlet_bc_(A);
             invA_.compute(A);
         }
         vector_t x;
@@ -345,7 +345,6 @@ struct fe_ls_elliptic {
         g_ = x.bottomRows(n_dofs_);
         return f_;
     }
-
     // hutchinson approximation for Tr[S]
     double edf(int r = 100, int seed = random_seed) {
         fdapde_assert(lambda_saved_.has_value());
@@ -427,6 +426,8 @@ struct fe_ls_elliptic {
 
     // observers
     int n_dofs() const { return n_dofs_; }
+    int n_obs() const { return n_obs_;}
+    const binary_t& nan_pattern() const { return nan_pattern_; }
     const sparse_matrix_t& mass() const { return R0_; }
     const sparse_matrix_t& stiff() const { return R1_; }
     const sparse_matrix_t& Psi() const { return Psi_; }
@@ -466,6 +467,7 @@ struct fe_ls_elliptic {
 
     matrix_t X_;               // n_obs x n_covs design matrix
     vector_t y_;               // n_obs x 1 observation vector
+    binary_t nan_pattern_;     // n_obs x 1 indicator vector for NaNs
     sparse_matrix_t W_;        // n_obs x n_obs matrix of observation weights
     matrix_t U_, V_;           // (2 * n_dofs) x n_covs matrices [\Psi^\top * D * W * y, 0] and [X^\top * W * \Psi, 0]
     matrix_t XtWX_;            // n_covs x n_covs matrix X^\top * W * X

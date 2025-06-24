@@ -28,6 +28,7 @@ class SRPDE {
     using solver_t = std::decay_t<VariationalSolver>;
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
+    using binary_t = BinaryMatrix<Dynamic, Dynamic>;
     using sparse_matrix_t = Eigen::SparseMatrix<double>;
     static constexpr int n_lambda = solver_t::n_lambda;
    public:
@@ -37,12 +38,17 @@ class SRPDE {
         solver_(), geo_category_(gf[0].category().begin(), gf[0].category().end()) {
         fdapde_assert(gf.n_layers() == 1);	
         Formula formula_(formula);
-	n_obs_  = gf[0].rows();
-	n_covs_ = 0;
+        n_obs_  = gf[0].rows();
+        n_covs_ = 0;
         for (const std::string& token : formula_.rhs()) {
             if (gf.contains(token)) { n_covs_++; }
         }
         solver_ = solver_t(formula, gf, penalty.get());
+    }
+    template <typename GeoFrame, typename Penalty, typename WeightMatrix>
+    SRPDE(const std::string& formula, const GeoFrame& gf, Penalty&& penalty, const WeightMatrix& weights) noexcept :
+        SRPDE(formula, gf, penalty) {
+            solver_.update_weights(weights);
     }
     template <typename... Args> auto fit(Args&&... args) { return solver_.fit(std::forward<Args>(args)...); }
     // observers
@@ -52,6 +58,7 @@ class SRPDE {
     int n_covs() const { return n_covs_; }
     int n_obs() const { return n_obs_; }
     double edf(int r = 100, int seed = random_seed) { return solver_.edf(r, seed); }
+    const binary_t& nan_pattern() const { return solver_.nan_pattern();}
     const vector_t& response() const { return solver_.response(); }
     const matrix_t& design_matrix() const { return solver_.design_matrix(); }
     const sparse_matrix_t& weights() const { return solver_.weights(); }
@@ -100,8 +107,10 @@ class SRPDE {
             if (edf_cache_.find(lambda_vec) == edf_cache_.end()) {   // cache Tr[S]
                 edf_cache_[lambda_vec] = model_->edf(r_, seed_);
             }
-            double dor = n_ - (q_ + edf_cache_.at(lambda_vec));   // residual degrees of freedom	    
-            return (n_ / std::pow(dor, 2)) * (model_->fitted() - model_->response()).squaredNorm();
+            double dor =  n_ - (q_ + edf_cache_.at(lambda_vec));   // residual degrees of freedom
+            double mse = (~model_->nan_pattern()).select(model_->fitted() - model_->response(),0).squaredNorm();
+            double gcv = (n_ / std::pow(dor, 2)) * mse;
+            return gcv;
         }
         // observers
         const edf_cache_t& edf_cache() const { return edf_cache_; }
@@ -339,6 +348,10 @@ class SRPDE {
 // deduction guide
 template <typename GeoFrame, typename Penalty>
 SRPDE(const std::string& formula, const GeoFrame& gf, Penalty&& solver) -> SRPDE<typename Penalty::solver_t>;
+
+template <typename GeoFrame, typename Penalty, typename WeightMatrix>
+SRPDE(const std::string& formula, const GeoFrame& gf, Penalty&& solver, const WeightMatrix& weights) -> SRPDE<typename Penalty::solver_t>;
+
 
 }   // namespace fdapde
 
