@@ -69,7 +69,7 @@ class FRPDE {
         return solver_.f();
     }
     // observers
-    const matrix_t& F() const { return solver_.f(); }
+    matrix_t F() const { return solver_.f(); }
     int n_covs() const { return n_covs_; }
     int n_obs() const { return n_obs_; }
     int n_stat_units() const { return n_stat_units_; }
