@@ -194,7 +194,6 @@ p <- progressor(steps = n_total)
 
 
 for(i in 1:n_replicas){
-    
   # Generate data
   data <- data_generator(
     n_units,
@@ -307,7 +306,9 @@ for(i in 1:n_replicas){
     rank = ncol(loadings_at_locs),
     centering = sqrt(mean((log_mean_generator(locations)-center_locs)^2)),
     imputation_err =
-      sqrt(mean((data$X_true - X_fpca_imputation)^2)),
+      sqrt(mean(
+        (data$X_true[is.na(partial_data)] -X_fpca_imputation[is.na(partial_data)])^2
+        )),
     reconstruction_err =
       sqrt(mean((data$X_true - X_smoothed)^2))
   )
@@ -354,7 +355,9 @@ for(i in 1:n_replicas){
     centering = 
       sqrt(mean((log_mean_generator(locations)-pca_fit$results$X_mean_locs)^2)),
     imputation_err =
-      sqrt(mean((data$X_true - dineof_fit$Xa)^2)),
+      sqrt(mean(
+        (data$X_true[is.na(partial_data)] - dineof_fit$Xa[is.na(partial_data)] )^2
+        )),
     reconstruction_err =
       sqrt(mean((data$X_true - X_smoothed)^2))
   )
