@@ -590,12 +590,12 @@ template <typename fPCASolver> class fpca_na_impl {
         int r = 100;
         sparse_matrix_t Id(n_units_,n_units_);
         Id.setIdentity();
-        sparse_matrix_t IdKronP = kronecker(Id,sparse_matrix_t(smoother_.P(lambda).sparseView()));
-        // SparseBlockMatrix<double, 2, 2> A(
-        //       B.transpose()*B, lambda[0] * kronecker(Id,smoother_->stiff()),
-        //       lambda[0] * kronecker(Id,smoother_->stiff()), -lambda[0] * kronecker(Id,smoother_->mass()));
+        // sparse_matrix_t IdKronP = kronecker(Id,sparse_matrix_t(smoother_.P(lambda).sparseView()));
+        SparseBlockMatrix<double, 2, 2> A(
+               B.transpose()*B,                                     lambda[0] * kronecker(Id,smoother_.stiff()),
+               lambda[0] * kronecker(Id,smoother_.stiff()),     -lambda[0] * kronecker(Id,smoother_.mass()));
         //construct the matrix to be inverted: B^TB + lambda(I_N kron_prod P)
-        sparse_matrix_t smoothing_mat = B.transpose()*B + IdKronP;
+        // sparse_matrix_t smoothing_mat = B.transpose()*B + IdKronP;
         //sample from the rademacher distribution
         std::mt19937 rng(random_seed);
         rademacher_distribution rademacher;
@@ -604,17 +604,17 @@ template <typename fPCASolver> class fpca_na_impl {
             for (int j = 0; j < r; ++j) { Us(i, j) = rademacher(rng); }
         }
         //solve the system: (B^TB + lambda(I_N kron_prod P))y = B^T e (where e is a sampled vector)
-        using sparse_solver_t = eigen_sparse_solver_movable_wrap<Eigen::SimplicialLDLT<sparse_matrix_t>>;
+        using sparse_solver_t = eigen_sparse_solver_movable_wrap<Eigen::SparseLU<sparse_matrix_t>>;
         sparse_solver_t invA;
-        //invA.compute(A);
-        invA.compute(smoothing_mat);
-        // matrix_t target = matrix_t::Zero(2*B.cols(),r);
-        // target.topRows(B.cols()) = B.transpose()*Us;
-        // matrix_t x = invA.solve(target);
-        matrix_t x = invA.solve(B.transpose()*Us);
+        //using sparse block matrix
+        invA.compute(A); // invA.compute(smoothing_mat); //not so sparse
+        matrix_t target = matrix_t::Zero(2*B.cols(),r);
+        target.topRows(B.cols()) = B.transpose()*Us;
+        matrix_t y = invA.solve(target); // matrix_t x = invA.solve(B.transpose()*Us);
+        //-> Trace estimation
         //compute e^T*B*y and estimate the trace by averaging these values
         double trS = 0.0;   // monte carlo Tr[S] approximation
-        for (int i = 0; i < r; ++i) { trS += Us.col(i).dot(B*x.col(i).head(B.cols())); }
+        for (int i = 0; i < r; ++i) { trS += Us.col(i).dot(B*y.topRows(B.cols()).col(i)); }
         trS =  trS / r;
         //-> GCV
         //(1) compute the data-fidelity term by fitting the model with the considered lambda
