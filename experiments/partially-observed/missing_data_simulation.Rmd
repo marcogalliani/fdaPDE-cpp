@@ -1,0 +1,607 @@
+
+## Data
+```{r}
+n_units <- 50
+n_nodes <- 400
+n_locs <- 500
+
+datadir = "../data/fpca/" 
+meshdir = "../data/mesh/unit_square/"
+```
+
+### Mesh
+```{r}
+source("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/mesh_utils.R")
+
+## Unit square mesh ----
+mesh <- unit_square.mesh(n_nodes,meshdir)
+```
+
+### Mean
+```{r}
+## mean generator
+log_mean_generator <- function(locs) {
+  ## I want a function between -1 and 1
+  return((2 * log((locs[, 1] + locs[, 2]) + 1) / log(3) - 1))
+}
+sin_mean_generator <- function(locs) {
+  ## I want a function between -1 and 1
+  return(sin(4 * pi * locs[, 1]) * sin(4 * pi * locs[, 2]) * exp(-8*((locs[, 1]-0.5)^2 + (locs[, 2]-0.5)^2)))
+}
+
+plot_eigenfunction(log_mean_generator(mesh$nodes()), mesh$nodes())
+```
+
+
+### Eigenfunctions
+```{r}
+#' The PC orthogonal functions used to generate the data are the eigenfunctions
+#' of the laplacian operator with Neumann bdd conditions
+laplacian_square_eigenfunction <- function(a, b, locs, x_t=0.2,y_t=0.2) {
+  return(cos(a * pi * (locs[,1]-x_t)) * cos(b * pi * (locs[, 2]-y_t)))
+}
+f1_fem <- laplacian_square_eigenfunction(a = 1, b = 1, mesh$nodes())
+f2_fem <- laplacian_square_eigenfunction(a = 2, b = 3, mesh$nodes())
+f3_fem <- laplacian_square_eigenfunction(a = 4, b = 4, mesh$nodes())
+test_functions <- cbind(f1_fem,f2_fem,f3_fem)
+
+plot_eigenfunction(f1_fem, mesh$nodes())
+plot_eigenfunction(f2_fem, mesh$nodes())
+plot_eigenfunction(f3_fem, mesh$nodes())
+
+```
+
+```{r}
+# Normalization and evaluation at locations
+Vh <- FunctionSpace(mesh, fe_order=1)
+u <- Function(Vh)
+Lu <- -laplace(u) ## poisson problem
+f <- function(points) { return(0*points[,1])}
+pde <- Pde(Lu, f)
+test_functions <- apply(test_functions, MARGIN=2, function(f,R0){ return(f/ sqrt(as.numeric(t(f) %*% R0 %*% f)))}, pde$mass())
+
+#' Then the functions are evaluated at locations
+locations <- unit_square.locs(n_locs,datadir)
+Psi <- Vh$basis()$eval(as.matrix(locations))
+test_functions.at_locs <- Psi %*% test_functions
+```
+
+## Data
+```{r}
+source("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/data_generator.R")
+```
+
+
+```{r}
+## missingness pattern
+library(RANN)
+
+# Optimized distance function
+de <- function(x, y, w = 1) {
+  res <- sum((x[1:2] - y[1:2])^2)
+  if (length(x) == 3) {
+    res <- res + w^2 * (x[3] - y[3])^2
+  }
+  sqrt(res)
+}
+
+# Optimized nearest neighbor function
+nearest <- function(p, points, w = 1) {
+  distances <- apply(points, 1, de, y = p, w = w)
+  which.min(distances)
+}
+
+dep_space.NA_fast <- function(Data, 
+                              p = 0.75, 
+                              schema = "a", 
+                              mesh_nodes = NULL, 
+                              locations = NULL, 
+                              RDD_groups = NULL) {
+  if (schema == "c") {
+    data_vector <- as.vector(Data)
+    size <- length(data_vector)
+    
+    nodes <- mesh_nodes
+    nobs <- ceiling(RDD_groups * p)
+    pts <- locations
+    
+    # Use precomputed seeds if possible
+    seeds <- nodes[sample(nrow(nodes), RDD_groups), , drop = FALSE]
+    obs_marker <- rep(0, RDD_groups)
+    obs_marker[sample(RDD_groups, nobs)] <- 1
+    
+    # Fast nearest neighbor search using RANN
+    nn_results <- nn2(seeds, pts, k = 1)  # Finds nearest seed for each location
+    nearest_idxs <- nn_results$nn.idx  # Index of the nearest seed
+    
+    # Vectorized NA assignment
+    data_vector[obs_marker[nearest_idxs] == 0] <- NA
+    
+    Data <- matrix(data = data_vector, nrow = 1, ncol = size)
+  }
+  
+  Data
+}
+```
+
+
+## Utils
+```{r}
+align_cols <- function(to_be_aligned, reference){
+  for(ii in 1:ncol(to_be_aligned)){
+    dot_prod <- as.numeric(t(reference[,ii]) %*% to_be_aligned[,ii])
+    if(dot_prod < 0) { to_be_aligned[,ii] <- (-1)*to_be_aligned[,ii]}
+  }
+  return(to_be_aligned)
+}
+
+wrapped_pca <- function(X, center = TRUE, n_comp = 3) {
+  ## centering
+  X_mean_locs <- rep(0, ncol(X))
+  if(center) {
+    X_mean_locs <- colMeans(X)
+    X <- scale(X, center = TRUE, scale = FALSE)
+  }
+  # MV-PCA
+  model_MV_PCA <- prcomp(X, center = FALSE, rank. = n_comp)
+
+  ## results
+  loadings_locs <- model_MV_PCA$rotation
+  scores <- model_MV_PCA$x
+  X_hat_locs <- scores %*% t(loadings_locs) + rep(1, nrow(scores)) %*% t(X_mean_locs)
+  
+  return(list(
+    model = model_MV_PCA,
+    results = list(
+      loadings = NULL,
+      loadings_locs = loadings_locs, #orthonormality w.r.t. MV product
+      scores = scores,
+      X_mean = NULL,
+      X_mean_locs = X_mean_locs,
+      X_hat = NULL,
+      X_hat_locs = X_hat_locs
+    )
+  ))
+}
+```
+
+## Simulation
+
+```{r}
+test_results <- list()
+n_replicas <- 3
+
+seed <- 1412  
+n_pc <- 3
+```
+
+Convention:
+- orthonormality of the scores
+$$
+S^TS=I_r
+$$
+
+```{r message=FALSE, warning=FALSE}
+run_id <- 1
+library(progressr)
+handlers(handler_txtprogressbar(style = 3))  
+n_total <- n_replicas
+
+# Progress bar
+progressr::with_progress({
+p <- progressor(steps = n_total)
+# ---
+
+
+for(i in 1:n_replicas){
+    
+  # Generate data
+  data <- data_generator(
+    n_units,
+    true_PCs = as.matrix(test_functions),
+    Psi = Psi,
+    scores_sd = c(0.4,0.3,0.2),
+    error_sd = 0.1,
+    obs_path = datadir,
+    mean_locs = log_mean_generator(locations),
+    seed = seed + 4*i,
+    filename = "y_complete.csv"
+  )
+  # Add missingness
+  partial_data <- t(apply(data$noisy_data, 1, 
+      dep_space.NA_fast,
+      p=0.5,
+      schema="c",
+      mesh_nodes=mesh$nodes(),
+      locations=locations,
+      RDD_groups=12))
+      
+  write.csv(format(as.matrix(partial_data), digits = 16),
+            paste(datadir,"y.csv",sep=""))
+  
+
+  p(message = sprintf("Replica %d" , i))
+  
+  # # (1) fPCA reconstruction----
+  # script_dir <- "./"
+  # system("./fpca_missing")
+  # 
+  # # Read results
+  # loadings <- as.matrix(read.csv(file = paste(script_dir, "/test-results/loadings.csv",
+  #                                             sep = "")))
+  # loadings_at_locs <- Psi %*% loadings
+  # scores <- as.matrix(read.csv(file = paste(script_dir, "/test-results/scores.csv", 
+  #                                           sep = "")))
+  # 
+  # # normalization
+  # scores_norms <- sqrt(colSums(scores^2))
+  # scores <- sweep(scores, 2, scores_norms, FUN = "/")
+  # loadings_at_locs <- sweep(loadings_at_locs, 2, scores_norms, FUN = "*")
+  # 
+  # X_smoothed <- scores%*%t(loadings_at_locs)
+  # 
+  # X_fpca_imputation <- partial_data
+  # X_fpca_imputation[is.na(partial_data)] <- X_smoothed[is.na(partial_data)]
+  # 
+  # # Store results
+  # global_metrics <- list(
+  #   replica = i,
+  #   method = "fPCA-KCV",
+  #   rank = ncol(loadings_at_locs),
+  #   imputation_err =
+  #     sqrt(mean((data$scores %*% t(test_functions.at_locs) - X_fpca_imputation)^2)),
+  #   reconstruction_err =
+  #     sqrt(mean((data$scores %*% t(test_functions.at_locs) - X_smoothed)^2))
+  # )
+  # 
+  # max_rank <- min(ncol(loadings_at_locs),ncol(test_functions.at_locs))
+  # aligned_loadings.at_locs <- 
+  #   align_cols(loadings_at_locs[,1:max_rank],test_functions.at_locs[,1:max_rank])
+  # aligned_scores <- 
+  #   align_cols(scores[,1:max_rank],data$scores[,1:max_rank])
+  # component_metrics <- lapply(seq_len(max_rank), 
+  #                             function(j) {
+  #   list(
+  #     index = j,
+  #     RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
+  #     RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
+  #   )
+  # })
+  # test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
+  # run_id <- run_id + 1
+  
+  # (2) fPCA-GCV reconstruction----
+  script_dir <- "../new-fpca-missing"
+  start.time <- Sys.time()
+  system(paste("cd ", script_dir,"; ./new_fpca_missing",sep=""))
+  end.time <- Sys.time()
+  cat(paste("fPCA-GCV: finished after", 
+            end.time - start.time, attr(end.time - start.time, "units"), "\n"))
+  
+  # Read results
+  center <- as.matrix(read.csv(file = paste(script_dir, "/test-results/center.csv", 
+                                            sep = "")))
+  center_locs <- Psi %*% center
+  loadings <- as.matrix(read.csv(file = paste(script_dir, "/test-results/loadings.csv",
+                                              sep = "")))
+  loadings_at_locs <- Psi %*% loadings
+  scores <- as.matrix(read.csv(file = paste(script_dir, "/test-results/scores.csv", 
+                                            sep = "")))
+  # normalization
+  scores_norms <- sqrt(colSums(scores^2))
+  scores <- sweep(scores, 2, scores_norms, FUN = "/")
+  loadings_at_locs <- sweep(loadings_at_locs, 2, scores_norms, FUN = "*")
+  
+  X_smoothed <- rep(1,n_units)%*%t(center_locs) + scores%*%t(loadings_at_locs)
+  X_smoothed <- as.matrix(read.csv(file = paste(script_dir, 
+                                                "/test-results/reconstruction_at_locs.csv",
+                                                sep = "")))
+  
+  X_fpca_imputation <- partial_data
+  X_fpca_imputation[is.na(partial_data)] <- X_smoothed[is.na(partial_data)]
+  
+  # Store results
+  global_metrics <- list(
+    replica = i,
+    method = "fPCA-GCV",
+    rank = ncol(loadings_at_locs),
+    centering = sqrt(mean((log_mean_generator(locations)-center_locs)^2)),
+    imputation_err =
+      sqrt(mean((data$X_true - X_fpca_imputation)^2)),
+    reconstruction_err =
+      sqrt(mean((data$X_true - X_smoothed)^2))
+  )
+  
+  max_rank <- min(ncol(loadings_at_locs),ncol(test_functions.at_locs))
+  aligned_loadings.at_locs <- 
+    align_cols(as.matrix(loadings_at_locs[,1:max_rank]),as.matrix(test_functions.at_locs[,1:max_rank]))
+  aligned_scores <- 
+    align_cols(as.matrix(scores[,1:max_rank]),as.matrix(data$scores[,1:max_rank]))
+  component_metrics <- lapply(seq_len(max_rank), 
+                              function(j) {
+    list(
+      index = j,
+      RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
+      RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
+    )
+  })
+  test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
+  run_id <- run_id + 1
+  
+  # (3) DINEOF----
+  start.time <- Sys.time()
+  dineof_fit <- sinkr::dineof(partial_data)
+  pca_fit <- wrapped_pca(dineof_fit$Xa, center = T, n_comp = n_pc)
+  end.time <- Sys.time()
+  cat(paste("dineof: finished after", 
+            end.time - start.time, attr(end.time - start.time, "units"), "\n"))
+  # Read results
+  loadings_at_locs <- pca_fit$results$loadings_locs
+  scores <- pca_fit$results$scores
+  
+  # normalization
+  scores_norms <- sqrt(colSums(scores^2))
+  scores <- sweep(scores, 2, scores_norms, FUN = "/")
+  loadings_at_locs <- sweep(loadings_at_locs, 2, scores_norms, FUN = "*")
+  
+  X_smoothed <- pca_fit$results$X_hat_locs
+  
+  # Store results
+  global_metrics <- list(
+    replica = i,
+    method = "dineof",
+    rank = dineof_fit$n.eof,
+    centering = 
+      sqrt(mean((log_mean_generator(locations)-pca_fit$results$X_mean_locs)^2)),
+    imputation_err =
+      sqrt(mean((data$X_true - dineof_fit$Xa)^2)),
+    reconstruction_err =
+      sqrt(mean((data$X_true - X_smoothed)^2))
+  )
+  
+  
+  max_rank <- 
+  aligned_loadings.at_locs <- align_cols(loadings_at_locs, test_functions.at_locs)
+  aligned_scores <- align_cols(scores,data$scores)
+  component_metrics <- lapply(seq_len(min(n_pc,ncol(loadings_at_locs))), 
+                              function(j) {
+    list(
+      index = j,
+      RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
+      RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
+    )
+  })
+  test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
+  run_id <- run_id + 1
+}
+  
+### ---
+})
+```
+
+```{r}
+plot_eigenfunction(pca_fit$results$X_mean_locs,locations)
+plot_eigenfunction(as.matrix(center_locs)[,1],locations)
+plot_eigenfunction(colMeans(partial_data,na.rm=T),locations)
+```
+
+
+```{r}
+# Flattening the results in convenient ways
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(tibble)
+
+component_df <- NULL
+# Step 1: Flatten component-level data with global info
+component_df <- map_dfr(test_results, function(res) {
+  global_info <- as_tibble(res$global)
+  map_dfr(res$components, function(comp) {
+    bind_cols(global_info, as_tibble(comp))
+  })
+})
+
+
+final_results <- NULL
+# Step 2: Pivot to wide format, creating one column per component metric
+final_results <- component_df %>%
+  pivot_wider(
+    id_cols = c(replica, method, imputation_err, reconstruction_err, rank, centering),
+    names_from = index,
+    values_from = c(RMSE.PC, RMSE.Scores),
+    names_glue = "{.value}_{index}"
+  )
+```
+
+## Visualization
+
+### Data
+```{r}
+for(idx in sample(1:n_units,10)){
+  print(plot_stat_units(partial_data[idx,],locations))
+}
+```
+
+
+```{r}
+plot_stat_units(colMeans(partial_data,na.rm=T),locations)
+plot_stat_units(center_locs[,1],locations)
+plot_stat_units(data$center_locs,locations)
+
+```
+```{r}
+plot_stat_units(loadings_at_locs[,1],locations)
+plot_stat_units((Psi%*%data$pcs)[,1],locations)
+```
+
+
+### Results
+
+```{r}
+save <- F
+
+if(save){
+ readr::write_csv(format(as.data.frame(final_results), digits = 16),
+          paste("test-results",
+                paste("calibrated-fpca-missing",
+                      "-Mesh", n_nodes,
+                      "-Obs", n_units,
+                      "-Locs",n_locs, 
+                      ".csv",sep=""),
+          sep="/")
+) 
+}
+```
+
+
+
+```{r}
+source("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/utils/plot_utils.R")
+
+color_map <- c(
+  "fPCA-GCV" = "#2297E6",
+  "dineof" = "#DF536B")
+
+plots_path <- "plots"
+```
+
+
+Principal functions
+```{r}
+for(i in 1:n_pc){
+  errPC.plot <- ggplot(final_results, 
+                       aes(x=method, 
+                           y=get(paste("RMSE.PC_",i,sep="")), 
+                           fill=factor(method, levels = c("fPCA-GCV","dineof")))) + 
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(y=paste("RMSE PC",i,sep=""),fill=NULL)  +
+    theme(text = element_text(size=25), legend.position = "top") +
+    guides(color="none", fill="none")  
+
+  print(errPC.plot)
+  
+  if(save){
+    ggsave(paste(plots_path,
+               "/errPC",i,
+             ".pdf", sep=""), 
+       errPC.plot, width = 10, height = 5)
+  }
+}
+```
+
+PC scores
+```{r}
+for(i in 1:n_pc){
+  errScores.plot <- ggplot(final_results, 
+                       aes(x=method, 
+                           y=get(paste("RMSE.Scores_",i,sep="")), 
+                           fill=factor(method, levels = c("fPCA-GCV","dineof")))) + 
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(y=paste("RMSE Scores",i,sep=""),fill=NULL)  +
+    theme(text = element_text(size=25), legend.position = "top") +
+    guides(color="none", fill="none")  
+
+  print(errScores.plot)
+  
+  if(save){
+    ggsave(paste(plots_path,
+               "/errScores",i,
+             ".pdf", sep=""), 
+       errScores.plot, width = 10, height = 5)
+  }
+}
+```
+
+```{r}
+imputation_err.plot <- ggplot(final_results, 
+                       aes(x=method, 
+                           y=get("imputation_err"), 
+                           fill=factor(method, levels = c("fPCA-GCV","dineof")))) + 
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(y="imputation error",fill=NULL)  +
+    theme(text = element_text(size=25), legend.position = "top") +
+    guides(color="none", fill="none")  
+
+print(imputation_err.plot)
+  
+if(save){
+  ggsave(paste(plots_path,
+             "/imputation_err",
+           ".pdf", sep=""), 
+     imputation_err.plot, width = 10, height = 5)
+}
+```
+
+```{r}
+reconstruction_err.plot <- ggplot(final_results, 
+                       aes(x=method, 
+                           y=get("reconstruction_err"), 
+                           fill=factor(method, levels = c("fPCA-GCV","dineof")))) + 
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(y="reconstruction error",fill=NULL)  +
+    theme(text = element_text(size=25), legend.position = "top") +
+    guides(color="none", fill="none")  
+
+print(reconstruction_err.plot)
+  
+if(save){
+  ggsave(paste(plots_path,
+             "/reconstruction_err",
+           ".pdf", sep=""), 
+     reconstruction_err.plot, width = 10, height = 5)
+}
+```
+
+```{r}
+rank.plot <- ggplot(final_results, 
+                       aes(x=method, 
+                           y=get("rank"), 
+                           fill=factor(method, levels = c("fPCA","dineof")))) + 
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(y="rank",fill=NULL)  +
+    theme(text = element_text(size=25), legend.position = "top") +
+    guides(color="none", fill="none")  
+
+print(rank.plot)
+  
+if(save){
+  ggsave(paste(plots_path,
+             "/reconstruction_err",i,
+           ".pdf", sep=""), 
+     rank.plot, width = 10, height = 5)
+}
+```
+
+```{r}
+centering.plot <- ggplot(final_results, 
+                       aes(x=method, 
+                           y=get("centering"), 
+                           fill=factor(method, levels = c("fPCA-GCV","dineof")))) + 
+    geom_boxplot() +
+    scale_fill_manual(values = color_map) +
+    theme_light() +
+    labs(y="centering error",fill=NULL)  +
+    theme(text = element_text(size=25), legend.position = "top") +
+    guides(color="none", fill="none")  
+
+print(centering.plot)
+  
+if(save){
+  ggsave(paste(plots_path,
+             "/centering_err",
+           ".pdf", sep=""), 
+     centering.plot, width = 10, height = 5)
+}
+```
+

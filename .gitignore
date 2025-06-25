@@ -30,3 +30,9 @@ cmake-build-debug/
 #docs files
 *.puml
 .Rproj.user
+
+#experiments
+experiments/**/*csv
+*.Rproj
+
+.Rproj.user
