@@ -2,8 +2,8 @@
 ## Data
 ```{r}
 n_units <- 50
-n_nodes <- 400
-n_locs <- 500
+n_nodes <- 100
+n_locs <- 600
 
 datadir = "../data/fpca/" 
 meshdir = "../data/mesh/unit_square/"
@@ -26,10 +26,8 @@ log_mean_generator <- function(locs) {
 }
 sin_mean_generator <- function(locs) {
   ## I want a function between -1 and 1
-  return(sin(4 * pi * locs[, 1]) * sin(4 * pi * locs[, 2]) * exp(-8*((locs[, 1]-0.5)^2 + (locs[, 2]-0.5)^2)))
+  return(sin(4 * pi * locs[, 1]) * sin(4 * pi * locs[, 2]) * exp(-4*((locs[, 1]-0.5)^2 + (locs[, 2]-0.5)^2)))
 }
-
-plot_eigenfunction(log_mean_generator(mesh$nodes()), mesh$nodes())
 ```
 
 
@@ -193,6 +191,8 @@ p <- progressor(steps = n_total)
 # ---
 
 
+mean_at_locs <- sin_mean_generator(locations)
+
 for(i in 1:n_replicas){
   # Generate data
   data <- data_generator(
@@ -202,7 +202,7 @@ for(i in 1:n_replicas){
     scores_sd = c(0.4,0.3,0.2),
     error_sd = 0.1,
     obs_path = datadir,
-    mean_locs = log_mean_generator(locations),
+    mean_locs = sin_mean_generator(locations),
     seed = seed + 4*i,
     filename = "y_complete.csv"
   )
@@ -221,53 +221,61 @@ for(i in 1:n_replicas){
 
   p(message = sprintf("Replica %d" , i))
   
-  # # (1) fPCA reconstruction----
-  # script_dir <- "./"
-  # system("./fpca_missing")
-  # 
-  # # Read results
-  # loadings <- as.matrix(read.csv(file = paste(script_dir, "/test-results/loadings.csv",
-  #                                             sep = "")))
-  # loadings_at_locs <- Psi %*% loadings
-  # scores <- as.matrix(read.csv(file = paste(script_dir, "/test-results/scores.csv", 
-  #                                           sep = "")))
-  # 
-  # # normalization
-  # scores_norms <- sqrt(colSums(scores^2))
-  # scores <- sweep(scores, 2, scores_norms, FUN = "/")
-  # loadings_at_locs <- sweep(loadings_at_locs, 2, scores_norms, FUN = "*")
-  # 
-  # X_smoothed <- scores%*%t(loadings_at_locs)
-  # 
-  # X_fpca_imputation <- partial_data
-  # X_fpca_imputation[is.na(partial_data)] <- X_smoothed[is.na(partial_data)]
-  # 
-  # # Store results
-  # global_metrics <- list(
-  #   replica = i,
-  #   method = "fPCA-KCV",
-  #   rank = ncol(loadings_at_locs),
-  #   imputation_err =
-  #     sqrt(mean((data$scores %*% t(test_functions.at_locs) - X_fpca_imputation)^2)),
-  #   reconstruction_err =
-  #     sqrt(mean((data$scores %*% t(test_functions.at_locs) - X_smoothed)^2))
-  # )
-  # 
-  # max_rank <- min(ncol(loadings_at_locs),ncol(test_functions.at_locs))
-  # aligned_loadings.at_locs <- 
-  #   align_cols(loadings_at_locs[,1:max_rank],test_functions.at_locs[,1:max_rank])
-  # aligned_scores <- 
-  #   align_cols(scores[,1:max_rank],data$scores[,1:max_rank])
-  # component_metrics <- lapply(seq_len(max_rank), 
-  #                             function(j) {
-  #   list(
-  #     index = j,
-  #     RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
-  #     RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
-  #   )
-  # })
-  # test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
-  # run_id <- run_id + 1
+  # (1) fPCA reconstruction----
+  script_dir <- "./"
+  system("./fpca_missing")
+
+  # Read results
+  center <- as.matrix(read.csv(file = paste(script_dir, "/test-results/center.csv", 
+                                            sep = "")))
+  center_locs <- Psi %*% center
+  loadings <- as.matrix(read.csv(file = paste(script_dir, "/test-results/loadings.csv",
+                                              sep = "")))
+  loadings_at_locs <- Psi %*% loadings
+  scores <- as.matrix(read.csv(file = paste(script_dir, "/test-results/scores.csv",
+                                            sep = "")))
+
+  # normalization
+  scores_norms <- sqrt(colSums(scores^2))
+  scores <- sweep(scores, 2, scores_norms, FUN = "/")
+  loadings_at_locs <- sweep(loadings_at_locs, 2, scores_norms, FUN = "*")
+
+  X_smoothed <- as.matrix(
+    read.csv(file = paste(script_dir, "/test-results/reconstruction_at_locs.csv",
+                          sep = "")))
+  X_fpca_imputation <- partial_data
+  X_fpca_imputation[is.na(partial_data)] <- X_smoothed[is.na(partial_data)]
+  
+  
+
+  # Store results
+  global_metrics <- list(
+    replica = i,
+    method = "fPCA-KCV",
+    rank = ncol(loadings_at_locs),
+    centering = sqrt(mean((mean_at_locs-center_locs)^2)),
+    imputation_err =
+      sqrt(mean((data$X_true[is.na(partial_data)] - X_fpca_imputation[is.na(partial_data)])^2)),
+    reconstruction_err =
+      sqrt(mean((data$X_true - X_smoothed)^2))
+  )
+
+  max_rank <- min(ncol(loadings_at_locs),ncol(test_functions.at_locs))
+  aligned_loadings.at_locs <-
+    align_cols(loadings_at_locs[,1:max_rank],test_functions.at_locs[,1:max_rank])
+  aligned_scores <-
+    align_cols(scores[,1:max_rank],data$scores[,1:max_rank])
+  component_metrics <- lapply(seq_len(max_rank),
+                              function(j) {
+    list(
+      index = j,
+      RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
+      RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
+    )
+  })
+  test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
+  run_id <- run_id + 1
+  
   
   # (2) fPCA-GCV reconstruction----
   script_dir <- "../new-fpca-missing"
@@ -291,9 +299,7 @@ for(i in 1:n_replicas){
   scores <- sweep(scores, 2, scores_norms, FUN = "/")
   loadings_at_locs <- sweep(loadings_at_locs, 2, scores_norms, FUN = "*")
   
-  X_smoothed <- rep(1,n_units)%*%t(center_locs) + scores%*%t(loadings_at_locs)
-  X_smoothed <- as.matrix(read.csv(file = paste(script_dir, 
-                                                "/test-results/reconstruction_at_locs.csv",
+  X_smoothed <- as.matrix(read.csv(file = paste(script_dir,                                                 "/test-results/reconstruction_at_locs.csv",
                                                 sep = "")))
   
   X_fpca_imputation <- partial_data
@@ -304,7 +310,7 @@ for(i in 1:n_replicas){
     replica = i,
     method = "fPCA-GCV",
     rank = ncol(loadings_at_locs),
-    centering = sqrt(mean((log_mean_generator(locations)-center_locs)^2)),
+    centering = sqrt(mean((mean_at_locs-center_locs)^2)),
     imputation_err =
       sqrt(mean(
         (data$X_true[is.na(partial_data)] -X_fpca_imputation[is.na(partial_data)])^2
@@ -353,7 +359,7 @@ for(i in 1:n_replicas){
     method = "dineof",
     rank = dineof_fit$n.eof,
     centering = 
-      sqrt(mean((log_mean_generator(locations)-pca_fit$results$X_mean_locs)^2)),
+      sqrt(mean((mean_at_locs-pca_fit$results$X_mean_locs)^2)),
     imputation_err =
       sqrt(mean(
         (data$X_true[is.na(partial_data)] - dineof_fit$Xa[is.na(partial_data)] )^2
@@ -376,8 +382,69 @@ for(i in 1:n_replicas){
   })
   test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
   run_id <- run_id + 1
-}
   
+  # (3) DINEOF + fPCA----
+  start.time <- Sys.time()
+  dineof_fit <- sinkr::dineof(partial_data)
+  write.csv(format(as.matrix(dineof_fit$Xa), digits = 16),
+            paste(datadir,"y.csv",sep=""))
+  system(paste("cd ", script_dir,"; ./new_fpca_missing",sep=""))
+  end.time <- Sys.time()
+  cat(paste("dineof+fully obs fPCA: finished after", 
+            end.time - start.time, attr(end.time - start.time, "units"), "\n"))
+  # Read results
+  center <- as.matrix(read.csv(file = paste(script_dir, "/test-results/center.csv", 
+                                            sep = "")))
+  center_locs <- Psi %*% center
+  loadings <- as.matrix(read.csv(file = paste(script_dir, "/test-results/loadings.csv",
+                                              sep = "")))
+  loadings_at_locs <- Psi %*% loadings
+  scores <- as.matrix(read.csv(file = paste(script_dir, "/test-results/scores.csv", 
+                                            sep = "")))
+  # normalization
+  scores_norms <- sqrt(colSums(scores^2))
+  scores <- sweep(scores, 2, scores_norms, FUN = "/")
+  loadings_at_locs <- sweep(loadings_at_locs, 2, scores_norms, FUN = "*")
+  
+  X_smoothed <- rep(1,n_units)%*%t(center_locs) + scores%*%t(loadings_at_locs)
+  X_smoothed <- as.matrix(read.csv(file = paste(script_dir, 
+                                                "/test-results/reconstruction_at_locs.csv",
+                                                sep = "")))
+  
+  X_fpca_imputation <- partial_data
+  X_fpca_imputation[is.na(partial_data)] <- X_smoothed[is.na(partial_data)]
+  
+  # Store results
+  global_metrics <- list(
+    replica = i,
+    method = "dineof+fPCA-GCV",
+    rank = ncol(loadings_at_locs),
+    centering = sqrt(mean((mean_at_locs-center_locs)^2)),
+    imputation_err =
+      sqrt(mean(
+        (data$X_true[is.na(partial_data)] -X_fpca_imputation[is.na(partial_data)])^2
+        )),
+    reconstruction_err =
+      sqrt(mean((data$X_true - X_smoothed)^2))
+  )
+  
+  max_rank <- min(ncol(loadings_at_locs),ncol(test_functions.at_locs))
+  aligned_loadings.at_locs <- 
+    align_cols(as.matrix(loadings_at_locs[,1:max_rank]),as.matrix(test_functions.at_locs[,1:max_rank]))
+  aligned_scores <- 
+    align_cols(as.matrix(scores[,1:max_rank]),as.matrix(data$scores[,1:max_rank]))
+  component_metrics <- lapply(seq_len(max_rank), 
+                              function(j) {
+    list(
+      index = j,
+      RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
+      RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
+    )
+  })
+  test_results[[run_id]] <- list(global = global_metrics, 
+                                 components = component_metrics)
+  run_id <- run_id + 1
+}
 ### ---
 })
 ```
@@ -606,5 +673,5 @@ if(save){
            ".pdf", sep=""), 
      centering.plot, width = 10, height = 5)
 }
-```
+```m
 
