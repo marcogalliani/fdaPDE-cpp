@@ -10,6 +10,26 @@
 test/fdapde_test
 test/.cache
 test/build/
+build/
+CMakeFiles/
+.DS_Store
+.bash_history
+.idea/
+cmake-build-debug-docker/
+cmake-build-default/
+cmake-build-debug/
+
+#plots
+*.pdf
+*.png
+
+#help files
+!*.csv
+!*.mtx
+
+#docs files
+*.puml
+.Rproj.user
 test/CMakeFiles/
 test/_deps/
 test/libs/
