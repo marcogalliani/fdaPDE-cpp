@@ -35,7 +35,7 @@ test/_deps/
 test/libs/
 .DS_Store
 .idea
-cmake-build-debug/
-cmake-build-default/
-experiments/
 
+#experiments
+experiments/**/*.csv
+experiments/**/*.mtx

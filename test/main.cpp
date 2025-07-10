@@ -58,7 +58,7 @@
 // }   // namespace test
 // }   // namespace fdapde
 
-// #include "src/sr.cpp"
+#include "src/sr.cpp"
 // #include "src/gsr.cpp"
 // #include "src/qsr.cpp"
 // #include "src/de.cpp"
