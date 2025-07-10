@@ -25,6 +25,7 @@
 #include "solvers.h"
 #include "src/models/fpca.h"
 #include "src/models/fr.h"
+#include "src/models/gap_filler.h"
 
 // clang-format on
 
