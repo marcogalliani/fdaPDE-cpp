@@ -24,9 +24,12 @@ namespace fdapde {
 [[maybe_unused]] constexpr int ComputeRandSVD = 0x1;
 [[maybe_unused]] constexpr int ComputeXactSVD = 0x0;
 
-// bits 1 - 5 reserved to calibration strategies
+// bits 1 - 2 reserved to calibration strategies
 [[maybe_unused]] constexpr int OptimizeGCV  = 0x1 << 1;
 [[maybe_unused]] constexpr int OptimizeMSRE = 0x2 << 1;
+
+// bit 3 reserved for mean computation
+[[maybe_unused]] constexpr int DoNotComputeMean = 0x1 << 3; // bit 3
   
 namespace internals {
 
@@ -232,6 +235,80 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         }
         return std::tie(f_, s_);	
     }
+    template <typename DataT> auto experimental_fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
+        fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
+        matrix_t X = data.transpose();
+        n_locs_ = X.cols(), n_units_ = X.rows();
+        // first guess of PCs set to a multivariate PCA (SVD)
+        matrix_t V;
+        if (flag & ComputeRandSVD) {
+            RSI<matrix_t> svd(X, rank);
+            V = std::move(svd.matrixV());
+        } else {
+            Eigen::JacobiSVD<matrix_t> svd(X, Eigen::ComputeThinU | Eigen::ComputeThinV);
+	    V = std::move(svd.matrixV());
+        }
+        // allocate memory
+        f_.resize(n_dofs_, rank);
+        s_.resize(n_units_, rank);
+        f_norm_.resize(rank);
+        lambda_.resize(rank, n_lambda);
+
+        int calibration = (flag & 0b11110);   // detect calibration strategy
+        std::array<double, n_lambda> opt_lambda;
+        matrix_t opt_lambdas(rank,n_lambda);
+        switch (calibration) {
+        case 0: {   // no calibration
+            fdapde_assert(lambda_grid.size() == n_lambda);
+            for (int i = 0; i < rank; ++i) {
+                for (int j = 0; j < n_lambda; ++j) {
+                    opt_lambdas(i, j) = lambda_grid[j];
+                }
+            }
+        } break;
+        case OptimizeGCV: {
+            matrix_t F0 = V;
+            int curr_rank = 1;
+
+            auto gcv_functor = [&](auto lambda) {
+                //fit with current lambda
+                for (int j = 0; j < n_lambda; ++j) opt_lambdas(rank-1,j) = lambda[j];
+                const auto& [F, S] = experimental_solve_(X, curr_rank, opt_lambdas.topRows(rank), F0);
+                //update initial guess (at locs) for the subsequent iterations
+                F0 = smoother_->Psi() * F;
+                // evaluate GCV index at convergence
+                if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
+                    edf_map_[lambda] = smoother_->edf(lambda);
+                }
+                int dor = n_locs_ - edf_map_.at(lambda);
+                return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
+            };
+            // GridOptimizer<n_lambda> optimizer;
+            GridOptimizer<n_lambda> optimizer;
+            while (curr_rank <= rank) {
+                opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
+                for (int j = 0; j < n_lambda; ++j) opt_lambdas(curr_rank-1, j) = opt_lambda[j];
+
+                curr_rank++;
+            }
+        } break;
+        case OptimizeMSRE: {
+        } break;
+        default: {
+            throw std::runtime_error("Unrecognized calibration option.");
+        }
+        }
+        // fit with optimal lambda
+        const auto& [F, S] = solve_(X, rank, opt_lambdas, V);
+	    // store results
+        lambda_ = opt_lambdas;
+        for (int i = 0; i < rank; ++i) {
+            f_norm_[i] = std::sqrt(F.col(i).dot(smoother_->mass() * F.col(i)));   // L^2 norm
+            f_.col(i) = F.col(i) / f_norm_[i];
+	        s_.col(i) = S.col(i) * f_norm_[i];
+        }
+        return std::tie(f_, s_);
+    }
     // observers
     const matrix_t& scores() const { return s_; }
     const matrix_t& loading() const { return f_; }
@@ -256,14 +333,47 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
 	        svd_t svd(S, Eigen::ComputeThinU | Eigen::ComputeThinV);
             S = svd.matrixU();
             // f_j = \argmin_f \sum_i (y_i - f_j(p_i))^2 + \int_D (\Delta f_j)^2, with y = X^\top * S_j,
-	    // j = 1, ..., rank
+	        // j = 1, ..., rank
             double pen = 0;
             for (int j = 0; j < rank; ++j) {
                 smoother_->update_response(X.transpose() * S.col(j));
                 smoother_->fit(lambda);
-		F .col(j) = smoother_->f();
-		Fn.col(j) = smoother_->Psi() * smoother_->f();
-		pen = pen + smoother_->ftPf(lambda);
+		        F .col(j) = smoother_->f();
+		        Fn.col(j) = smoother_->Psi() * smoother_->f();
+		        pen = pen + smoother_->ftPf(lambda);
+            }
+            // prepare for next iteration
+            n_iter++;
+            Jold = Jnew;
+            Jnew = (X - S * Fn.transpose()).squaredNorm() + pen;
+        }
+        return std::make_pair(F, S);
+    }
+    // finds matrices S, F minimizing \norm{X - S * F^\top}_F^2 + \sum_{i=1}^rank P_{\lambda_i}(f_i)
+    template <typename LambdaT, typename InitT>
+        requires(internals::is_matrix_like<LambdaT>)
+    auto experimental_solve_(const matrix_t& X, int rank, const LambdaT& lambda, const InitT& F0) {
+        // initialization
+        matrix_t Fn = F0;
+        matrix_t F(n_dofs_, rank);
+        matrix_t S(n_units_, rank);
+        double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
+        int n_iter = 0;
+        while (!almost_equal(Jnew, Jold, tol_) && n_iter < max_iter_) {
+            // solve the orthogonal procrustes problem
+            // S = \argmin \| X - S * F^\top \|_F^2 subject to S^\top * S = I
+            S = X * Fn;
+            svd_t svd(S, Eigen::ComputeThinU | Eigen::ComputeThinV);
+            S = svd.matrixU();
+            // f_j = \argmin_f \sum_i (y_i - f_j(p_i))^2 + \int_D (\Delta f_j)^2, with y = X^\top * S_j,
+            // j = 1, ..., rank
+            double pen = 0;
+            for (int j = 0; j < rank; ++j) {
+                smoother_->update_response(X.transpose() * S.col(j));
+                smoother_->fit(lambda.row(j));
+                F .col(j) = smoother_->f();
+                Fn.col(j) = smoother_->Psi() * smoother_->f();
+                pen = pen + smoother_->ftPf(lambda);
             }
             // prepare for next iteration
             n_iter++;
@@ -424,6 +534,8 @@ template <typename fPCASolver> class fpca_na_impl {
         std::vector<double> opt_lambda_mu(n_lambda);
         std::vector<double> opt_lambda_F(n_lambda);
 
+        //matrix_t U = initial_matrix(X,nan_pattern,std::vector<double>{lambda_grid[0]});
+        matrix_t U = matrix_t::Zero(n_units_, n_dofs_);
         int opt_rank;
         switch (calibration) {
         case 0: {   // no calibration
@@ -434,18 +546,26 @@ template <typename fPCASolver> class fpca_na_impl {
         } break;
         case OptimizeGCV: {
             //define the gcv functor
-            matrix_t U = matrix_t::Zero(n_units_, n_dofs_);
             auto gcv_functor = [&](auto params) {
                 std::vector<double> lambda_mu(n_lambda);
                 std::vector<double> lambda_F(n_lambda);
                 std::copy(params.begin(), params.begin()+n_lambda, lambda_mu.begin());
                 std::copy(params.begin()+n_lambda, params.begin()+2*n_lambda, lambda_F.begin());
-                int curr_rank = rank;
 
-                const auto& [center, F, S] = solve_(X, nan_pattern, U, static_cast<double>(curr_rank), lambda_mu,lambda_F, flag & 0x1);
-                //U = S * F.transpose(); // reconstruction update
-                //U.rowwise() += center.transpose();
-                return gcv_(X, nan_pattern, center, S, F, static_cast<double>(curr_rank), lambda_mu, lambda_F);
+                matrix_t U_init = U;
+                matrix_t center,F,S;
+                for (int k = 1; k <= rank; ++k) {
+                    const auto& [c, f, s] = solve_(X, nan_pattern, U, k, lambda_mu,lambda_F, flag & 0x1);
+                    U_init = s * f.transpose(); // reconstruction update
+                    U_init.rowwise() += c.transpose();
+                    center = c; S=s; F=f;
+                }
+                auto start_gcv = std::chrono::high_resolution_clock::now();
+                double gcv = gcv_(X, nan_pattern, center.col(0), S, F, rank, lambda_mu, lambda_F);
+                auto end_gcv = std::chrono::high_resolution_clock::now();
+                std::chrono::duration<double, std::milli> elapsed = end_gcv - start_gcv;
+                std::cout << "Elapsed time GCV: " << elapsed.count() << " ms\n";
+                return gcv;
             };
             Eigen::Matrix<double, Dynamic, Dynamic, Eigen::RowMajor> grid_2D(lambda_grid.size(), 2);
             int idx = 0;
@@ -552,8 +672,8 @@ template <typename fPCASolver> class fpca_na_impl {
         f_norm_.resize(opt_rank);
         lambda_.resize(opt_rank+1, n_lambda);
         // fit with optimal lambda
-        matrix_t U = matrix_t::Zero(n_units_, n_dofs_); //starting guess
-        for (int k = opt_rank; k <= opt_rank; ++k) {
+        //matrix_t U = matrix_t::Zero(n_units_, n_dofs_); //starting guess
+        for (int k = 1; k <= opt_rank; ++k) {
             const auto& [center, F, S] = solve_(X, nan_pattern, U,k, opt_lambda_mu,opt_lambda_F, flag & 0x1);
             U = S * F.transpose(); // reconstruction update
             U.rowwise() += center.transpose();
@@ -577,11 +697,73 @@ template <typename fPCASolver> class fpca_na_impl {
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
    private:
+
+    template <typename LambdaT>
+        requires(internals::is_subscriptable<LambdaT, int>)
+    const matrix_t initial_matrix(const matrix_t& X, const binary_t& nan_pattern, const LambdaT lambda) {
+        using triplet_t = Eigen::Triplet<double>;
+        //construct the matrix of weights
+        std::vector<int> observed_indexes = nan_pattern.which(false);
+        //construct the B matrix: B = ...
+        matrix_t design_mat(n_units_,n_units_);
+        design_mat = matrix_t::Identity(n_units_,n_units_);
+        sparse_matrix_t B_full(n_units_*n_locs_, n_units_*n_dofs_);
+        B_full = kronecker(design_mat.sparseView(),smoother_.Psi());
+        //remove rows corresponding to unobserved data points
+        using triplet_t = Eigen::Triplet<double>;
+        std::vector<triplet_t> B_obs_triplets;
+        int n_obs = observed_indexes.size();
+        int n_cols = B_full.cols();
+        for (int i = 0; i < n_obs; ++i) {
+            int src_row = observed_indexes[i];
+            Eigen::SparseVector<double> row = B_full.row(src_row);
+            for (Eigen::SparseVector<double>::InnerIterator it(row); it; ++it) {
+                B_obs_triplets.emplace_back(i, it.index(), it.value());
+            }
+        }
+        sparse_matrix_t B_obs(n_obs, n_cols);
+        B_obs.setFromTriplets(B_obs_triplets.begin(), B_obs_triplets.end());
+        //construct the smoothing matrix
+        sparse_matrix_t diag_lambdas(n_units_,n_units_);
+        std::vector<triplet_t> lambda_triplets;
+        for (int i = 0; i < n_units_; ++i) {
+            lambda_triplets.emplace_back(i, i, lambda[0]);
+        }
+        diag_lambdas.setFromTriplets(lambda_triplets.begin(),lambda_triplets.end());
+        //smoothing matrix
+        SparseBlockMatrix<double, 2, 2> A(
+               B_obs.transpose()*B_obs,                            kronecker(diag_lambdas,smoother_.stiff()),
+               kronecker(diag_lambdas,smoother_.stiff()),  kronecker(-diag_lambdas,smoother_.mass())
+               );
+        using sparse_solver_t = internals::eigen_sparse_solver_movable_wrap<Eigen::SparseLU<sparse_matrix_t>>;
+        sparse_solver_t invA;
+        //using sparse block matrix
+        invA.compute(A);
+        if (invA.info() != Eigen::Success) {
+            throw std::runtime_error("Matrix factorization failed.");
+        }
+        //compute the vectorized X
+        vector_t vec_X_full = (~nan_pattern).select(X,0).reshaped<Eigen::RowMajor>();
+        vector_t vec_X_obs(observed_indexes.size());
+        for (int i = 0; i < observed_indexes.size(); ++i) {
+            vec_X_obs(i) = vec_X_full(observed_indexes[i]);
+        }
+        //solve the system: (B^TB + lambda(I_N kron_prod P))y = B^T e (where e is a sampled vector)
+        vector_t target = vector_t::Zero(2*B_obs.cols());
+        target.head(B_obs.cols()) = B_obs.transpose()*vec_X_obs;
+        vector_t y = invA.solve(target);
+        vector_t solution = y.head(B_obs.cols());
+        //compute the initialisation
+        matrix_t U(n_units_,n_dofs_);
+        U = Eigen::Map<Eigen::Matrix<double,Dynamic,Dynamic,Eigen::RowMajor>>(solution.data(), n_units_, n_dofs_);
+        return U;
+    }
     // the solve_ method implements the MM scheme (the rank recursion is performed during the fit)
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, const binary_t& nan, const matrix_t& U0, int rank, const LambdaT lambda_mu, const LambdaT lambda_F, int flag) {
         std::cout <<  "Lambda: " << lambda_mu[0] << std::endl;
+        std::cout <<  "Rank: " << rank << std::endl;
         for (int i = 0; i < lambda_mu.size(); ++i) { fdapde_assert(lambda_mu[i] > 0); fdapde_assert(lambda_F[i] > 0);}
         vector_t center(n_dofs_);
         matrix_t F(n_dofs_ , rank);
@@ -594,13 +776,12 @@ template <typename fPCASolver> class fpca_na_impl {
         while (!almost_equal(Jnew, Jold, tol_) && n_iter < max_iter_) {
             // imputation update
             matrix_t Xn = (~nan).select(X, Un);
-            //Xn.rowwise() -= Xn.colwise().mean();   // re-center
-            // Alternative impl.
-            // compute the smooth mean
+            // smooth mean estimation
             smoother_.update_response(Xn.colwise().mean().transpose());
             smoother_.fit(lambda_mu[0]);
             const auto mu = smoother_.f();
             Xn.rowwise() -= (smoother_.Psi() * mu).transpose();
+            // Xn.rowwise() -= Xn.colwise().mean();;
 
             // rank-k fPCA on imputed data
             auto [f, s] = fpca_->fit(Xn.transpose(), rank, lambda_F, flag & 0x1); //always run with no calibration
@@ -615,10 +796,13 @@ template <typename fPCASolver> class fpca_na_impl {
             n_iter++;
             Jold = Jnew;
             Un = U * smoother_.Psi().transpose();
-            Jnew = ((~nan).select(X - Un, 0)).squaredNorm() + n_units_*mu.transpose()*smoother_.P(lambda_mu)*mu + (f.transpose() * smoother_.P(lambda_F) * f).trace();
+            Jnew = ((~nan).select(X - Un, 0)).squaredNorm() +
+                n_units_*mu.transpose()*smoother_.P(lambda_mu)*mu +
+                (f.transpose() * smoother_.P(lambda_F) * f).trace();
             if (almost_equal(Jnew, Jold, tol_) || n_iter == max_iter_) {
                 center = mu; F = f; S = s;
             }
+            std::cout << "Iter " << n_iter << ", improvement: " << (std::fabs(Jnew) < std::fabs(Jold) ? std::fabs(Jnew-Jold)/Jold : std::fabs(Jnew-Jold)/Jnew) << std::endl;
         }
         if (n_iter>=max_iter_){ std::cout << "convergence issues, relative error: " <<  (std::fabs(Jnew) < std::fabs(Jold) ? std::fabs(Jnew-Jold)/Jold : std::fabs(Jnew-Jold)/Jnew) << std::endl;}
 	    return std::make_tuple(center, F, S);
@@ -699,7 +883,7 @@ template <typename fPCASolver> class fpca_na_impl {
     matrix_t lambda_;              // selected PCs smoothing level
 
     // MM scheme parameters
-    double tol_ = 1e-6;
+    double tol_ = 1e-5;
     int max_iter_ = 100;
 };
 
@@ -795,18 +979,20 @@ template <typename VariationalSolver> class fPCA {
             if (lambda_grid.size() > n_lambda && (flag & 0b11110) == 0) { flag = flag | OptimizeGCV; }
             // data centering
             matrix_t centred_data = data_.transpose();
-            smoother_.update_response(centred_data.colwise().mean());
-            GridOptimizer<1> opt;
-            auto gcv_functor = [&](auto lambda) {
-                smoother_.fit(lambda);
-                double dor =  n_locs_ - smoother_.edf();  // residual degrees of freedom
-                return (n_locs_ / std::pow(dor, 2)) * (~smoother_.nan_pattern()).select(smoother_.fn() - smoother_.response(),0).squaredNorm();
-            };
-            opt.optimize(gcv_functor, lambda_grid);
-            smoother_.fit(opt.optimum());
-            center_ = std::move(smoother_.f());
-            centred_data.rowwise() -= smoother_.fn().transpose();
-
+            bool computeMean = !(flag & DoNotComputeMean);
+            if (computeMean) {
+                smoother_.update_response(centred_data.colwise().mean());
+                GridOptimizer<1> opt;
+                auto gcv_functor = [&](auto lambda) {
+                    smoother_.fit(lambda);
+                    double dor =  n_locs_ - smoother_.edf();  // residual degrees of freedom
+                    return (n_locs_ / std::pow(dor, 2)) * (~smoother_.nan_pattern()).select(smoother_.fn() - smoother_.response(),0).squaredNorm();
+                };
+                opt.optimize(gcv_functor, lambda_grid);
+                smoother_.fit(opt.optimum());
+                center_ = std::move(smoother_.f());
+                centred_data.rowwise() -= smoother_.fn().transpose();
+            }
             // performing fPCA on the zero-centred data
             const auto& [f, s] = solver_.fit(centred_data.transpose(), rank, lambda_grid, flag);
             f_ = std::move(f);
