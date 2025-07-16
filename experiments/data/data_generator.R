@@ -30,6 +30,9 @@ data_generator <- function(n_units, true_PCs, Psi, scores_sd, error_sd, mean_loc
   data$error <- error
   
   
+  # add a heteroschedastic error
+  
+  
   #(4) save the noisy matrix
   if(!is.null(obs_path)){
     write.csv(format(as.matrix(data$noisy_data), digits = 16),

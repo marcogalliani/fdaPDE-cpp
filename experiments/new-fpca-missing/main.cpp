@@ -63,7 +63,7 @@ int main() {
         /* n_comp = */ json_file["RunParams"].value("n_pc",6),
         lambda_grid,
         /* options = */ ComputeRandSVD | OptimizeGCV,
-        fpca_subspace_solver()
+        fpca_subspace_experimental_solver()
     );
 
     // save results
