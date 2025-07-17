@@ -67,6 +67,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
         s_.resize(n_units_, rank);
         f_norm_.resize(rank);
         lambda_.resize(rank, n_lambda);
+        gcv_scores_.resize(lambda_grid.size(),rank);
 
         int calibration = (flag & 0b11110);   // detect calibration strategy
         for (int i = 0; i < rank; ++i) {
@@ -82,6 +83,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
                 // GridOptimizer<n_lambda> optimizer;
                 GridOptimizer<n_lambda> optimizer;
                 opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
+                for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
             } break;
             case OptimizeMSRE: {
             } break;
@@ -106,6 +108,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     const matrix_t& loading() const { return f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
+    const matrix_t& gcv_scores() const { return gcv_scores_; }
     const smoother_t* smoother() const { return smoother_; }
    private:
     // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f)
@@ -151,6 +154,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
+    matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
   
     // power iteration algorithm parameters
     double tol_ = 1e-6;
@@ -190,6 +194,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         s_.resize(n_units_, rank);
         f_norm_.resize(rank);
         lambda_.resize(rank, n_lambda);
+        gcv_scores_.resize(lambda_grid.size(),rank);
 
         int calibration = (flag & 0b11110);   // detect calibration strategy	
         std::array<double, n_lambda> opt_lambda;
@@ -215,6 +220,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
             // GridOptimizer<n_lambda> optimizer;
             GridOptimizer<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
+            for(int i=0; i < rank; i++) for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
         } break;
         case OptimizeMSRE: {
         } break;
@@ -240,6 +246,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     const matrix_t& loading() const { return f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
+    const matrix_t& gcv_scores() const { return gcv_scores_; }
     const smoother_t* smoother() const { return smoother_; }
   private:
     // finds matrices S, F minimizing \norm{X - S * F^\top}_F^2 + \sum_{i=1}^rank P_{\lambda_i}(f_i)
@@ -291,6 +298,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
+    matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
   
     // subspace iteration algorithm parameters
     double tol_ = 1e-6;
@@ -332,6 +340,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
         s_.resize(n_units_, rank);
         f_norm_.resize(rank);
         lambda_.resize(rank, n_lambda);
+        gcv_scores_.resize(lambda_grid.size(), rank);
 
         int calibration = (flag & 0b11110);   // detect calibration strategy
         std::array<double, n_lambda> opt_lambda;
@@ -359,11 +368,11 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
                 int dor = n_locs_ - edf_map_.at(lambda);
                 return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S.col(curr_rank-1) - (smoother_->Psi() * F.col(curr_rank-1))).squaredNorm();
             };
-            // GridOptimizer<n_lambda> optimizer;
-            GridOptimizer<n_lambda> optimizer;
             while (curr_rank <= rank) {
+                GridOptimizer<n_lambda> optimizer;
                 opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
                 for (int j = 0; j < n_lambda; ++j) opt_lambdas(curr_rank-1, j) = opt_lambda[j];
+                for (int i = 0; i < lambda_grid.size(); i++) gcv_scores_(i,curr_rank-1) = optimizer.values()[i];
                 curr_rank++;
             }
         } break;
@@ -389,6 +398,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
     const matrix_t& loading() const { return f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
+    const matrix_t& gcv_scores() const { return gcv_scores_; }
     const smoother_t* smoother() const { return smoother_; }
   private:
     // finds matrices S, F minimizing \norm{X - S * F^\top}_F^2 + \sum_{i=1}^rank P_{\lambda_i}(f_i)
@@ -440,6 +450,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
+    matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
 
     // subspace iteration algorithm parameters
     double tol_ = 1e-6;
@@ -468,6 +479,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
         s_.resize(n_units_, rank);
         f_norm_.resize(rank);
         lambda_.resize(rank, n_lambda);
+        gcv_scores_.resize(lambda_grid.size(),rank);
 	
         int calibration = (flag & 0b11110);   // detect calibration strategy
         std::array<double, n_lambda> opt_lambda;
@@ -481,6 +493,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
             // GridOptimizer<n_lambda> optimizer;
             GridOptimizer<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
+            for(int i=0; i < rank; i++) for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
         } break;
         case OptimizeMSRE: {
         } break;
@@ -504,6 +517,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
     const matrix_t& loading() const { return f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
+    const matrix_t& gcv_scores() const { return gcv_scores_; }
     const smoother_t* smoother() const { return smoother_; }
    private:
     // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f)
@@ -548,6 +562,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
+    matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
 };
   
 // class for handling nan
@@ -740,66 +755,6 @@ template <typename fPCASolver> class fpca_na_impl {
     const matrix_t& lambda() const { return lambda_; }
    private:
 
-    template <typename LambdaT>
-        requires(internals::is_subscriptable<LambdaT, int>)
-    const matrix_t initial_matrix(const matrix_t& X, const binary_t& nan_pattern, const LambdaT lambda) {
-        using triplet_t = Eigen::Triplet<double>;
-        //construct the matrix of weights
-        std::vector<int> observed_indexes = nan_pattern.which(false);
-        //construct the B matrix: B = ...
-        matrix_t design_mat(n_units_,n_units_);
-        design_mat = matrix_t::Identity(n_units_,n_units_);
-        sparse_matrix_t B_full(n_units_*n_locs_, n_units_*n_dofs_);
-        B_full = kronecker(design_mat.sparseView(),smoother_.Psi());
-        //remove rows corresponding to unobserved data points
-        using triplet_t = Eigen::Triplet<double>;
-        std::vector<triplet_t> B_obs_triplets;
-        int n_obs = observed_indexes.size();
-        int n_cols = B_full.cols();
-        for (int i = 0; i < n_obs; ++i) {
-            int src_row = observed_indexes[i];
-            Eigen::SparseVector<double> row = B_full.row(src_row);
-            for (Eigen::SparseVector<double>::InnerIterator it(row); it; ++it) {
-                B_obs_triplets.emplace_back(i, it.index(), it.value());
-            }
-        }
-        sparse_matrix_t B_obs(n_obs, n_cols);
-        B_obs.setFromTriplets(B_obs_triplets.begin(), B_obs_triplets.end());
-        //construct the smoothing matrix
-        sparse_matrix_t diag_lambdas(n_units_,n_units_);
-        std::vector<triplet_t> lambda_triplets;
-        for (int i = 0; i < n_units_; ++i) {
-            lambda_triplets.emplace_back(i, i, lambda[0]);
-        }
-        diag_lambdas.setFromTriplets(lambda_triplets.begin(),lambda_triplets.end());
-        //smoothing matrix
-        SparseBlockMatrix<double, 2, 2> A(
-               B_obs.transpose()*B_obs,                            kronecker(diag_lambdas,smoother_.stiff()),
-               kronecker(diag_lambdas,smoother_.stiff()),  kronecker(-diag_lambdas,smoother_.mass())
-               );
-        using sparse_solver_t = internals::eigen_sparse_solver_movable_wrap<Eigen::SparseLU<sparse_matrix_t>>;
-        sparse_solver_t invA;
-        //using sparse block matrix
-        invA.compute(A);
-        if (invA.info() != Eigen::Success) {
-            throw std::runtime_error("Matrix factorization failed.");
-        }
-        //compute the vectorized X
-        vector_t vec_X_full = (~nan_pattern).select(X,0).reshaped<Eigen::RowMajor>();
-        vector_t vec_X_obs(observed_indexes.size());
-        for (int i = 0; i < observed_indexes.size(); ++i) {
-            vec_X_obs(i) = vec_X_full(observed_indexes[i]);
-        }
-        //solve the system: (B^TB + lambda(I_N kron_prod P))y = B^T e (where e is a sampled vector)
-        vector_t target = vector_t::Zero(2*B_obs.cols());
-        target.head(B_obs.cols()) = B_obs.transpose()*vec_X_obs;
-        vector_t y = invA.solve(target);
-        vector_t solution = y.head(B_obs.cols());
-        //compute the initialisation
-        matrix_t U(n_units_,n_dofs_);
-        U = Eigen::Map<Eigen::Matrix<double,Dynamic,Dynamic,Eigen::RowMajor>>(solution.data(), n_units_, n_dofs_);
-        return U;
-    }
     // the solve_ method implements the MM scheme (the rank recursion is performed during the fit)
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
@@ -1053,17 +1008,19 @@ template <typename VariationalSolver> class fPCA {
             s_ = std::move(s);
             f_norm_ = solver_.loadings_norm();
             lambda_ = solver_.lambda();
+            gcv_scores_ = solver_.gcv_scores();
         }
         return std::tie(f_, s_);
     }
     // observers
     const vector_t& center() const { return center_;} // mean vector
-    const vector_t& center_locs() const { return smoother_.Psi()*center_;} // mean vector
+    vector_t center_locs() const { return smoother_.Psi() * center_;} // mean vector
     const matrix_t& S() const { return s_; }   // scoring matrix
     const matrix_t& F() const { return f_; }   // loading matrix
     matrix_t Fn() const { return smoother_.Psi() * f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
+    const matrix_t& gcv_scores() const { return gcv_scores_; }
    private:
     data_t data_;           // mapped geoframe data
     smoother_t smoother_;   // variational solver used in the smoothing step
@@ -1075,6 +1032,7 @@ template <typename VariationalSolver> class fPCA {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated components
     matrix_t lambda_;              // selected level of smoothing for each component
+    matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
 };
 
 // deduction guide
