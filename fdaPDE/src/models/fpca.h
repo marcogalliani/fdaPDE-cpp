@@ -27,6 +27,8 @@ namespace fdapde {
 // bits 1 - 2 reserved to calibration strategies
 [[maybe_unused]] constexpr int OptimizeGCV  = 0x1 << 1;
 [[maybe_unused]] constexpr int OptimizeMSRE = 0x2 << 1;
+[[maybe_unused]] constexpr int CalibrationMask = 0b0110;      // 0b0110, bits 1 and 2
+
 
 // bit 3 reserved for mean computation
 [[maybe_unused]] constexpr int DoNotComputeMean = 0x1 << 3; // bit 3
@@ -69,7 +71,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
         lambda_.resize(rank, n_lambda);
         gcv_scores_.resize(lambda_grid.size(),rank);
 
-        int calibration = (flag & 0b11110);   // detect calibration strategy
+        int calibration = (flag & CalibrationMask);   // detect calibration strategy
         for (int i = 0; i < rank; ++i) {
             // select optimal smoothing level for i-th component
             std::array<double, n_lambda> opt_lambda;
@@ -109,6 +111,19 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
     const matrix_t& gcv_scores() const { return gcv_scores_; }
+    vector_t edf_scores() const {
+        // Copy map to a sortable vector of pairs
+        std::vector<std::pair<std::array<double, n_lambda>, double>> sorted_entries(edf_map_.begin(), edf_map_.end());
+        // Sort by lambda order
+        std::sort(sorted_entries.begin(), sorted_entries.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first;
+                  });
+        // Fill vector with sorted EDFs
+        vector_t sorted_edfs(sorted_entries.size());
+        for (std::size_t i = 0; i < sorted_entries.size(); ++i) sorted_edfs(i) = sorted_entries[i].second;
+        return sorted_edfs;
+    }
     const smoother_t* smoother() const { return smoother_; }
    private:
     // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f)
@@ -196,7 +211,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         lambda_.resize(rank, n_lambda);
         gcv_scores_.resize(lambda_grid.size(),rank);
 
-        int calibration = (flag & 0b11110);   // detect calibration strategy	
+        int calibration = (flag & CalibrationMask);   // detect calibration strategy
         std::array<double, n_lambda> opt_lambda;
         switch (calibration) {
         case 0: {   // no calibration
@@ -209,7 +224,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
                 //fit with current lambda
                 const auto& [F, S] = solve_(X, rank, lambda, F0);
                 //update initial guess (at locs) for the subsequent iterations
-                F0 = smoother_->Psi() * F;
+                // F0 = smoother_->Psi() * F;
                 // evaluate GCV index at convergence
                 if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
                     edf_map_[lambda] = smoother_->edf(lambda);
@@ -221,6 +236,8 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
             GridOptimizer<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
             for(int i=0; i < rank; i++) for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
+            gcv_scores_ = gcv_scores_/rank;
+
         } break;
         case OptimizeMSRE: {
         } break;
@@ -247,6 +264,19 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
     const matrix_t& gcv_scores() const { return gcv_scores_; }
+    vector_t edf_scores() const {
+        // Copy map to a sortable vector of pairs
+        std::vector<std::pair<std::array<double, n_lambda>, double>> sorted_entries(edf_map_.begin(), edf_map_.end());
+        // Sort by lambda order
+        std::sort(sorted_entries.begin(), sorted_entries.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first;
+                  });
+        // Fill vector with sorted EDFs
+        vector_t sorted_edfs(sorted_entries.size());
+        for (std::size_t i = 0; i < sorted_entries.size(); ++i) sorted_edfs(i) = sorted_entries[i].second;
+        return sorted_edfs;
+    }
     const smoother_t* smoother() const { return smoother_; }
   private:
     // finds matrices S, F minimizing \norm{X - S * F^\top}_F^2 + \sum_{i=1}^rank P_{\lambda_i}(f_i)
@@ -299,7 +329,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
     matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
-  
+
     // subspace iteration algorithm parameters
     double tol_ = 1e-6;
     int max_iter_ = 20;
@@ -342,7 +372,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
         lambda_.resize(rank, n_lambda);
         gcv_scores_.resize(lambda_grid.size(), rank);
 
-        int calibration = (flag & 0b11110);   // detect calibration strategy
+        int calibration = (flag & CalibrationMask);   // detect calibration strategy
         std::array<double, n_lambda> opt_lambda;
         matrix_t opt_lambdas(rank,n_lambda);
         switch (calibration) {
@@ -355,13 +385,37 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
             }
         } break;
         case OptimizeGCV: {
+            // initialisation
             matrix_t F0 = V;
+            for (int i = 0; i < rank; ++i) {
+                // assuming the grid is ordered
+                for (int j = 0; j < n_lambda; ++j) opt_lambdas(i, j) = lambda_grid[j];
+            }
+            // refinement
             int curr_rank = 1;
             auto gcv_functor = [&](auto lambda) {
                 //fit with current lambda
+
                 for (int j = 0; j < n_lambda; ++j) opt_lambdas(curr_rank-1,j) = lambda[j];
                 const auto& [F, S] = solve_(X, curr_rank, opt_lambdas.topRows(curr_rank), F0.leftCols(curr_rank));
-                // evaluate GCV index at convergence
+                //update initial guess (at locs) for the subsequent iterations
+                // F0.leftCols(curr_rank) = smoother_->Psi() * F;
+                // const auto& [F, S] = solve_(X, rank, opt_lambdas, F0);
+                // // weight the columns of each vector
+                // vector_t weights(rank);
+                // for (int m = 0; m < rank; m++) {
+                //     // evaluate GCV index at convergence
+                //     std::array<double,n_lambda> lambda_buffer;
+                //     for (int j = 0; j < n_lambda; j++) lambda_buffer[j] = opt_lambdas(m,j);
+                //     if (edf_map_.find(lambda_buffer) == edf_map_.end()) {   // cache Tr[S]
+                //         edf_map_[lambda_buffer] = smoother_->edf(lambda_buffer);
+                //     }
+                //     weights(m) = std::sqrt(n_locs_)/(n_locs_-edf_map_[lambda_buffer]);
+                // }
+                // matrix_t F_w = F.array().rowwise() * weights.transpose().array();
+                // matrix_t S_w = S.array().rowwise() * weights.transpose().array();
+                // return (X.transpose() * S_w - smoother_->Psi() * F_w).squaredNorm();
+
                 if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
                     edf_map_[lambda] = smoother_->edf(lambda);
                 }
@@ -399,6 +453,19 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
     const matrix_t& gcv_scores() const { return gcv_scores_; }
+    vector_t edf_scores() const {
+        // Copy map to a sortable vector of pairs
+        std::vector<std::pair<std::array<double, n_lambda>, double>> sorted_entries(edf_map_.begin(), edf_map_.end());
+        // Sort by lambda order
+        std::sort(sorted_entries.begin(), sorted_entries.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first;
+                  });
+        // Fill vector with sorted EDFs
+        vector_t sorted_edfs(sorted_entries.size());
+        for (std::size_t i = 0; i < sorted_entries.size(); ++i) sorted_edfs(i) = sorted_entries[i].second;
+        return sorted_edfs;
+    }
     const smoother_t* smoother() const { return smoother_; }
   private:
     // finds matrices S, F minimizing \norm{X - S * F^\top}_F^2 + \sum_{i=1}^rank P_{\lambda_i}(f_i)
@@ -481,7 +548,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
         lambda_.resize(rank, n_lambda);
         gcv_scores_.resize(lambda_grid.size(),rank);
 	
-        int calibration = (flag & 0b11110);   // detect calibration strategy
+        int calibration = (flag & CalibrationMask);   // detect calibration strategy
         std::array<double, n_lambda> opt_lambda;
         switch (calibration) {
         case 0: {   // no calibration
@@ -494,6 +561,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
             GridOptimizer<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
             for(int i=0; i < rank; i++) for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
+            gcv_scores_ = gcv_scores_/rank;
         } break;
         case OptimizeMSRE: {
         } break;
@@ -518,6 +586,19 @@ template <typename VariationalSolver> class fpca_direct_impl {
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
     const matrix_t& gcv_scores() const { return gcv_scores_; }
+    vector_t edf_scores() const {
+        // Copy map to a sortable vector of pairs
+        std::vector<std::pair<std::array<double, n_lambda>, double>> sorted_entries(edf_map_.begin(), edf_map_.end());
+        // Sort by lambda order
+        std::sort(sorted_entries.begin(), sorted_entries.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first;
+                  });
+        // Fill vector with sorted EDFs
+        vector_t sorted_edfs(sorted_entries.size());
+        for (std::size_t i = 0; i < sorted_entries.size(); ++i) sorted_edfs(i) = sorted_entries[i].second;
+        return sorted_edfs;
+    }
     const smoother_t* smoother() const { return smoother_; }
    private:
     // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f)
@@ -551,10 +632,14 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     double gcv_(const matrix_t& X, int rank, const LambdaT lambda, int flag) {
         const auto& [F, S] = solve_(X, rank, lambda, flag);
+        if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
+            edf_map_[lambda] = invD_.squaredNorm();
+        }
         // evaluate GCV index at convergence (note that Tr[S] = \|D^(-1)\|_F^2)
-        int dor = n_locs_ - invD_.squaredNorm();
+        int dor = n_locs_ - edf_map_.at(lambda);
         return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
     }
+    std::unordered_map<std::array<double, n_lambda>, double, internals::std_array_hash<double, n_lambda>> edf_map_;
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
     matrix_t invD_;                // inverse of the cholesky factor of \Psi^\top * \Psi + P_{\lambda}
     smoother_t* smoother_;         // smoothing variational solver
@@ -587,7 +672,7 @@ template <typename fPCASolver> class fpca_na_impl {
         binary_t nan_pattern = na_matrix(X);   // compute missingness pattern
         n_locs_ = X.cols(), n_units_ = X.rows();
 
-        int calibration = (flag & 0b11110);   // detect calibration strategy
+        int calibration = (flag & CalibrationMask);   // detect calibration strategy
         std::vector<double> opt_lambda_mu(n_lambda);
         std::vector<double> opt_lambda_F(n_lambda);
 
@@ -975,7 +1060,7 @@ template <typename VariationalSolver> class fPCA {
 	    // dispatch to processing logic
         if (has_nan_) {
             // default to OptimMSRE calibration, if no calibration provided
-            if (lambda_grid.size() > n_lambda && (flag & 0b11110) == 0) { flag = flag | OptimizeMSRE; }
+            if (lambda_grid.size() > n_lambda && (flag & CalibrationMask) == 0) { flag = flag | OptimizeMSRE; }
             internals::fpca_na_impl mm_scheme(solver_);
             const auto& [mu,f, s] = mm_scheme.fit(data_, rank, lambda_grid, flag);
             center_ = std::move(mu);
@@ -985,7 +1070,7 @@ template <typename VariationalSolver> class fPCA {
             lambda_ = mm_scheme.lambda();
         } else {
             // default to OptimGCV calibration, if no calibration provided
-            if (lambda_grid.size() > n_lambda && (flag & 0b11110) == 0) { flag = flag | OptimizeGCV; }
+            if (lambda_grid.size() > n_lambda && (flag & CalibrationMask) == 0) { flag = flag | OptimizeGCV; }
             // data centering
             matrix_t centred_data = data_.transpose();
             bool computeMean = !(flag & DoNotComputeMean);
@@ -1009,6 +1094,7 @@ template <typename VariationalSolver> class fPCA {
             f_norm_ = solver_.loadings_norm();
             lambda_ = solver_.lambda();
             gcv_scores_ = solver_.gcv_scores();
+            edf_scores_ = solver_.edf_scores();
         }
         return std::tie(f_, s_);
     }
@@ -1021,6 +1107,7 @@ template <typename VariationalSolver> class fPCA {
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
     const matrix_t& gcv_scores() const { return gcv_scores_; }
+    const matrix_t& edf_scores() const { return edf_scores_; }
    private:
     data_t data_;           // mapped geoframe data
     smoother_t smoother_;   // variational solver used in the smoothing step
@@ -1033,6 +1120,7 @@ template <typename VariationalSolver> class fPCA {
     std::vector<double> f_norm_;   // L^2 norm of estimated components
     matrix_t lambda_;              // selected level of smoothing for each component
     matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
+    matrix_t edf_scores_;          // expected dof scores (#lambda_grid-by-rank matrix)
 };
 
 // deduction guide
