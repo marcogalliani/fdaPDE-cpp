@@ -26,11 +26,11 @@ data_generator <- function(n_units, true_PCs, Psi, scores_sd, error_sd, mean_loc
   error <- matrix(error,nrow=n_units)
   error <- error - matrix(rep(colMeans(error),n_units), byrow=T, nrow=n_units)
   
+  # error <- outer(data$scores[,1],rnorm(nrow(Psi),mean = 0, sd = error_sd*data_range))
+  # error <- scale(error)
+  
   data$noisy_data <- as.matrix(data$X_true + error)
   data$error <- error
-  
-  
-  # add a heteroschedastic error
   
   
   #(4) save the noisy matrix
