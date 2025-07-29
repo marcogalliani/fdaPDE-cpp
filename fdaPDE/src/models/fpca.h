@@ -235,80 +235,6 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         }
         return std::tie(f_, s_);	
     }
-    template <typename DataT> auto experimental_fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
-        fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
-        matrix_t X = data.transpose();
-        n_locs_ = X.cols(), n_units_ = X.rows();
-        // first guess of PCs set to a multivariate PCA (SVD)
-        matrix_t V;
-        if (flag & ComputeRandSVD) {
-            RSI<matrix_t> svd(X, rank);
-            V = std::move(svd.matrixV());
-        } else {
-            Eigen::JacobiSVD<matrix_t> svd(X, Eigen::ComputeThinU | Eigen::ComputeThinV);
-	    V = std::move(svd.matrixV());
-        }
-        // allocate memory
-        f_.resize(n_dofs_, rank);
-        s_.resize(n_units_, rank);
-        f_norm_.resize(rank);
-        lambda_.resize(rank, n_lambda);
-
-        int calibration = (flag & 0b11110);   // detect calibration strategy
-        std::array<double, n_lambda> opt_lambda;
-        matrix_t opt_lambdas(rank,n_lambda);
-        switch (calibration) {
-        case 0: {   // no calibration
-            fdapde_assert(lambda_grid.size() == n_lambda);
-            for (int i = 0; i < rank; ++i) {
-                for (int j = 0; j < n_lambda; ++j) {
-                    opt_lambdas(i, j) = lambda_grid[j];
-                }
-            }
-        } break;
-        case OptimizeGCV: {
-            matrix_t F0 = V;
-            int curr_rank = 1;
-
-            auto gcv_functor = [&](auto lambda) {
-                //fit with current lambda
-                for (int j = 0; j < n_lambda; ++j) opt_lambdas(rank-1,j) = lambda[j];
-                const auto& [F, S] = experimental_solve_(X, curr_rank, opt_lambdas.topRows(rank), F0);
-                //update initial guess (at locs) for the subsequent iterations
-                F0 = smoother_->Psi() * F;
-                // evaluate GCV index at convergence
-                if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
-                    edf_map_[lambda] = smoother_->edf(lambda);
-                }
-                int dor = n_locs_ - edf_map_.at(lambda);
-                return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
-            };
-            // GridOptimizer<n_lambda> optimizer;
-            GridOptimizer<n_lambda> optimizer;
-            while (curr_rank <= rank) {
-                opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
-                for (int j = 0; j < n_lambda; ++j) opt_lambdas(curr_rank-1, j) = opt_lambda[j];
-
-                curr_rank++;
-            }
-        } break;
-        case OptimizeMSRE: {
-        } break;
-        default: {
-            throw std::runtime_error("Unrecognized calibration option.");
-        }
-        }
-        // fit with optimal lambda
-        const auto& [F, S] = solve_(X, rank, opt_lambdas, V);
-	    // store results
-        lambda_ = opt_lambdas;
-        for (int i = 0; i < rank; ++i) {
-            f_norm_[i] = std::sqrt(F.col(i).dot(smoother_->mass() * F.col(i)));   // L^2 norm
-            f_.col(i) = F.col(i) / f_norm_[i];
-	        s_.col(i) = S.col(i) * f_norm_[i];
-        }
-        return std::tie(f_, s_);
-    }
     // observers
     const matrix_t& scores() const { return s_; }
     const matrix_t& loading() const { return f_; }
@@ -341,39 +267,6 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
 		        F .col(j) = smoother_->f();
 		        Fn.col(j) = smoother_->Psi() * smoother_->f();
 		        pen = pen + smoother_->ftPf(lambda);
-            }
-            // prepare for next iteration
-            n_iter++;
-            Jold = Jnew;
-            Jnew = (X - S * Fn.transpose()).squaredNorm() + pen;
-        }
-        return std::make_pair(F, S);
-    }
-    // finds matrices S, F minimizing \norm{X - S * F^\top}_F^2 + \sum_{i=1}^rank P_{\lambda_i}(f_i)
-    template <typename LambdaT, typename InitT>
-        requires(internals::is_matrix_like<LambdaT>)
-    auto experimental_solve_(const matrix_t& X, int rank, const LambdaT& lambda, const InitT& F0) {
-        // initialization
-        matrix_t Fn = F0;
-        matrix_t F(n_dofs_, rank);
-        matrix_t S(n_units_, rank);
-        double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
-        int n_iter = 0;
-        while (!almost_equal(Jnew, Jold, tol_) && n_iter < max_iter_) {
-            // solve the orthogonal procrustes problem
-            // S = \argmin \| X - S * F^\top \|_F^2 subject to S^\top * S = I
-            S = X * Fn;
-            svd_t svd(S, Eigen::ComputeThinU | Eigen::ComputeThinV);
-            S = svd.matrixU();
-            // f_j = \argmin_f \sum_i (y_i - f_j(p_i))^2 + \int_D (\Delta f_j)^2, with y = X^\top * S_j,
-            // j = 1, ..., rank
-            double pen = 0;
-            for (int j = 0; j < rank; ++j) {
-                smoother_->update_response(X.transpose() * S.col(j));
-                smoother_->fit(lambda.row(j));
-                F .col(j) = smoother_->f();
-                Fn.col(j) = smoother_->Psi() * smoother_->f();
-                pen = pen + smoother_->ftPf(lambda);
             }
             // prepare for next iteration
             n_iter++;
@@ -507,7 +400,56 @@ template <typename VariationalSolver> class fpca_direct_impl {
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
 };
-  
+
+
+// utilities to handle k-fold cross-validation in the case of missing data
+class k_fold_missing_cv_impl {
+private:
+    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
+    using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
+    using binary_t = BinaryMatrix<Dynamic, Dynamic>;
+    using fold_t = std::vector<std::pair<int, int>>;
+    using TrainTestPartition = std::pair<binary_t, binary_t>;
+
+    int n_folds_ = 5;
+    std::vector<fold_t> folds_;
+
+    // utility to generate non-overlapping folds
+    void generate_folds(const matrix_t& X, int K){
+        int n = X.rows(), m = X.cols();
+        std::vector<std::pair<int, int>> duplets;
+        // collect all observed (i, j) pairs
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < m; ++j)
+                if (!std::isnan(X(i, j))) duplets.emplace_back(i, j);
+        // shuffle once
+        std::shuffle(duplets.begin(), duplets.end(), std::default_random_engine{});
+        // partition into K folds
+        folds_.resize(K);
+        for (std::size_t i = 0; i < duplets.size(); ++i)
+            folds_[i % K].push_back(duplets[i]);
+    }
+
+public:
+    k_fold_missing_cv_impl(const matrix_t &X, int K) : n_folds_(K){
+        generate_folds(X, K);
+    }
+    //utility to access the i-th fold
+    TrainTestPartition split(const matrix_t& X, int fold_index){
+        int n = X.rows(), m = X.cols();
+        binary_t test_mask(n, m), train_mask(n, m);
+        for (int k = 0; k < folds_.size(); ++k) {
+            for (const auto& [i, j] : folds_[k]) {
+                if (k == fold_index)
+                    test_mask.set(i, j);
+                else
+                    train_mask.set(i, j);
+            }
+        }
+        return {train_mask, test_mask};
+    }
+};
+
 // class for handling nan
 template <typename fPCASolver> class fpca_na_impl {
    private:
@@ -530,7 +472,7 @@ template <typename fPCASolver> class fpca_na_impl {
         binary_t nan_pattern = na_matrix(X);   // compute missingness pattern
         n_locs_ = X.cols(), n_units_ = X.rows();
 
-        int calibration = (flag & 0b11110);   // detect calibration strategy
+        int calibration = (flag & 0b00110);   // detect calibration strategy
         std::vector<double> opt_lambda_mu(n_lambda);
         std::vector<double> opt_lambda_F(n_lambda);
 
@@ -553,9 +495,9 @@ template <typename fPCASolver> class fpca_na_impl {
                 std::copy(params.begin()+n_lambda, params.begin()+2*n_lambda, lambda_F.begin());
 
                 matrix_t U_init = U;
-                matrix_t center,F,S;
+                matrix_t center, F, S;
                 for (int k = 1; k <= rank; ++k) {
-                    const auto& [c, f, s] = solve_(X, nan_pattern, U, k, lambda_mu,lambda_F, flag & 0x1);
+                    const auto& [c, f, s] = solve_(X, nan_pattern, U, k, lambda_mu,lambda_F, flag & 0b1001);
                     U_init = s * f.transpose(); // reconstruction update
                     U_init.rowwise() += c.transpose();
                     center = c; S=s; F=f;
@@ -595,54 +537,20 @@ template <typename fPCASolver> class fpca_na_impl {
             opt_rank = rank; //optimal_lambdas[optimal_lambdas.size()-1];
         } break;
         case OptimizeMSRE: {
-            //Utilities to generate non-overlapping folds
-            using IndexList = std::vector<std::pair<int, int>>;
-            using TrainTestPartition = std::pair<BinaryMatrix<Dynamic>, BinaryMatrix<Dynamic>>;
-            // Function to generate K non-overlapping folds
-            auto generate_folds = [&](const matrix_t& X, int K) -> std::vector<IndexList> {
-                int n = X.rows(), m = X.cols();
-                std::vector<std::pair<int, int>> duplets;
-                // collect all observed (i, j) pairs
-                for (int i = 0; i < n; ++i)
-                    for (int j = 0; j < m; ++j)
-                        if (!std::isnan(X(i, j))) duplets.emplace_back(i, j);
-                // shuffle once
-                std::shuffle(duplets.begin(), duplets.end(), std::default_random_engine{});
-                // partition into K folds
-                std::vector<IndexList> folds(K);
-                for (std::size_t i = 0; i < duplets.size(); ++i)
-                    folds[i % K].push_back(duplets[i]);
-                return folds;
-            };
-            // Split function using precomputed folds
-            auto split = [&](const matrix_t& X,
-                             const std::vector<IndexList>& folds, int fold_index) -> TrainTestPartition {
-                int n = X.rows(), m = X.cols();
-                BinaryMatrix<Dynamic> test_mask(n, m), train_mask(n, m);
-                for (int k = 0; k < folds.size(); ++k) {
-                    for (const auto& [i, j] : folds[k]) {
-                        if (k == fold_index)
-                            test_mask.set(i, j);
-                        else
-                            train_mask.set(i, j);
-                    }
-                }
-                return {train_mask, test_mask};
-            };
-            std::vector<IndexList> folds = generate_folds(X, n_folds_);
+            auto k_fold_cv = k_fold_missing_cv_impl(X,n_folds_);
             // store the rmse estimated via KCV for each pair (lambda,rank)
             matrix_t rmse_table = matrix_t::Zero(lambda_grid.size(),rank);
             for(int i = 0; i < lambda_grid.size(); ++i) {
                 matrix_t mse_per_fold = matrix_t::Zero(n_folds_, rank);
                 for(int j = 0; j < n_folds_; ++j) {
-                    auto [train_mask, test_mask] = split(X, folds, j);
+                    auto [train_mask, test_mask] = k_fold_cv.split(X, j);
                     matrix_t X_train = train_mask.select(X,std::numeric_limits<double>::quiet_NaN());
                     binary_t train_nan_pattern = na_matrix(X_train);
                     // repeat for increasing rank
                     matrix_t U = matrix_t::Zero(n_units_, n_dofs_); //starting guess
                     for (int k = 1; k <= rank; ++k) {
-                        // TEMPORARY FIX, TO BE CORRECTED SOON.
-                        const auto& [mu, F, S] = solve_(X_train, train_nan_pattern, U,k, std::vector<double>{lambda_grid[i]},std::vector<double>{lambda_grid[i]}, flag & 0x1);
+                        // TEMPORARY FIX: std::vector<double>{double} is not nice
+                        const auto& [mu, F, S] = solve_(X_train, train_nan_pattern, U,k, std::vector<double>{lambda_grid[i]},std::vector<double>{lambda_grid[i]}, flag & flag & 0b1001);
                         U = S * F.transpose();
                         U.rowwise() += mu.transpose(); // reconstruction update
                         // check the loss for each k in {1,...,rank}
@@ -654,7 +562,6 @@ template <typename fPCASolver> class fpca_na_impl {
                 } //iteration over the folds
                 rmse_table.row(i) = mse_per_fold.colwise().mean();
             } // iteration over the lambda
-            std::cout << rmse_table << std::endl;
             rmse_table = rmse_table.array() / n_folds_;
             Eigen::Index opt_lambda_idx, opt_rank_idx;
             rmse_table.minCoeff(&opt_lambda_idx, &opt_rank_idx);
@@ -674,7 +581,7 @@ template <typename fPCASolver> class fpca_na_impl {
         // fit with optimal lambda
         //matrix_t U = matrix_t::Zero(n_units_, n_dofs_); //starting guess
         for (int k = 1; k <= opt_rank; ++k) {
-            const auto& [center, F, S] = solve_(X, nan_pattern, U,k, opt_lambda_mu,opt_lambda_F, flag & 0x1);
+            const auto& [center, F, S] = solve_(X, nan_pattern, U,k, opt_lambda_mu,opt_lambda_F, flag & flag & 0b1001);
             U = S * F.transpose(); // reconstruction update
             U.rowwise() += center.transpose();
             center_ = center;
@@ -698,78 +605,32 @@ template <typename fPCASolver> class fpca_na_impl {
     const matrix_t& lambda() const { return lambda_; }
    private:
 
-    template <typename LambdaT>
-        requires(internals::is_subscriptable<LambdaT, int>)
-    const matrix_t initial_matrix(const matrix_t& X, const binary_t& nan_pattern, const LambdaT lambda) {
-        using triplet_t = Eigen::Triplet<double>;
-        //construct the matrix of weights
-        std::vector<int> observed_indexes = nan_pattern.which(false);
-        //construct the B matrix: B = ...
-        matrix_t design_mat(n_units_,n_units_);
-        design_mat = matrix_t::Identity(n_units_,n_units_);
-        sparse_matrix_t B_full(n_units_*n_locs_, n_units_*n_dofs_);
-        B_full = kronecker(design_mat.sparseView(),smoother_.Psi());
-        //remove rows corresponding to unobserved data points
-        using triplet_t = Eigen::Triplet<double>;
-        std::vector<triplet_t> B_obs_triplets;
-        int n_obs = observed_indexes.size();
-        int n_cols = B_full.cols();
-        for (int i = 0; i < n_obs; ++i) {
-            int src_row = observed_indexes[i];
-            Eigen::SparseVector<double> row = B_full.row(src_row);
-            for (Eigen::SparseVector<double>::InnerIterator it(row); it; ++it) {
-                B_obs_triplets.emplace_back(i, it.index(), it.value());
-            }
-        }
-        sparse_matrix_t B_obs(n_obs, n_cols);
-        B_obs.setFromTriplets(B_obs_triplets.begin(), B_obs_triplets.end());
-        //construct the smoothing matrix
-        sparse_matrix_t diag_lambdas(n_units_,n_units_);
-        std::vector<triplet_t> lambda_triplets;
-        for (int i = 0; i < n_units_; ++i) {
-            lambda_triplets.emplace_back(i, i, lambda[0]);
-        }
-        diag_lambdas.setFromTriplets(lambda_triplets.begin(),lambda_triplets.end());
-        //smoothing matrix
-        SparseBlockMatrix<double, 2, 2> A(
-               B_obs.transpose()*B_obs,                            kronecker(diag_lambdas,smoother_.stiff()),
-               kronecker(diag_lambdas,smoother_.stiff()),  kronecker(-diag_lambdas,smoother_.mass())
-               );
-        using sparse_solver_t = internals::eigen_sparse_solver_movable_wrap<Eigen::SparseLU<sparse_matrix_t>>;
-        sparse_solver_t invA;
-        //using sparse block matrix
-        invA.compute(A);
-        if (invA.info() != Eigen::Success) {
-            throw std::runtime_error("Matrix factorization failed.");
-        }
-        //compute the vectorized X
-        vector_t vec_X_full = (~nan_pattern).select(X,0).reshaped<Eigen::RowMajor>();
-        vector_t vec_X_obs(observed_indexes.size());
-        for (int i = 0; i < observed_indexes.size(); ++i) {
-            vec_X_obs(i) = vec_X_full(observed_indexes[i]);
-        }
-        //solve the system: (B^TB + lambda(I_N kron_prod P))y = B^T e (where e is a sampled vector)
-        vector_t target = vector_t::Zero(2*B_obs.cols());
-        target.head(B_obs.cols()) = B_obs.transpose()*vec_X_obs;
-        vector_t y = invA.solve(target);
-        vector_t solution = y.head(B_obs.cols());
-        //compute the initialisation
-        matrix_t U(n_units_,n_dofs_);
-        U = Eigen::Map<Eigen::Matrix<double,Dynamic,Dynamic,Eigen::RowMajor>>(solution.data(), n_units_, n_dofs_);
-        return U;
-    }
     // the solve_ method implements the MM scheme (the rank recursion is performed during the fit)
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, const binary_t& nan, const matrix_t& U0, int rank, const LambdaT lambda_mu, const LambdaT lambda_F, int flag) {
-        std::cout <<  "Lambda: " << lambda_mu[0] << std::endl;
-        std::cout <<  "Rank: " << rank << std::endl;
+        std::cout << "Lambda: " << lambda_mu[0] << std::endl;
+        std::cout << "Rank: " << rank << std::endl;
         for (int i = 0; i < lambda_mu.size(); ++i) { fdapde_assert(lambda_mu[i] > 0); fdapde_assert(lambda_F[i] > 0);}
         vector_t center(n_dofs_);
         matrix_t F(n_dofs_ , rank);
 	    matrix_t S(n_units_, rank);
         matrix_t U = U0;
 	    matrix_t Un = U * smoother_.Psi().transpose();
+        // define the mean function used to center the data in the mean estimation step
+        std::function<vector_t(const matrix_t &, double)> mean_functor;
+        bool computeMean = !(flag & DoNotComputeMean);
+        if (computeMean) {
+            mean_functor = [&](const matrix_t& X, double lambda) {
+                smoother_.update_response(X.colwise().mean().transpose());
+                smoother_.fit(lambda_mu[0]);
+                return smoother_.f();
+            };
+        } else {
+            mean_functor = [&](const matrix_t& X, double lambda) {
+                return vector_t::Zero(n_dofs_);
+            };
+        }
         // iterate until the MM scheme converges
         int n_iter = 0;
         double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
@@ -777,12 +638,13 @@ template <typename fPCASolver> class fpca_na_impl {
             // imputation update
             matrix_t Xn = (~nan).select(X, Un);
             // smooth mean estimation
-            smoother_.update_response(Xn.colwise().mean().transpose());
-            smoother_.fit(lambda_mu[0]);
-            const auto mu = smoother_.f();
-            Xn.rowwise() -= (smoother_.Psi() * mu).transpose();
-            // Xn.rowwise() -= Xn.colwise().mean();;
+            // smoother_.update_response(Xn.colwise().mean().transpose());
+            // smoother_.fit(lambda_mu[0]);
+            // const auto mu = smoother_.f();
+            // Xn.rowwise() -= (smoother_.Psi() * mu).transpose();
 
+            const auto mu = mean_functor(Xn, lambda_mu[0]);
+            Xn.rowwise() -= (smoother_.Psi() * mu).transpose();
             // rank-k fPCA on imputed data
             auto [f, s] = fpca_->fit(Xn.transpose(), rank, lambda_F, flag & 0x1); //always run with no calibration
             // return orthogonal scores
@@ -1004,6 +866,7 @@ template <typename VariationalSolver> class fPCA {
     }
     // observers
     const vector_t& center() const { return center_;} // mean vector
+    const vector_t& center_locs() const { return smoother_.Psi() * center_;} // mean vector
     const matrix_t& S() const { return s_; }   // scoring matrix
     const matrix_t& F() const { return f_; }   // loading matrix
     matrix_t Fn() const { return smoother_.Psi() * f_; }
