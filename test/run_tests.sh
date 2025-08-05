@@ -27,7 +27,7 @@ clean_build_dir()
 ## parse command line inputs
 SHORT=m,c:,h
 LONG=memcheck,compiler:,help
-OPTS=$(getopt -a --n "$SCRIPT_NAME" --options $SHORT --longoptions $LONG -- "$@") 
+OPTS=$(getopt -a --n "$SCRIPT_NAME" --options $SHORT --longoptions $LONG -- "$@")
 
 eval set -- "$OPTS"
 

@@ -609,8 +609,6 @@ template <typename fPCASolver> class fpca_na_impl {
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, const binary_t& nan, const matrix_t& U0, int rank, const LambdaT lambda_mu, const LambdaT lambda_F, int flag) {
-        std::cout << "Lambda: " << lambda_mu[0] << std::endl;
-        std::cout << "Rank: " << rank << std::endl;
         for (int i = 0; i < lambda_mu.size(); ++i) { fdapde_assert(lambda_mu[i] > 0); fdapde_assert(lambda_F[i] > 0);}
         vector_t center(n_dofs_);
         matrix_t F(n_dofs_ , rank);
@@ -658,9 +656,8 @@ template <typename fPCASolver> class fpca_na_impl {
             if (almost_equal(Jnew, Jold, tol_) || n_iter == max_iter_) {
                 center = mu; F = f; S = s;
             }
-            std::cout << "Iter " << n_iter << ", improvement: " << (std::fabs(Jnew) < std::fabs(Jold) ? std::fabs(Jnew-Jold)/Jold : std::fabs(Jnew-Jold)/Jnew) << std::endl;
         }
-        if (n_iter>=max_iter_){ std::cout << "convergence issues, relative error: " <<  (std::fabs(Jnew) < std::fabs(Jold) ? std::fabs(Jnew-Jold)/Jold : std::fabs(Jnew-Jold)/Jnew) << std::endl;}
+        if (n_iter>=max_iter_){ std::cout << "Convergence issues, relative error: " <<  (std::fabs(Jnew) < std::fabs(Jold) ? std::fabs(Jnew-Jold)/Jold : std::fabs(Jnew-Jold)/Jnew) << std::endl;}
 	    return std::make_tuple(center, F, S);
     }
     // compute the effective degrees of freedom of the method (assume a unique lambda)
@@ -736,7 +733,7 @@ template <typename fPCASolver> class fpca_na_impl {
     matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
 
     // MM scheme parameters
-    double tol_ = 1e-5;
+    double tol_ = 1e-4;
     int max_iter_ = 100;
 };
 
