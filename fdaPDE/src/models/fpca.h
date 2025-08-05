@@ -429,13 +429,12 @@ private:
         for (std::size_t i = 0; i < duplets.size(); ++i)
             folds_[i % K].push_back(duplets[i]);
     }
-
 public:
     k_fold_missing_cv_impl(const matrix_t &X, int K) : n_folds_(K){
         generate_folds(X, K);
     }
     //utility to access the i-th fold
-    TrainTestPartition split(const matrix_t& X, int fold_index){
+    std::pair<binary_t, binary_t> split(const matrix_t& X, int fold_index){
         int n = X.rows(), m = X.cols();
         binary_t test_mask(n, m), train_mask(n, m);
         for (int k = 0; k < folds_.size(); ++k) {
@@ -497,16 +496,15 @@ template <typename fPCASolver> class fpca_na_impl {
                 matrix_t U_init = U;
                 matrix_t center, F, S;
                 for (int k = 1; k <= rank; ++k) {
-                    const auto& [c, f, s] = solve_(X, nan_pattern, U, k, lambda_mu,lambda_F, flag & 0b1001);
+                    const auto& [c, f, s] = solve_(X, nan_pattern, U_init, k, lambda_mu,lambda_F, flag & 0b1001);
                     U_init = s * f.transpose(); // reconstruction update
                     U_init.rowwise() += c.transpose();
                     center = c; S=s; F=f;
                 }
-                auto start_gcv = std::chrono::high_resolution_clock::now();
-                double gcv = gcv_(X, nan_pattern, center.col(0), S, F, rank, lambda_mu, lambda_F);
-                auto end_gcv = std::chrono::high_resolution_clock::now();
-                std::chrono::duration<double, std::milli> elapsed = end_gcv - start_gcv;
-                std::cout << "Elapsed time GCV: " << elapsed.count() << " ms\n";
+                double edf = edf_(nan_pattern, center.col(0), S, F, rank, lambda_mu,lambda_F);
+                double dor = n_units_*n_locs_ - edf;
+                double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * (~nan_pattern).select(X - U_init*smoother_.Psi().transpose(), 0).squaredNorm();;
+
                 return gcv;
             };
             Eigen::Matrix<double, Dynamic, Dynamic, Eigen::RowMajor> grid_2D(lambda_grid.size(), 2);
@@ -516,7 +514,6 @@ template <typename fPCASolver> class fpca_na_impl {
                     //for(int k = 1; k <= rank; k++){
                         grid_2D(idx, 0) = lambda_grid[i];
                         grid_2D(idx, 1) = lambda_grid[i];
-                        //grid_3D(idx, 2) = k;
                         ++idx;
                     //}
                 //}
@@ -524,13 +521,12 @@ template <typename fPCASolver> class fpca_na_impl {
             //optimize over the grid
             GridOptimizer<2> optimizer;
             auto optimal_lambdas = optimizer.optimize(gcv_functor,grid_2D);
-            matrix_t gcv_table(lambda_grid.size(),1);
+            // resize to have shape: grid_sz-by-n_lambda
+            gcv_scores_.resize(lambda_grid.size(),1);
             for (int i = 0; i < lambda_grid.size(); ++i) {
-                //for (int j = 0; j < lambda_grid.size(); j++)
-                {
-                    gcv_table(i, 0) = optimizer.values()[i];
-                }
-                //
+                //for (int j = 0; j < lambda_grid.size(); j++){
+                    gcv_scores_(i, 0) = optimizer.values()[i];
+                //}
             }
             std::copy(optimal_lambdas.begin(), optimal_lambdas.begin()+n_lambda, opt_lambda_mu.begin());
             std::copy(optimal_lambdas.begin()+n_lambda, optimal_lambdas.begin()+2*n_lambda, opt_lambda_F.begin());
@@ -567,6 +563,9 @@ template <typename fPCASolver> class fpca_na_impl {
             rmse_table.minCoeff(&opt_lambda_idx, &opt_rank_idx);
             opt_lambda_mu = opt_lambda_F = std::vector<double>{lambda_grid[opt_lambda_idx]};
             opt_rank = opt_rank_idx + 1; //rank grid is always {1,...,rank}
+            // gcv scores (not really gcv, just kcv)
+            gcv_scores_.resize(lambda_grid.size(),1);
+            gcv_scores_.col(0) = rmse_table.col(opt_rank_idx);
         } break;
         default: {
             throw std::runtime_error("Unrecognized calibration option.");
@@ -603,6 +602,7 @@ template <typename fPCASolver> class fpca_na_impl {
     const matrix_t& loading() const { return f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
+    const matrix_t& gcv_scores() const { return gcv_scores_; }
    private:
 
     // the solve_ method implements the MM scheme (the rank recursion is performed during the fit)
@@ -637,17 +637,11 @@ template <typename fPCASolver> class fpca_na_impl {
         while (!almost_equal(Jnew, Jold, tol_) && n_iter < max_iter_) {
             // imputation update
             matrix_t Xn = (~nan).select(X, Un);
-            // smooth mean estimation
-            // smoother_.update_response(Xn.colwise().mean().transpose());
-            // smoother_.fit(lambda_mu[0]);
-            // const auto mu = smoother_.f();
-            // Xn.rowwise() -= (smoother_.Psi() * mu).transpose();
-
             const auto mu = mean_functor(Xn, lambda_mu[0]);
             Xn.rowwise() -= (smoother_.Psi() * mu).transpose();
             // rank-k fPCA on imputed data
             auto [f, s] = fpca_->fit(Xn.transpose(), rank, lambda_F, flag & 0x1); //always run with no calibration
-            // return orthogonal scores
+            // return orthonormal scores
             for (int i = 0; i < rank; ++i) {
                 s.col(i) = s.col(i) / fpca_->loadings_norm()[i];
                 f.col(i) = f.col(i) * fpca_->loadings_norm()[i];
@@ -658,9 +652,9 @@ template <typename fPCASolver> class fpca_na_impl {
             n_iter++;
             Jold = Jnew;
             Un = U * smoother_.Psi().transpose();
-            Jnew = ((~nan).select(X - Un, 0)).squaredNorm() +
-                n_units_*mu.transpose()*smoother_.P(lambda_mu)*mu +
-                (f.transpose() * smoother_.P(lambda_F) * f).trace();
+            Jnew = ((~nan).select(X - Un, 0)).squaredNorm() + n_units_*mu.transpose()*smoother_.P(lambda_mu)*mu + (f.transpose() * smoother_.P(lambda_F) * f).trace();
+            //double edf = edf_(nan, mu, S, F, rank, lambda_F);
+            //Jnew = n_units_*n_locs_*((~nan).select(X - Un, 0)).squaredNorm()/std::pow(n_units_*n_locs_ - edf,2);
             if (almost_equal(Jnew, Jold, tol_) || n_iter == max_iter_) {
                 center = mu; F = f; S = s;
             }
@@ -669,16 +663,15 @@ template <typename fPCASolver> class fpca_na_impl {
         if (n_iter>=max_iter_){ std::cout << "convergence issues, relative error: " <<  (std::fabs(Jnew) < std::fabs(Jold) ? std::fabs(Jnew-Jold)/Jold : std::fabs(Jnew-Jold)/Jnew) << std::endl;}
 	    return std::make_tuple(center, F, S);
     }
-    // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f) and returns the GCV index
+    // compute the effective degrees of freedom of the method (assume a unique lambda)
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
-    double gcv_(const matrix_t& X, const binary_t& nan_pattern, const vector_t& center, const matrix_t& S, const matrix_t& F, int rank, const LambdaT lambda_mu, const LambdaT lambda_F) {
-        int r = 100; //number of mc simultations
+    double edf_(const binary_t& nan_pattern, const vector_t& center, const matrix_t& S, const matrix_t& F, int rank, const LambdaT lambda_mu, const LambdaT lambda_F) {
         matrix_t U = S * F.transpose(); // reconstruction
         U.rowwise() += center.transpose();
         using triplet_t = Eigen::Triplet<double>;
         //construct the matrix of weights
-        std::vector<int> observed_indexes = nan_pattern.which(false);
+        std::vector<int> observed_indexes = nan_pattern.which(false); // rowmajor ordering
         std::vector<triplet_t> Dwt_triplets;
         for (int i=0; i <observed_indexes.size(); i++) Dwt_triplets.emplace_back(observed_indexes[i],observed_indexes[i],1.0);
         sparse_matrix_t Dwt(n_units_*n_locs_, n_units_*n_locs_);
@@ -711,9 +704,9 @@ template <typename fPCASolver> class fpca_na_impl {
         //sample from the rademacher distribution
         std::mt19937 rng(random_seed);
         rademacher_distribution rademacher;
-        matrix_t Us(B.rows(), r);
+        matrix_t Us(B.rows(), n_mc_samples_);
         for (int i = 0; i < B.rows(); ++i) {
-            for (int j = 0; j < r; ++j) { Us(i, j) = rademacher(rng); }
+            for (int j = 0; j < n_mc_samples_; ++j) { Us(i, j) = rademacher(rng); }
         }
         //solve the system: (B^TB + lambda(I_N kron_prod P))y = B^T e (where e is a sampled vector)
         using sparse_solver_t = eigen_sparse_solver_movable_wrap<Eigen::SparseLU<sparse_matrix_t>>;
@@ -721,21 +714,18 @@ template <typename fPCASolver> class fpca_na_impl {
         //using sparse block matrix
         invA.compute(A);
         //building the target
-        matrix_t target = matrix_t::Zero(2*B.cols(),r);
+        matrix_t target = matrix_t::Zero(2*B.cols(),n_mc_samples_);
         target.topRows(B.cols()) = B.transpose()*Dwt*Us;
         matrix_t y = invA.solve(target);
         //compute e^T*S_m(lambda)*y and estimate the trace by averaging these values
         double trS = 0.0;   // monte carlo Tr[S_m] approximation
-        for (int i = 0; i < r; ++i) { trS += Us.col(i).dot(B*y.topRows(B.cols()).col(i)); }
-        trS =  trS / r;
-        //finally compute the GCV using the estimated dof of the model given by the estimated trace of smoothing matrix
-        double dor = n_units_*n_locs_ -  trS;
-        double mse = (~nan_pattern).select(X - U*smoother_.Psi().transpose(), 0).squaredNorm();
-        double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * mse;
-        return gcv;
+        for (int i = 0; i < n_mc_samples_; ++i) { trS += Us.col(i).dot(B*y.topRows(B.cols()).col(i)); }
+        trS =  trS / n_mc_samples_;
+        return trS;
     }
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
     int n_folds_ = 5;
+    int n_mc_samples_ = 100;       // to estimate the trace of the smoothing matrix
     fpca_t* fpca_;
     smoother_t smoother_;
     vector_t center_;              // mean expansion coefficient vector
@@ -743,6 +733,7 @@ template <typename fPCASolver> class fpca_na_impl {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
+    matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
 
     // MM scheme parameters
     double tol_ = 1e-5;
@@ -825,6 +816,7 @@ template <typename VariationalSolver> class fPCA {
         s_.resize(n_units_, rank);
         f_norm_.resize(rank);
         lambda_.resize(n_lambda, rank);
+        gcv_scores_.resize(lambda_grid.size(),1);
 	    // dispatch to processing logic
         if (has_nan_) {
             // default to OptimMSRE calibration, if no calibration provided
@@ -836,6 +828,7 @@ template <typename VariationalSolver> class fPCA {
             s_ = std::move(s);
             f_norm_ = solver_.loadings_norm();
             lambda_ = mm_scheme.lambda();
+            gcv_scores_ = mm_scheme.gcv_scores();
         } else {
             // default to OptimGCV calibration, if no calibration provided
             if (lambda_grid.size() > n_lambda && (flag & 0b11110) == 0) { flag = flag | OptimizeGCV; }
@@ -872,6 +865,8 @@ template <typename VariationalSolver> class fPCA {
     matrix_t Fn() const { return smoother_.Psi() * f_; }
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
+    const matrix_t& gcv_scores() const { return gcv_scores_; }
+
    private:
     data_t data_;           // mapped geoframe data
     smoother_t smoother_;   // variational solver used in the smoothing step
@@ -883,6 +878,7 @@ template <typename VariationalSolver> class fPCA {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated components
     matrix_t lambda_;              // selected level of smoothing for each component
+    matrix_t gcv_scores_;          // gcv scores (#lambda_grid-by-rank matrix)
 };
 
 // deduction guide
