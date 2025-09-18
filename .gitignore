@@ -32,10 +32,10 @@ cmake-build-debug/
 .Rproj.user
 
 #experiments
-experiments/
-!experiments/**/*.cpp
-!experiments/**/*.Rmd
-!experiments/**/*.json
+experiments/**/*.csv
+experiments/data
+
+
 *.Rproj
 
 .Rproj.user

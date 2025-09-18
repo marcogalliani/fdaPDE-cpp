@@ -7,16 +7,6 @@ using namespace fdapde;
 #include "nlohmann/json.hpp"
 using nlohmann::json;
 
-Eigen::MatrixXd align_columns_by_sign(const Eigen::MatrixXd& reference, Eigen::MatrixXd target) {
-    for (int col = 0; col < reference.cols(); ++col) {
-        double dot_product = reference.col(col).dot(target.col(col));
-        if (dot_product < 0) {
-            target.col(col) *= -1;
-        }
-    }
-    return target;
-}
-
 int main() {
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
@@ -46,42 +36,15 @@ int main() {
     data_path = std::filesystem::relative(data_path, std::filesystem::current_path());
     // load the data matrix (assume that X is an (n_units,n_locs) data matrix)
     matrix_t X = read_csv<double>(data_path + "/y.csv").as_matrix();
-    binary_t nan_pattern = na_matrix(X);
     int n_units = X.rows(), n_locs = X.cols();
     matrix_t locs = read_csv<double>(data_path + "/locs.csv").as_matrix(); // (n_locs,2)-matrix
-    matrix_t repeated_locs = kronecker(locs, vector_t::Ones(n_units));
 
-    //(1) centering
-    vector_t col_sums_X = (~nan_pattern).select(X,0).colwise().sum();
-    vector_t col_nobs_X = (~nan_pattern).select(matrix_t::Ones(n_units,n_locs),0).colwise().sum();
-    vector_t col_means_X = col_sums_X.array() / col_nobs_X.array();
-
-    GeoFrame data(D);
-    vector_t vec_X = X.reshaped(); //default to column-major (as we want)
-    auto& l_rep_locs = data.insert_scalar_layer<POINT>("repeated_locs_layer", repeated_locs);
-    l_rep_locs.load_vec("y",vec_X);
-    // auto& l_locs = data.insert_scalar_layer<POINT>("locs_layer", locs);
-    // l_locs.load_vec("y",col_means_X);
-    //smooth the pointwise mean
-    SRPDE center("y ~ f", data, fe_ls_elliptic(a, F));
-    // calibration
-    std::vector<double> center_grid;
-    for (double x = -6.0; x <= 2.0; x += 0.5) { center_grid.push_back(std::pow(10, x) / data[0].rows()); }
-    GridOptimizer<1> opt;
-    opt.optimize(center.gcv(), center_grid);
-
-    // fit at optimal smoothing level
-    center.fit(opt.optimum());
-    std::cout << opt.optimum()[0] << std::endl;
-
-    //(2) fPCA
-    //compute and load the centred data
+    binary_t nan_pattern = na_matrix(X);
     sparse_matrix_t Psi = internals::point_basis_eval(Vh, locs);
-    matrix_t X_c = X.rowwise() - (Psi*center.f()).transpose();
-
-    GeoFrame centred_data(D);
+    GeoFrame centred_data(D); //unfortunately we need a new GeoFrame
     auto& l_locs = centred_data.insert_scalar_layer<POINT>("locs_layer", locs);
-    l_locs.load_blk("X", X_c.transpose());
+    //l_locs.load_blk("X", X_c.transpose());
+    l_locs.load_blk("X", X.transpose());
 
     fPCA fpca("X", centred_data, fe_ls_elliptic(a, F));
 
@@ -89,15 +52,16 @@ int main() {
     fpca.fit(
         /* n_comp = */ json_file["RunParams"].value("n_pc",6),
         lambda_grid,
-        /* options = */ ComputeRandSVD | OptimizeGCV,
+        /* options = */ ComputeRandSVD | OptimizeMSRE,
         fpca_subspace_solver()
     );
 
     // save results
     std::string results_path = "test-results/";
+
     //(1) functional mean ()
-    write_csv(results_path + "center.csv", center.f()); //at nodes
-    write_csv(results_path + "center_locs.csv", Psi*center.f()); //at locs
+    write_csv(results_path + "center.csv", fpca.center()); //at nodes
+    write_csv(results_path + "center_locs.csv", Psi*fpca.center()); //at locs
     //(2) functional PCs
     write_csv(results_path + "loadings.csv", fpca.F()); //at nodes
     write_csv(results_path + "loadings_locs.csv", fpca.Fn()); //at locs
@@ -105,16 +69,18 @@ int main() {
     write_csv(results_path + "scores.csv", fpca.S());
     //(4) reconstructed functional data
     matrix_t rec_X = fpca.S()*fpca.F().transpose();
-    rec_X = rec_X.rowwise() + center.f().transpose();
+    rec_X = rec_X.rowwise() + fpca.center().transpose();
     write_csv(results_path + "reconstruction.csv", rec_X); //at nodes
     matrix_t rec_X_locs = fpca.S()*fpca.Fn().transpose();
-    rec_X_locs = rec_X_locs.rowwise() + (Psi*center.f()).transpose();
+    rec_X_locs = rec_X_locs.rowwise() + (Psi*fpca.center()).transpose();
     write_csv(results_path + "reconstruction_at_locs.csv", rec_X_locs); //at locs
     //(5) imputation
     matrix_t X_imputed = (~nan_pattern).select(X,0) + (nan_pattern).select(rec_X_locs,0);
     write_csv(results_path + "imputation.csv", X_imputed);
     //(6) lambda
     write_csv(results_path + "lambda.csv", fpca.lambda());
+    //(7) gcv scores
+    write_csv(results_path + "gcv_scores.csv", fpca.gcv_scores());
 
     return 0;
 }
