@@ -633,7 +633,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
     double gcv_(const matrix_t& X, int rank, const LambdaT lambda, int flag) {
         const auto& [F, S] = solve_(X, rank, lambda, flag);
         if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
-            edf_map_[lambda] = invD_.squaredNorm();
+            edf_map_[lambda] = (invD_*smoother_->Psi().transpose()).squaredNorm();
         }
         // evaluate GCV index at convergence (note that Tr[S] = \|D^(-1)\|_F^2)
         int dor = n_locs_ - edf_map_.at(lambda);
