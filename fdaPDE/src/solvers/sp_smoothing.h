@@ -20,9 +20,13 @@ struct sp_smoothing {
     template <typename DataLocs>
     static constexpr bool is_valid_data_locs_descriptor_v =
       std::is_same_v<DataLocs, matrix_t> || std::is_same_v<DataLocs, binary_t>;
-    template <typename InfoT> struct is_valid_info_t {
-        static constexpr bool value = requires(InfoT info) { info.penalty; };
+    template <typename Penalty> struct is_valid_penalty {
+        static constexpr bool value = requires(Penalty penalty) {
+            penalty.bilinear_form();
+            penalty.linear_form();
+        };
     };
+    template <typename Penalty> static constexpr bool is_valid_penalty_v = is_valid_penalty<Penalty>::value;
 
     // evaluate basis at locations (point or areal)
     template <typename DataLocs>
@@ -43,12 +47,7 @@ struct sp_smoothing {
         switch (gf.category(0)[0]) {
             case ltype::point: {
                 const auto& spatial_index = geo_index_cast<0, POINT>(gf[0]);
-                if (spatial_index.points_at_dofs()) {
-                    Psi_.resize(n_locs_, n_dofs_);
-                    Psi_.setIdentity();
-                } else {
-                    Psi_ = point_eval_(spatial_index.coordinates());
-                }
+                Psi_ = point_eval_(spatial_index.coordinates());
                 D_ = vector_t::Ones(n_locs_).asDiagonal();
                 break;
             }
@@ -69,37 +68,37 @@ struct sp_smoothing {
 
     sp_smoothing() noexcept = default;
     // construct from formula + geoframe
-    template <typename GeoFrame, typename InfoT, typename WeightMatrix>
-        requires(is_valid_info_t<InfoT>::value)
-    sp_smoothing(const std::string& formula, const GeoFrame& gf, InfoT&& info, const WeightMatrix& W) : W_(W) {
+    template <typename GeoFrame, typename Penalty, typename WeightMatrix>
+        requires(is_valid_penalty_v<Penalty>)
+    sp_smoothing(const std::string& formula, const GeoFrame& gf, Penalty&& penalty, const WeightMatrix& W) : W_(W) {
         fdapde_static_assert(GeoFrame::Order == 1, THIS_CLASS_IS_FOR_ORDER_ONE_GEOFRAMES_ONLY);
         fdapde_assert(gf.n_layers() == 1);
         n_obs_  = gf[0].rows();
         n_locs_ = n_obs_;
 
-        discretize(info.penalty);
+        discretize(penalty);
         analyze_data(formula, gf, W);
     }
-    template <typename GeoFrame, typename InfoT>
-        requires(is_valid_info_t<InfoT>::value)
-    sp_smoothing(const std::string& formula, const GeoFrame& gf, InfoT&& info) :
-        sp_smoothing(formula, gf, info, vector_t::Ones(gf[0].rows()).asDiagonal()) { }
+    template <typename GeoFrame, typename Penalty>
+        requires(is_valid_penalty_v<Penalty>)
+    sp_smoothing(const std::string& formula, const GeoFrame& gf, Penalty&& penalty) :
+        sp_smoothing(formula, gf, penalty, vector_t::Ones(gf[0].rows()).asDiagonal()) { }
     // construct with no data
-    template <typename GeoFrame, typename InfoT, typename WeightMatrix>
-        requires(is_valid_info_t<InfoT>::value)
-    sp_smoothing(const GeoFrame& gf, InfoT&& info, const WeightMatrix& W) : W_(W) {
+    template <typename GeoFrame, typename Penalty, typename WeightMatrix>
+        requires(is_valid_penalty_v<Penalty>)
+    sp_smoothing(const GeoFrame& gf, Penalty&& penalty, const WeightMatrix& W) : W_(W) {
         fdapde_static_assert(GeoFrame::Order == 1, THIS_CLASS_IS_FOR_ORDER_ONE_GEOFRAMES_ONLY);
         fdapde_assert(gf.n_layers() == 1);
         n_obs_  = gf[0].rows();
         n_locs_ = n_obs_;
 
-        discretize(info.penalty);
+        discretize(penalty);
         eval_basis_at_(gf);
     }
-    template <typename GeoFrame, typename InfoT>
-        requires(is_valid_info_t<InfoT>::value)
-    sp_smoothing(const GeoFrame& gf, InfoT&& info) :
-        sp_smoothing(gf, info, vector_t::Ones(gf[0].rows()).asDiagonal()) { }
+    template <typename GeoFrame, typename Penalty>
+        requires(is_valid_penalty_v<Penalty>)
+    sp_smoothing(const GeoFrame& gf, Penalty&& penalty) :
+        sp_smoothing(gf, penalty, vector_t::Ones(gf[0].rows()).asDiagonal()) { }
 
     // discretization: assemble R1 and basis evaluation handles
     template <typename Penalty> void discretize(Penalty&& penalty) {
@@ -112,6 +111,10 @@ struct sp_smoothing {
         const LinearForm&   linear_form   = penalty.linear_form();
         n_dofs_ = bilinear_form.n_dofs();
         // assemble penalty (stiffness) R1 and forcing u (if provided)
+        auto& space = bilinear_form.trial_space();
+        TrialFunction u(space);
+        TestFunction  v(space);
+        R0_ = integral(space.triangulation())(u * v).assemble();
         R1_ = bilinear_form.assemble();
         u_  = linear_form.assemble();
 
@@ -366,7 +369,7 @@ struct sp_smoothing {
     int n_dofs() const { return n_dofs_; }
     int n_obs() const { return n_obs_;}
     const binary_t& nan_pattern() const { return nan_pattern_; }
-    const sparse_matrix_t mass() const { sparse_matrix_t R0_(n_dofs_,n_dofs_); R0_.setIdentity(); return R0_; }
+    const sparse_matrix_t mass() const { return R0_; }
     const sparse_matrix_t& stiff() const { return R1_; }
     const sparse_matrix_t& Psi() const { return Psi_; }
     const sparse_matrix_t& PsiNA() const { return B_.has_value() ? *B_ : Psi_; }
@@ -391,6 +394,7 @@ struct sp_smoothing {
     std::optional<matrix_t> Ys_, Bs_, Us_;
 
     int n_dofs_ = 0, n_locs_ = 0, n_obs_ = 0, n_covs_ = 0;
+    sparse_matrix_t R0_;    // n_dofs x n_dofs matrix [R0]_{ij} = \int_D \psi_i * \psi_j
     sparse_matrix_t R1_;    // n_dofs x n_dofs matrix [R1]_{ij} = \int_D a(\psi_i, \psi_j)
     vector_t u_;            // n_dofs x 1 vector u_i = \int_D u * \psi_i (not used for spline smoother?)
     sparse_matrix_t Psi_;   // n_obs x n_dofs

@@ -32,7 +32,7 @@ TEST(sr, test_01) {
     Triangulation<1,1> T = Triangulation<1,1>::UnitInterval(101);
     // data
     GeoFrame data(T);
-    auto& l1 = data.insert_scalar_layer<POINT>("l1", T.nodes());
+    auto& l1 = data.insert_scalar_layer<POINT>("l1", MESH_NODES);
     l1.load_csv<double>("../data/sr/1D_test1/y.csv");
     // physics
     BsSpace Bh(T, 3);   // cubic B-splines
@@ -61,7 +61,7 @@ TEST(sr, test_02) {
     Triangulation<1,1> T = Triangulation<1,1>::UnitInterval(101);
     // data
     GeoFrame data(T);
-    auto& l1 = data.insert_scalar_layer<POINT>("l1", T.nodes());
+    auto& l1 = data.insert_scalar_layer<POINT>("l1", MESH_NODES);
     l1.load_csv<double>("../data/sr/1D_test1/y.csv");
     // physics
     BsSpace Bh(T, 3);   // cubic B-splines
