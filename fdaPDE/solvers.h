@@ -36,7 +36,8 @@ struct de_solver { };
 // least square solvers
 #include "src/solvers/fe_ls_elliptic.h"
 #include "src/solvers/fe_ls_separable.h"
-#include "src/solvers/fe_ls_parabolic.h"
+#include "src/solvers/bs_ls.h"
+#include "src/solvers/sp_smoothing.h"
 
 // density estimation solvers
 #include "src/solvers/fe_de_elliptic.h"

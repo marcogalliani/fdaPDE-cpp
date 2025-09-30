@@ -138,7 +138,6 @@ TEST(sr, test_04) {
     for (int i = 0; i < 13; ++i) { lambda_grid[i] = std::pow(10, -6.0 + 0.25 * i) / data[0].rows(); }
     GridSearch<1> optimizer;
     optimizer.optimize(m.gcv(100, 476813), lambda_grid);
-
     EXPECT_TRUE(almost_equal<double>(optimizer.values(), "../data/sr/04/gcvs.mtx"));
 }
 
