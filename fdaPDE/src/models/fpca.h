@@ -17,7 +17,11 @@
 #ifndef __FPCA_H__
 #define __FPCA_H__
 
+#include <Eigen/src/SparseCholesky/SimplicialCholesky.h>
+
 #include "header_check.h"
+#include "fdaPDE/utility.h"
+#include "fdaPDE/src/linear_algebra/lumping.h"
 
 namespace fdapde {
 
@@ -283,6 +287,8 @@ template <typename VariationalSolver> class fpca_direct_impl {
    private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
+    using diag_matrix_t = Eigen::DiagonalMatrix<double, Dynamic, Dynamic>;
+    using sparse_matrix_t = Eigen::SparseMatrix<double, Dynamic, Dynamic>;
    public:
     using smoother_t = std::decay_t<VariationalSolver>;
     static constexpr int n_lambda = smoother_t::n_lambda;
@@ -342,13 +348,14 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, int rank, const LambdaT& lambda, int flag) {
         for (int i = 0; i < lambda.size(); ++i) { fdapde_assert(lambda[i] > 0); }
-        matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_->P(lambda);
+        diag_matrix_t lumped_mass = lump(smoother_->mass());
+        sparse_matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_.stiffness()*lumped_mass.cwiseInverse()*smoother_->stiffness();
         // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
-        Eigen::LLT<matrix_t> chol(C);
+        Eigen::SimplicialLLT<sparse_matrix_t> chol(C);
         invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_));
         // compute SVD of X * \Psi * (D^{-1})^\top
         matrix_t V, s;
-	vector_t singularValues;
+	    vector_t singularValues;
         if (flag & ComputeRandSVD) {
             RSI<matrix_t> svd(X * smoother_->Psi() * invD_.transpose(), rank);
             V = std::move(svd.matrixV());
