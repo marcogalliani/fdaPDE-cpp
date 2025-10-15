@@ -28,6 +28,7 @@ class SRPDE {
     using solver_t = std::decay_t<VariationalSolver>;
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
+    using binary_t = BinaryMatrix<Dynamic, Dynamic>;
     using sparse_matrix_t = Eigen::SparseMatrix<double>;
     static constexpr int n_lambda = solver_t::n_lambda;
    public:
@@ -44,8 +45,8 @@ class SRPDE {
     void analyze_data(const std::string& formula, const GeoFrame& gf, const WeightMatrix& W) {
         fdapde_assert(gf.n_layers() == 1);
         Formula formula_(formula);
-	n_obs_  = gf[0].rows();
-	n_covs_ = 0;
+        n_obs_  = gf[0].rows();
+        n_covs_ = 0;
         for (const std::string& token : formula_.rhs()) {
             if (gf.contains(token)) { n_covs_++; }
         }
@@ -63,6 +64,7 @@ class SRPDE {
     int n_covs() const { return n_covs_; }
     int n_obs() const { return n_obs_; }
     double edf(int r = 100, int seed = random_seed) { return solver_.edf(r, seed); }
+    const binary_t& nan_pattern() const { return solver_.nan_pattern();}
     const vector_t& response() const { return solver_.response(); }
     const matrix_t& design_matrix() const { return solver_.design_matrix(); }
     const sparse_matrix_t& weights() const { return solver_.weights(); }
@@ -351,6 +353,10 @@ class SRPDE {
 template <typename GeoFrame, typename Penalty>
 SRPDE(const std::string& formula, const GeoFrame& gf, Penalty&& solver)
   -> SRPDE<typename std::decay_t<Penalty>::solver_t>;
+
+template <typename GeoFrame, typename Penalty, typename WeightMatrix>
+SRPDE(const std::string& formula, const GeoFrame& gf, Penalty&& solver, const WeightMatrix& weights) -> SRPDE<typename Penalty::solver_t>;
+
 
 }   // namespace fdapde
 

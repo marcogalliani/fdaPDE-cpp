@@ -30,12 +30,12 @@ cmake-build-debug/
 #docs files
 *.puml
 .Rproj.user
-test/CMakeFiles/
-test/_deps/
-test/libs/
-.DS_Store
-.idea
 
 #experiments
-experiments/**/*.csv
-experiments/**/*.mtx
+experiments/
+!experiments/**/*.cpp
+!experiments/**/*.Rmd
+!experiments/**/*.json
+*.Rproj
+
+.Rproj.user
