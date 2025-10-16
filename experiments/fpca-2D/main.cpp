@@ -101,7 +101,7 @@ int main() {
     //(6) lambda
     write_csv(results_path + "lambda.csv", fpca.lambda());
     //(7) gcv scores
-    write_csv(results_path + "gcv_scores.csv", fpca.gcv_scores());
+    // write_csv(results_path + "gcv_scores.csv", fpca.gcv_scores());
 
     return 0;
 }
