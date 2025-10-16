@@ -173,9 +173,9 @@ plot_stat_units <- function(stat_unit, locations, title=NULL, mybreaks=NULL, iso
   x_range <- range(locations[,1], na.rm = TRUE)
   y_range <- range(locations[,2], na.rm = TRUE)
   
-  plot <- ggplot(df, aes(x = x, y = y, fill = f)) +
-    geom_tile() +
-    scale_fill_gradientn(
+  plot <- ggplot(df, aes(x = x, y = y, fill = f, colour = f)) +
+    geom_point(size=3) +
+    scale_color_gradientn(
       colors = mycolors,
       breaks = mybreaks,
       name = "Value",

@@ -107,8 +107,12 @@ struct fe_ls_elliptic {
         requires(is_valid_penalty_v<Penalty>)
     fe_ls_elliptic(const std::string& formula, const GeoFrame& gf, Penalty&& penalty, const WeightMatrix& W) : W_(W) {
         fdapde_static_assert(GeoFrame::Order == 1, THIS_CLASS_IS_FOR_ORDER_ONE_GEOFRAMES_ONLY);
+        fdapde_assert(gf.n_layers() == 1);
+
+        n_obs_  = gf[0].rows();
+        n_locs_ = n_obs_;
         discretize(penalty);
-	analyze_data(formula, gf, W);
+	    analyze_data(formula, gf, W);
     }
     template <typename GeoFrame, typename Penalty>
         requires(is_valid_penalty_v<Penalty>)
@@ -119,13 +123,18 @@ struct fe_ls_elliptic {
         requires(is_valid_penalty_v<Penalty>)
     fe_ls_elliptic(const GeoFrame& gf, Penalty&& penalty, const WeightMatrix& W) : W_(W) {
         fdapde_static_assert(GeoFrame::Order == 1, THIS_CLASS_IS_FOR_ORDER_ONE_GEOFRAMES_ONLY);
+        fdapde_assert(gf.n_layers() == 1);
+        n_obs_  = gf[0].rows();
+        n_locs_ = n_obs_;
+
         discretize(penalty);
         eval_basis_at_(gf);
     }
     template <typename GeoFrame, typename Penalty>
         requires(is_valid_penalty_v<Penalty>)
     fe_ls_elliptic(const GeoFrame& gf, Penalty&& penalty) :
-        fe_ls_elliptic(gf, penalty, vector_t::Ones(gf[0].rows()).asDiagonal()) { }
+        fe_ls_elliptic(gf, penalty, vector_t::Ones(gf[0].rows()).asDiagonal()) {
+    }
 
     // perform finite element based numerical discretization
     template <typename Penalty> void discretize(Penalty&& penalty) {

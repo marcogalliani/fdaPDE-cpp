@@ -81,7 +81,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
             } break;
             case OptimizeGCV: {
                 auto gcv_functor = [&](auto lambda) { return gcv_(X, lambda, V.col(i)); };
-                GridSearch<n_lambda> optimizer;
+                GridOptimizer<n_lambda> optimizer;
                 opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
                 for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
             } break;
@@ -218,7 +218,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         } break;
         case OptimizeGCV: {
             auto gcv_functor = [&](auto lambda) { return gcv_(X, rank, lambda, V); };
-            GridSearch<n_lambda> optimizer;
+            GridOptimizer<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
             for(int i=0; i < rank; i++) for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
             gcv_scores_ = gcv_scores_/rank;
@@ -515,7 +515,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
     using diag_matrix_t = Eigen::DiagonalMatrix<double, Dynamic, Dynamic>;
-    using sparse_matrix_t = Eigen::SparseMatrix<double, Dynamic, Dynamic>;
+    using sparse_matrix_t = Eigen::SparseMatrix<double>;
    public:
     using smoother_t = std::decay_t<VariationalSolver>;
     static constexpr int n_lambda = smoother_t::n_lambda;
@@ -593,11 +593,14 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, int rank, const LambdaT& lambda, int flag) {
         for (int i = 0; i < lambda.size(); ++i) { fdapde_assert(lambda[i] > 0); }
-        diag_matrix_t lumped_mass = lump(smoother_->mass());
-        sparse_matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_.stiffness()*lumped_mass.cwiseInverse()*smoother_->stiffness();
+        vector_t lumped_mass = lump(smoother_->mass()).diagonal();
+
+        sparse_matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + lambda[0]*smoother_->stiff()*lumped_mass.cwiseInverse().asDiagonal()*smoother_->stiff();
         // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
         Eigen::SimplicialLLT<sparse_matrix_t> chol(C);
-        invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_));
+        invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_))*chol.permutationP();
+        //std::cout << "Sparse cholesky: " << (C-).squaredNorm() << std::endl;
+
         // compute SVD of X * \Psi * (D^{-1})^\top
         matrix_t V, s;
 	    vector_t singularValues;
