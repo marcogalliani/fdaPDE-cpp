@@ -1085,6 +1085,7 @@ template <typename VariationalSolver> class fPCA {
             s_ = std::move(s);
             f_norm_ = solver_.loadings_norm();
             lambda_ = solver_.lambda();
+            gcv_scores_ = solver_.gcv_scores();
         }
         return std::tie(f_, s_);
     }
