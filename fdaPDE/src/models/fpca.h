@@ -73,7 +73,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
         int calibration = (flag & 0b11110);   // detect calibration strategy
         for (int i = 0; i < rank; ++i) {
             // select optimal smoothing level for i-th component
-            std::array<double, n_lambda> opt_lambda;
+            Eigen::Matrix<double, n_lambda, 1> opt_lambda;
             switch (calibration) {
             case 0: {   // no calibration
                 fdapde_assert(lambda_grid.size() == n_lambda);
@@ -81,7 +81,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
             } break;
             case OptimizeGCV: {
                 auto gcv_functor = [&](auto lambda) { return gcv_(X, lambda, V.col(i)); };
-                GridOptimizer<n_lambda> optimizer;
+                GridSearch<n_lambda> optimizer;
                 opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
                 for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
             } break;
@@ -154,10 +154,12 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     double gcv_(const matrix_t& X, const LambdaT lambda, const InitT& f0) {
         const auto& [f, s] = solve_(X, lambda, f0);
         // evaluate GCV index at convergence
-        if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
-            edf_map_[lambda] = smoother_->edf();
+        std::array<double, n_lambda> lambda_vec;
+        std::copy(lambda.data(), lambda.data() + n_lambda, lambda_vec.begin());
+        if (edf_map_.find(lambda_vec) == edf_map_.end()) {   // cache Tr[S]
+            edf_map_[lambda_vec] = smoother_->edf();
         }
-        int dor = n_locs_ - edf_map_.at(lambda);
+        int dor = n_locs_ - edf_map_.at(lambda_vec);
         return (n_locs_ / std::pow(dor, 2)) * ((smoother_->Psi() * f) - smoother_->response()).squaredNorm();
     }
     std::unordered_map<std::array<double, n_lambda>, double, internals::std_array_hash<double, n_lambda>> edf_map_;
@@ -209,8 +211,8 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         lambda_.resize(rank, n_lambda);
         gcv_scores_.resize(lambda_grid.size(),rank);
 
-        int calibration = (flag & 0b11110);   // detect calibration strategy	
-        std::array<double, n_lambda> opt_lambda;
+        int calibration = (flag & 0b11110);   // detect calibration strategy
+        Eigen::Matrix<double, n_lambda, 1> opt_lambda;
         switch (calibration) {
         case 0: {   // no calibration
             fdapde_assert(lambda_grid.size() == n_lambda);
@@ -218,7 +220,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         } break;
         case OptimizeGCV: {
             auto gcv_functor = [&](auto lambda) { return gcv_(X, rank, lambda, V); };
-            GridOptimizer<n_lambda> optimizer;
+            GridSearch<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
             for(int i=0; i < rank; i++) for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
             gcv_scores_ = gcv_scores_/rank;
@@ -239,9 +241,9 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
             }
             f_norm_[i] = std::sqrt(F.col(i).dot(smoother_->mass() * F.col(i)));   // L^2 norm
             f_.col(i) = F.col(i) / f_norm_[i];
-	    s_.col(i) = S.col(i) * f_norm_[i];
+	        s_.col(i) = S.col(i) * f_norm_[i];
         }
-        return std::tie(f_, s_);	
+        return std::tie(f_, s_);
     }
     // observers
     const matrix_t& scores() const { return s_; }
@@ -358,7 +360,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
         gcv_scores_.resize(lambda_grid.size(), rank);
 
         int calibration = (flag & CalibrationMask);   // detect calibration strategy
-        std::array<double, n_lambda> opt_lambda;
+        Eigen::Matrix<double, n_lambda, 1> opt_lambda;
         matrix_t opt_lambdas_by_pc(rank,n_lambda);
         switch (calibration) {
         case 0: {   // no calibration
@@ -393,7 +395,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
                 return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S.col(curr_rank-1) - (smoother_->Psi() * F.col(curr_rank-1))).squaredNorm();
             };
             while (curr_rank <= rank) {
-                GridOptimizer<n_lambda> optimizer;
+                GridSearch<n_lambda> optimizer;
                 opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
                 for (int j = 0; j < n_lambda; ++j) opt_lambdas_by_pc(curr_rank-1, j) = opt_lambda[j];
                 for (int i = 0; i < lambda_grid.size(); i++) gcv_scores_(i,curr_rank-1) = optimizer.values()[i];
@@ -521,7 +523,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
         gcv_scores_.resize(lambda_grid.size(),rank);
 
         int calibration = (flag & 0b11110);   // detect calibration strategy
-        std::array<double, n_lambda> opt_lambda;
+        Eigen::Matrix<double, n_lambda, 1> opt_lambda;
         switch (calibration) {
         case 0: {   // no calibration
             fdapde_assert(lambda_grid.size() == n_lambda);
@@ -529,8 +531,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
         } break;
         case OptimizeGCV: {
             auto gcv_functor = [&](auto lambda) { return gcv_(X, rank, lambda, flag); };
-            // GridOptimizer<n_lambda> optimizer;
-            GridOptimizer<n_lambda> optimizer;
+            GridSearch<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
             for(int i=0; i < rank; i++) for(int j=0; j < lambda_grid.size(); j++) gcv_scores_(j,i) = optimizer.values()[j];
             gcv_scores_ = gcv_scores_/rank;
@@ -584,8 +585,6 @@ template <typename VariationalSolver> class fpca_direct_impl {
         // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
         Eigen::SimplicialLLT<sparse_matrix_t> chol(C);
         invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_))*chol.permutationP();
-        //std::cout << "Sparse cholesky: " << (C-).squaredNorm() << std::endl;
-
         // compute SVD of X * \Psi * (D^{-1})^\top
         matrix_t V, s;
 	    vector_t singularValues;
@@ -608,11 +607,13 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     double gcv_(const matrix_t& X, int rank, const LambdaT lambda, int flag) {
         const auto& [F, S] = solve_(X, rank, lambda, flag);
-        if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
-            edf_map_[lambda] = (invD_*smoother_->Psi().transpose()).squaredNorm();
+        std::array<double, n_lambda> lambda_vec;
+        std::copy(lambda.data(), lambda.data() + n_lambda, lambda_vec.begin());
+        if (edf_map_.find(lambda_vec) == edf_map_.end()) {   // cache Tr[S]
+            edf_map_[lambda_vec] = (invD_*smoother_->Psi().transpose()).squaredNorm();
         }
         // evaluate GCV index at convergence (note that Tr[S] = \|D^(-1)\|_F^2)
-        int dor = n_locs_ - edf_map_.at(lambda);
+        int dor = n_locs_ - edf_map_.at(lambda_vec);
         return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
     }
     std::unordered_map<std::array<double, n_lambda>, double, internals::std_array_hash<double, n_lambda>> edf_map_;
@@ -698,7 +699,7 @@ template <typename fPCASolver> class fpca_na_impl {
                 //}
             }
             //optimize over the grid
-            GridOptimizer<2> optimizer;
+            GridSearch<2> optimizer;
             auto optimal_lambdas = optimizer.optimize(gcv_functor,grid_2D);
             matrix_t gcv_table(lambda_grid.size(),1);
             for (int i = 0; i < lambda_grid.size(); ++i) {
@@ -1002,18 +1003,22 @@ template <typename VariationalSolver> class fPCA {
    public:
     fPCA() noexcept = default;
     template <typename GeoFrame, typename Penalty>
-    fPCA(const std::string& colname, const GeoFrame& gf, Penalty&& penalty) noexcept :
-        smoother_(), data_(gf[0].data().template col<double>(colname).as_matrix()) {
+    fPCA(const std::string& colname, const GeoFrame& gf, Penalty&& penalty) noexcept : smoother_(), data_() {
+        discretize(penalty.get());
+        analyze_data(colname, gf);
+    }
+    template <typename... Args> void discretize(Args&&... args) {
+        smoother_.discretize(std::forward<Args>(args)...);
+        n_dofs_ = smoother_.n_dofs();
+	return;
+    }
+    template <typename GeoFrame> void analyze_data(const std::string& colname, const GeoFrame& gf) {
         fdapde_assert(gf.n_layers() == 1);
+        data_ = gf[0].data().template col<double>(colname).as_matrix();
         n_locs_ = data_.rows();
-	    n_units_ = data_.cols();
-        if constexpr (requires(Penalty p) { p.get(); }) {
-            smoother_ = smoother_t(gf, penalty.get());
-        } else {
-            smoother_ = smoother_t(gf, penalty(gf.template triangulation<0>()).get());
-        }
-	    n_dofs_ = smoother_.n_dofs();
-	    // detect if data_ has at least one missing value
+        n_units_ = data_.cols();
+	smoother_.analyze_data(gf, vector_t::Ones(gf[0].rows()).asDiagonal());
+        // detect if data_ has at least one missing value
         has_nan_ = false;
         for (int i = 0; i < n_locs_; ++i) {
             for (int j = 0; j < n_units_; ++j) {
@@ -1023,6 +1028,7 @@ template <typename VariationalSolver> class fPCA {
                 }
             }
         }
+	return;
     }
 
     template <typename LambdaT, typename Policy = fpca_power_solver>
@@ -1053,7 +1059,7 @@ template <typename VariationalSolver> class fPCA {
             bool computeMean = !(flag & DoNotComputeMean);
             if (computeMean) {
                 smoother_.update_response(centred_data.colwise().mean());
-                GridOptimizer<1> opt;
+                GridSearch<1> opt;
                 auto gcv_functor = [&](auto lambda) {
                     smoother_.fit(lambda);
                     double dor =  n_locs_ - smoother_.edf();  // residual degrees of freedom
