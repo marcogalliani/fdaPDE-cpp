@@ -359,13 +359,13 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
 
         int calibration = (flag & CalibrationMask);   // detect calibration strategy
         std::array<double, n_lambda> opt_lambda;
-        matrix_t opt_lambdas(rank,n_lambda);
+        matrix_t opt_lambdas_by_pc(rank,n_lambda);
         switch (calibration) {
         case 0: {   // no calibration
             fdapde_assert(lambda_grid.size() == n_lambda);
             for (int i = 0; i < rank; ++i) {
                 for (int j = 0; j < n_lambda; ++j) {
-                    opt_lambdas(i, j) = lambda_grid[j];
+                    opt_lambdas_by_pc(i, j) = lambda_grid[j];
                 }
             }
         } break;
@@ -373,44 +373,29 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
             // initialisation
             matrix_t F0 = V;
             for (int i = 0; i < rank; ++i) {
-                // assuming the grid is ordered
-                for (int j = 0; j < n_lambda; ++j) opt_lambdas(i, j) = lambda_grid[j];
+                // assuming the grid is ordered, fill each row with the first lambda in lambda grid
+                for (int j = 0; j < n_lambda; ++j) opt_lambdas_by_pc(i, j) = lambda_grid[j];
             }
             // refinement
             int curr_rank = 1;
             auto gcv_functor = [&](auto lambda) {
-                //fit with current lambda
-
-                for (int j = 0; j < n_lambda; ++j) opt_lambdas(curr_rank-1,j) = lambda[j];
-                const auto& [F, S] = solve_(X, curr_rank, opt_lambdas.topRows(curr_rank), F0.leftCols(curr_rank));
+                //fit with current lambda (replacing the row of opt_lambdas_by_pc with the one associated to the last fPC)
+                for (int j = 0; j < n_lambda; ++j) opt_lambdas_by_pc(curr_rank-1,j) = lambda[j];
                 //update initial guess (at locs) for the subsequent iterations
-                // F0.leftCols(curr_rank) = smoother_->Psi() * F;
-                // const auto& [F, S] = solve_(X, rank, opt_lambdas, F0);
-                // // weight the columns of each vector
-                // vector_t weights(rank);
-                // for (int m = 0; m < rank; m++) {
-                //     // evaluate GCV index at convergence
-                //     std::array<double,n_lambda> lambda_buffer;
-                //     for (int j = 0; j < n_lambda; j++) lambda_buffer[j] = opt_lambdas(m,j);
-                //     if (edf_map_.find(lambda_buffer) == edf_map_.end()) {   // cache Tr[S]
-                //         edf_map_[lambda_buffer] = smoother_->edf(lambda_buffer);
-                //     }
-                //     weights(m) = std::sqrt(n_locs_)/(n_locs_-edf_map_[lambda_buffer]);
-                // }
-                // matrix_t F_w = F.array().rowwise() * weights.transpose().array();
-                // matrix_t S_w = S.array().rowwise() * weights.transpose().array();
-                // return (X.transpose() * S_w - smoother_->Psi() * F_w).squaredNorm();
-
-                if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
+                // F0.leftCols(curr_rank) = smoother_->Psi() * F; // this may mess up orthogonality
+                const auto& [F, S] = solve_(X, curr_rank, opt_lambdas_by_pc.topRows(curr_rank), F0.leftCols(curr_rank));
+                // cache Tr[S]
+                if (edf_map_.find(lambda) == edf_map_.end()) {
                     edf_map_[lambda] = smoother_->edf(lambda);
                 }
+                //return gcv
                 int dor = n_locs_ - edf_map_.at(lambda);
                 return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S.col(curr_rank-1) - (smoother_->Psi() * F.col(curr_rank-1))).squaredNorm();
             };
             while (curr_rank <= rank) {
                 GridOptimizer<n_lambda> optimizer;
                 opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
-                for (int j = 0; j < n_lambda; ++j) opt_lambdas(curr_rank-1, j) = opt_lambda[j];
+                for (int j = 0; j < n_lambda; ++j) opt_lambdas_by_pc(curr_rank-1, j) = opt_lambda[j];
                 for (int i = 0; i < lambda_grid.size(); i++) gcv_scores_(i,curr_rank-1) = optimizer.values()[i];
                 curr_rank++;
             }
@@ -422,9 +407,9 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
         }
         }
         // fit with optimal lambda
-        const auto& [F, S] = solve_(X, rank, opt_lambdas, V);
+        const auto& [F, S] = solve_(X, rank, opt_lambdas_by_pc, V);
 	    // store results
-        lambda_ = opt_lambdas;
+        lambda_ = opt_lambdas_by_pc;
         for (int i = 0; i < rank; ++i) {
             f_norm_[i] = std::sqrt(F.col(i).dot(smoother_->mass() * F.col(i)));   // L^2 norm
             f_.col(i) = F.col(i) / f_norm_[i];
