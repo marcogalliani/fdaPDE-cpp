@@ -387,11 +387,13 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
                 // F0.leftCols(curr_rank) = smoother_->Psi() * F; // this may mess up orthogonality
                 const auto& [F, S] = solve_(X, curr_rank, opt_lambdas_by_pc.topRows(curr_rank), F0.leftCols(curr_rank));
                 // cache Tr[S]
-                if (edf_map_.find(lambda) == edf_map_.end()) {
-                    edf_map_[lambda] = smoother_->edf(lambda);
+                std::array<double, n_lambda> lambda_vec;
+                std::copy(lambda.data(), lambda.data() + n_lambda, lambda_vec.begin());
+                if (edf_map_.find(lambda_vec) == edf_map_.end()) {
+                    edf_map_[lambda_vec] = smoother_->edf(lambda);
                 }
                 //return gcv
-                int dor = n_locs_ - edf_map_.at(lambda);
+                int dor = n_locs_ - edf_map_.at(lambda_vec);
                 return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S.col(curr_rank-1) - (smoother_->Psi() * F.col(curr_rank-1))).squaredNorm();
             };
             while (curr_rank <= rank) {
@@ -997,7 +999,6 @@ template <typename VariationalSolver> class fPCA {
     using smoother_t = std::decay_t<VariationalSolver>;
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
-    using data_t   = Eigen::Map<const Eigen::Matrix<double, Dynamic, Dynamic, Eigen::ColMajor>>;
     using binary_t = BinaryMatrix<Dynamic, Dynamic>;
     static constexpr int n_lambda = smoother_t::n_lambda;
    public:
@@ -1091,7 +1092,7 @@ template <typename VariationalSolver> class fPCA {
     const matrix_t& gcv_scores() const { return gcv_scores_; }
     const matrix_t& edf_scores() const { return edf_scores_; }
    private:
-    data_t data_;           // mapped geoframe data
+    matrix_t data_;           // mapped geoframe data
     smoother_t smoother_;   // variational solver used in the smoothing step
     bool has_nan_;
 
