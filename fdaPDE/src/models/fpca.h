@@ -361,7 +361,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
 
         int calibration = (flag & CalibrationMask);   // detect calibration strategy
         Eigen::Matrix<double, n_lambda, 1> opt_lambda;
-        matrix_t opt_lambdas_by_pc(rank,n_lambda);
+        matrix_t opt_lambdas_by_pc(rank,1);
         switch (calibration) {
         case 0: {   // no calibration
             fdapde_assert(lambda_grid.size() == n_lambda);
@@ -372,6 +372,34 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
             }
         } break;
         case OptimizeGCV: {
+            /* NelderMead optimisation
+            // parametisation: lambda = exp(theta)
+            matrix_t opt_thetas_by_pc(rank,1);
+            //assume that lambda is a rank-by-1 matrix where each row contains the lambda related to each fpc
+            auto gcv_functor = [&](const vector_t &theta) {
+                matrix_t lambda_mat = theta.array().exp();
+                const auto& [F, S] = solve_(X, rank, lambda_mat, V.leftCols(rank));
+                double gcv_score = 0;
+                for (int curr_rank = 0; curr_rank < rank; curr_rank++) {
+                    // TODO: extend NelderMead to n_lambda > 1
+                    std::array<double, 1> lambda_vec;
+                    std::copy(lambda_mat.row(curr_rank).begin(),lambda_mat.row(curr_rank).end(),lambda_vec.begin());
+                    if (edf_map_.find(lambda_vec) == edf_map_.end()) {
+                        edf_map_[lambda_vec] = smoother_->edf(lambda_mat.row(curr_rank));
+                    }
+                    int dor = n_locs_ - edf_map_.at(lambda_vec);
+                    gcv_score += (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S.col(curr_rank) - (smoother_->Psi() * F.col(curr_rank))).squaredNorm();
+                }
+                return gcv_score;
+            };
+            NelderMead<Dynamic> optimizer(30,1e-3);
+            // assuming the grid is ordered, fill each row with the first lambda in lambda grid
+            vector_t theta0(rank);
+            for (int i = 0; i < rank; ++i) theta0(i) = 0;
+            opt_thetas_by_pc = optimizer.optimize(gcv_functor, theta0);
+            opt_lambdas_by_pc = opt_thetas_by_pc.array().exp();
+            */
+            /* GridSearch optimisation */
             // initialisation
             matrix_t F0 = V;
             for (int i = 0; i < rank; ++i) {
@@ -394,7 +422,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
                 }
                 //return gcv
                 int dor = n_locs_ - edf_map_.at(lambda_vec);
-                return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S.col(curr_rank-1) - (smoother_->Psi() * F.col(curr_rank-1))).squaredNorm();
+                return (n_locs_ / std::pow(dor, 2)) * (X.transpose()*S.col(curr_rank-1) - smoother_->Psi() * F.col(curr_rank-1)).squaredNorm();
             };
             while (curr_rank <= rank) {
                 GridSearch<n_lambda> optimizer;
@@ -475,6 +503,7 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
         }
         return std::make_pair(F, S);
     }
+    // TODO: remove gcv_ method if not used
     // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f) and returns the GCV index
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
@@ -581,12 +610,18 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, int rank, const LambdaT& lambda, int flag) {
         for (int i = 0; i < lambda.size(); ++i) { fdapde_assert(lambda[i] > 0); }
+        /* lumped mass matrix
         vector_t lumped_mass = lump(smoother_->mass()).diagonal();
-
         sparse_matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + lambda[0]*smoother_->stiff()*lumped_mass.cwiseInverse().asDiagonal()*smoother_->stiff();
         // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
         Eigen::SimplicialLLT<sparse_matrix_t> chol(C);
         invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_))*chol.permutationP();
+        */
+        /* true mass matrix */
+        matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_->P(lambda);
+        // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
+        Eigen::LLT<matrix_t> chol(C);
+        invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_));
         // compute SVD of X * \Psi * (D^{-1})^\top
         matrix_t V, s;
 	    vector_t singularValues;
@@ -1018,7 +1053,7 @@ template <typename VariationalSolver> class fPCA {
         data_ = gf[0].data().template col<double>(colname).as_matrix();
         n_locs_ = data_.rows();
         n_units_ = data_.cols();
-	smoother_.analyze_data(gf, vector_t::Ones(gf[0].rows()).asDiagonal());
+	    smoother_.analyze_data(gf, vector_t::Ones(gf[0].rows()).asDiagonal());
         // detect if data_ has at least one missing value
         has_nan_ = false;
         for (int i = 0; i < n_locs_; ++i) {
