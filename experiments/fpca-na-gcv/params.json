@@ -1,0 +1,10 @@
+{
+  "Path": {
+    "mesh": "/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/mesh/unit_square",
+    "data": "/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/fpca-na"
+  },
+  "RunParams": {
+    "lambda_grid": [0.00001,0.0001,0.001,0.01,0.1],
+    "n_pc": 3
+  }
+}

@@ -1,8 +1,8 @@
 source("data/data_generator.R")
-source("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/mesh_utils.R")
+source("data/mesh_utils.R")
 
-data_path <- "data/fpca-fully_obs"
-mesh_path <- "data/mesh/unit_square"
+data_path <- "data/fpca-na/"
+mesh_path <- "mesh/unit_square/"
 
 ## Mesh ----
 n_nodes <- 400
@@ -77,34 +77,7 @@ data <- data_generator(
   obs_path = data_path,
   mean_locs = mean_locs,
   seed = 1412,
-  filename = "y.csv"
-)
+  filename = "y.csv")
 
-NSR <- error_sd^2/sum(scores_sd^2)
-NSR
-
-## Variance ----
-# X = SF^T + E
-data_range <- max(test_functions) - min(test_functions)
-true_total_var <- sum(c(scores_sd,error_sd)^2)*data_range^2
-true_total_var
-
-true_pcs_var <- sum(scores_sd^2)*data_range^2
-true_pcs_var
-
-scores_sd^2/sum(c(scores_sd,error_sd)^2)
-true_total_var
-
-centred_data <- sweep(data$noisy_data, 2, colMeans(data$noisy_data), FUN = "-")
-estimated_total_var <- 1/(n_units-1)*sum(centred_data^2)
-estimated_total_var
-
-apply(data$scores,2,var) * n_locs/ (estimated_total_var)
-
-estimated_pcs_var <- 1/(n_units-1)*sum((data$scores%*%t(Psi%*%data$pcs))^2)
-estimated_pcs_var
-
-plot(as.factor(1:n_pcs), scores_sd^2, type="l")
-plot(1:n_pcs, scores_sd^2/sum(c(scores_sd,error_sd)^2))
 
 

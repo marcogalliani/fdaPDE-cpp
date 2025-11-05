@@ -11,11 +11,11 @@ unit_square.mesh <- function(N, mesh_path=NULL){
   
   ## export mesh
   if(!is.null(mesh_path)){
-    write.csv(format(mesh.2D$nodes, digits = 16), paste(mesh_path,"points.csv", sep = "/"))
-    write.csv(format(mesh.2D$triangles, digits = 16), paste(mesh_path,"elements.csv", sep = "/"))
-    write.csv(format(1 * mesh.2D$nodesmarkers, digits = 16), paste(mesh_path,"boundary.csv", sep = "/"))
-    write.csv(format(mesh.2D$neighbors, digits = 16), paste(mesh_path,"neigh.csv", sep = "/"))
-    write.csv(format(mesh.2D$edges, digits = 16), paste(mesh_path,"edges.csv", sep = "/"))
+    write.csv(format(mesh.2D$nodes, digits = 16), paste0(mesh_path,"points.csv"))
+    write.csv(format(mesh.2D$triangles, digits = 16), paste0(mesh_path,"elements.csv"))
+    write.csv(format(1 * mesh.2D$nodesmarkers, digits = 16), paste0(mesh_path,"boundary.csv"))
+    write.csv(format(mesh.2D$neighbors, digits = 16), paste0(mesh_path,"neigh.csv"))
+    write.csv(format(mesh.2D$edges, digits = 16), paste0(mesh_path,"edges.csv"))
   }
   # Construct a mesh object in femR
   mesh <- Mesh(
@@ -43,7 +43,7 @@ unit_square.locs <- function(n, locs_path=NULL){
   
   ## export locations
   if(!is.null(locs_path)){
-    write.csv(format(locations.obs.2D, digits = 16), paste(locs_path,"locs.csv", sep = "/")) 
+    write.csv(format(locations.obs.2D, digits = 16), paste0(locs_path,"locs.csv")) 
   }
   return(locations.obs.2D)
 }
