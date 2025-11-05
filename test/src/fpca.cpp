@@ -16,12 +16,6 @@
 
 using namespace fdapde;
 using fdapde::test::almost_equal;
-using fdapde::write_csv;
-
-using vector_t = Eigen::Matrix<double, Dynamic, 1>;
-using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
-using sparse_matrix_t = Eigen::SparseMatrix<double>;
-using binary_t = BinaryMatrix<Dynamic, Dynamic>;
 
 // test 1
 //    mesh:         unit_square_60
@@ -29,18 +23,19 @@ using binary_t = BinaryMatrix<Dynamic, Dynamic>;
 //    penalization: simple laplacian
 //    BC:           no
 //    order FE:     1
+//    solver:       subspace
 TEST(fpca, test_01) {
     // geometry
-    std::string mesh_path = "../data/mesh/unit_square_10/";
-    Triangulation<2, 2> D(mesh_path + "/points.csv", mesh_path + "/elements.csv", mesh_path + "/boundary.csv",
-        /* header = */ true, /* index_col = */ true);
+    std::string mesh_path = "../data/mesh/unit_square_40/";
+    Triangulation<2, 2> D(mesh_path + "points.csv", mesh_path + "elements.csv", mesh_path + "boundary.csv", true, true);
     // data
     GeoFrame data(D);
     auto& l1 = data.insert_scalar_layer<POINT>("l1", MESH_NODES);
+    // load the data matrix (assume that X is an (n_units,n_locs) data matrix)
     std::string data_path = "../data/fpca/01/";
-    matrix_t X = read_csv<double>(data_path + "y.csv").as_matrix();
+    Eigen::Matrix<double,Eigen::Dynamic,Eigen::Dynamic> X = read_csv<double>(data_path + "y.csv").as_matrix();
     l1.load_blk("X", X.transpose());
-    // physics (isotropic laplacian)
+    // physics
     FeSpace Vh(D, P1<1>);
     TrialFunction f(Vh);
     TestFunction v(Vh);
@@ -48,19 +43,18 @@ TEST(fpca, test_01) {
     ZeroField<2> u;
     auto F = integral(D)(u * v);
     // modeling
-    fPCA fpca("X", data, fe_ls_elliptic(a, F));
+    fPCA m("X", data, fe_ls_elliptic(a, F));
+
     // fit
-    std::vector<double> lambda_grid = {1e-5}; // if the grid contains more than a value the calibration is automatically activated
-    fpca.fit(
+    std::vector<double> lambda_grid(5);
+    for (int i = 0; i < 5; ++i) { lambda_grid[i] = std::pow(10, -4.0 +  i);}
+    m.fit(
         /* n_comp = */ 3,
         lambda_grid,
-        /* options = */ ComputeRandSVD, // to use calibration (only kcv for now) replace with: ComputeRandSVD | OptimizeMSRE
+        /* options = */ ComputeRandSVD | OptimizeGCV,
         fpca_subspace_solver()
-    );
-
-    // results
-    matrix_t X_reconstructed = fpca.S()*fpca.Fn().transpose();
-    X_reconstructed = X_reconstructed.rowwise() + fpca.center_locs().transpose(); // add the estimated functional mean
-    matrix_t X_true = read_csv<double>(data_path + "true_reconstruction.csv",true, false).as_matrix();
-    EXPECT_TRUE(almost_equal<double>(X_reconstructed, X_true));
+        );
+    EXPECT_TRUE(almost_equal<double>(m.F().col(0), data_path + "f1.mtx") || almost_equal<double>(-m.F().col(0), data_path + "f1.mtx"));
+    EXPECT_TRUE(almost_equal<double>(m.F().col(1), data_path + "f2.mtx") || almost_equal<double>(-m.F().col(1), data_path + "f2.mtx"));
+    EXPECT_TRUE(almost_equal<double>(m.F().col(2), data_path + "f3.mtx") || almost_equal<double>(-m.F().col(2), data_path + "f3.mtx"));
 }

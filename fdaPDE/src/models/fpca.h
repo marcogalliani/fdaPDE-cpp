@@ -24,13 +24,13 @@ namespace fdapde {
 [[maybe_unused]] constexpr int ComputeRandSVD = 0x1;
 [[maybe_unused]] constexpr int ComputeXactSVD = 0x0;
 
-// bits 1 - 2 reserved to calibration strategies
+// bits 1 - 5 reserved to calibration strategies
 [[maybe_unused]] constexpr int OptimizeGCV  = 0x1 << 1;
 [[maybe_unused]] constexpr int OptimizeMSRE = 0x2 << 1;
 
 // bit 3 reserved for mean computation
 [[maybe_unused]] constexpr int DoNotComputeMean = 0x1 << 3; // bit 3
-  
+
 namespace internals {
 
 // power iteration based fPCA
@@ -71,7 +71,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
         int calibration = (flag & 0b11110);   // detect calibration strategy
         for (int i = 0; i < rank; ++i) {
             // select optimal smoothing level for i-th component
-            std::array<double, n_lambda> opt_lambda;
+            Eigen::Matrix<double, n_lambda, 1> opt_lambda;
             switch (calibration) {
             case 0: {   // no calibration
                 fdapde_assert(lambda_grid.size() == n_lambda);
@@ -79,8 +79,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
             } break;
             case OptimizeGCV: {
                 auto gcv_functor = [&](auto lambda) { return gcv_(X, lambda, V.col(i)); };
-                // GridOptimizer<n_lambda> optimizer;
-                GridOptimizer<n_lambda> optimizer;
+                GridSearch<n_lambda> optimizer;
                 opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
             } break;
             case OptimizeMSRE: {
@@ -138,10 +137,12 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     double gcv_(const matrix_t& X, const LambdaT lambda, const InitT& f0) {
         const auto& [f, s] = solve_(X, lambda, f0);
         // evaluate GCV index at convergence
-        if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
-            edf_map_[lambda] = smoother_->edf();
+        std::array<double, n_lambda> lambda_vec;
+        std::copy(lambda.data(), lambda.data() + n_lambda, lambda_vec.begin());
+        if (edf_map_.find(lambda_vec) == edf_map_.end()) {   // cache Tr[S]
+            edf_map_[lambda_vec] = smoother_->edf();
         }
-        int dor = n_locs_ - edf_map_.at(lambda);
+        int dor = n_locs_ - edf_map_.at(lambda_vec);
         return (n_locs_ / std::pow(dor, 2)) * ((smoother_->Psi() * f) - smoother_->response()).squaredNorm();
     }
     std::unordered_map<std::array<double, n_lambda>, double, internals::std_array_hash<double, n_lambda>> edf_map_;
@@ -191,29 +192,16 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         f_norm_.resize(rank);
         lambda_.resize(rank, n_lambda);
 
-        int calibration = (flag & 0b11110);   // detect calibration strategy	
-        std::array<double, n_lambda> opt_lambda;
+        int calibration = (flag & 0b11110);   // detect calibration strategy
+        Eigen::Matrix<double, n_lambda, 1> opt_lambda;
         switch (calibration) {
         case 0: {   // no calibration
             fdapde_assert(lambda_grid.size() == n_lambda);
             std::copy(lambda_grid.begin(), lambda_grid.end(), opt_lambda.begin());
         } break;
         case OptimizeGCV: {
-            matrix_t F0 = V;
-            auto gcv_functor = [&](auto lambda) {
-                //fit with current lambda
-                const auto& [F, S] = solve_(X, rank, lambda, F0);
-                //update initial guess (at locs) for the subsequent iterations
-                F0 = smoother_->Psi() * F;
-                // evaluate GCV index at convergence
-                if (edf_map_.find(lambda) == edf_map_.end()) {   // cache Tr[S]
-                    edf_map_[lambda] = smoother_->edf(lambda);
-                }
-                int dor = n_locs_ - edf_map_.at(lambda);
-                return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
-            };
-            // GridOptimizer<n_lambda> optimizer;
-            GridOptimizer<n_lambda> optimizer;
+            auto gcv_functor = [&](auto lambda) { return gcv_(X, rank, lambda, V); };
+            GridSearch<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
         } break;
         case OptimizeMSRE: {
@@ -224,16 +212,14 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         }
         // fit with optimal lambda
         const auto& [F, S] = solve_(X, rank, opt_lambda, V);
-	    // store results
+	// store results
         for (int i = 0; i < rank; ++i) {
-            for (int j = 0; j < n_lambda; ++j) {
-                lambda_(i, j) = opt_lambda[j];
-            }
+            for (int j = 0; j < n_lambda; ++j) { lambda_(i, j) = opt_lambda[j]; }
             f_norm_[i] = std::sqrt(F.col(i).dot(smoother_->mass() * F.col(i)));   // L^2 norm
             f_.col(i) = F.col(i) / f_norm_[i];
 	        s_.col(i) = S.col(i) * f_norm_[i];
         }
-        return std::tie(f_, s_);	
+        return std::tie(f_, s_);
     }
     // observers
     const matrix_t& scores() const { return s_; }
@@ -291,7 +277,7 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
-  
+
     // subspace iteration algorithm parameters
     double tol_ = 1e-6;
     int max_iter_ = 20;
@@ -321,7 +307,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
         lambda_.resize(rank, n_lambda);
 	
         int calibration = (flag & 0b11110);   // detect calibration strategy
-        std::array<double, n_lambda> opt_lambda;
+        Eigen::Matrix<double, n_lambda, 1> opt_lambda;
         switch (calibration) {
         case 0: {   // no calibration
             fdapde_assert(lambda_grid.size() == n_lambda);
@@ -329,8 +315,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
         } break;
         case OptimizeGCV: {
             auto gcv_functor = [&](auto lambda) { return gcv_(X, rank, lambda, flag); };
-            // GridOptimizer<n_lambda> optimizer;
-            GridOptimizer<n_lambda> optimizer;
+            GridSearch<n_lambda> optimizer;
             opt_lambda = optimizer.optimize(gcv_functor, lambda_grid);
         } break;
         case OptimizeMSRE: {
@@ -389,7 +374,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
     double gcv_(const matrix_t& X, int rank, const LambdaT lambda, int flag) {
         const auto& [F, S] = solve_(X, rank, lambda, flag);
         // evaluate GCV index at convergence (note that Tr[S] = \|D^(-1)\|_F^2)
-        int dor = n_locs_ - invD_.squaredNorm();
+        int dor = n_locs_ -  (invD_*smoother_->Psi().transpose()).squaredNorm();
         return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
     }
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
@@ -463,7 +448,7 @@ template <typename fPCASolver> class fpca_na_impl {
 
     fpca_na_impl() noexcept = default;
     fpca_na_impl(fPCASolver& fpca) noexcept :
-        fpca_(std::addressof(fpca)), smoother_(*fpca.smoother()), n_dofs_(fpca.smoother()->n_dofs()) { }
+        fpca_(std::addressof(fpca)), smoother_(fpca.smoother()), n_dofs_(smoother_->n_dofs()) { }
 
     template <typename DataT>
     auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
@@ -781,18 +766,22 @@ template <typename VariationalSolver> class fPCA {
    public:
     fPCA() noexcept = default;
     template <typename GeoFrame, typename Penalty>
-    fPCA(const std::string& colname, const GeoFrame& gf, Penalty&& penalty) noexcept :
-        smoother_(), data_(gf[0].data().template col<double>(colname).as_matrix()) {
+    fPCA(const std::string& colname, const GeoFrame& gf, Penalty&& penalty) noexcept : smoother_(), data_() {
+        discretize(penalty.get());
+        analyze_data(colname, gf);
+    }
+    template <typename... Args> void discretize(Args&&... args) {
+        smoother_.discretize(std::forward<Args>(args)...);
+        n_dofs_ = smoother_.n_dofs();
+	return;
+    }
+    template <typename GeoFrame> void analyze_data(const std::string& colname, const GeoFrame& gf) {
         fdapde_assert(gf.n_layers() == 1);
+        data_ = gf[0].data().template col<double>(colname).as_matrix();
         n_locs_ = data_.rows();
-	    n_units_ = data_.cols();
-        if constexpr (requires(Penalty p) { p.get(); }) {
-            smoother_ = smoother_t(gf, penalty.get());
-        } else {
-            smoother_ = smoother_t(gf, penalty(gf.template triangulation<0>()).get());
-        }
-	    n_dofs_ = smoother_.n_dofs();
-	    // detect if data_ has at least one missing value
+        n_units_ = data_.cols();
+	smoother_.analyze_data(gf, vector_t::Ones(gf[0].rows()).asDiagonal());
+        // detect if data_ has at least one missing value
         has_nan_ = false;
         for (int i = 0; i < n_locs_; ++i) {
             for (int j = 0; j < n_units_; ++j) {
@@ -802,6 +791,7 @@ template <typename VariationalSolver> class fPCA {
                 }
             }
         }
+	return;
     }
 
     template <typename LambdaT, typename Policy = fpca_power_solver>
@@ -809,12 +799,11 @@ template <typename VariationalSolver> class fPCA {
     auto fit(int rank, const LambdaT& lambda_grid, int flag = ComputeRandSVD, Policy policy = Policy()) {
         fdapde_assert(lambda_grid.size() % n_lambda == 0);
         auto solver_ = policy.get(smoother_);   // instantiate solver implementation
-        f_.resize(n_dofs_ , rank);
+        f_.resize(n_dofs_, rank);
         s_.resize(n_units_, rank);
         f_norm_.resize(rank);
         lambda_.resize(n_lambda, rank);
-        gcv_scores_.resize(lambda_grid.size(),1);
-	    // dispatch to processing logic
+        // dispatch to processing logic
         if (has_nan_) {
             // default to OptimMSRE calibration, if no calibration provided
             if (lambda_grid.size() > n_lambda && (flag & 0b11110) == 0) { flag = flag | OptimizeMSRE; }
@@ -865,7 +854,7 @@ template <typename VariationalSolver> class fPCA {
     const matrix_t& gcv_scores() const { return gcv_scores_; }
 
    private:
-    data_t data_;           // mapped geoframe data
+    matrix_t data_;         // mapped geoframe data
     smoother_t smoother_;   // variational solver used in the smoothing step
     bool has_nan_;
 

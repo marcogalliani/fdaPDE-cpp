@@ -22,43 +22,55 @@
 namespace fdapde {
 namespace test {
 
-[[maybe_unused]] constexpr double testing_double_tolerance = 1e-7;
+  [[maybe_unused]] constexpr double testing_double_tolerance = 1e-7;
 
-// floating point comparision utilities
-template <typename Scalar>
-bool almost_equal(
-  const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op1, const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op2,
-  double epsilon) {
+  // floating point comparison utilities
+  template <typename Scalar>
+  bool almost_equal(
+    const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op1,
+    const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op2,
+    double epsilon) {
     return (op1 - op2).template lpNorm<Eigen::Infinity>() < epsilon ||
            (op1 - op2).template lpNorm<Eigen::Infinity>() <
-      (std::max(op1.template lpNorm<Eigen::Infinity>(), op2.template lpNorm<Eigen::Infinity>()) * epsilon);
-}
-template <typename Scalar>
-bool almost_equal(
-  const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op1, const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op2) {
+             (std::max(op1.template lpNorm<Eigen::Infinity>(), op2.template lpNorm<Eigen::Infinity>()) * epsilon);
+  }
+
+  template <typename Scalar>
+  bool almost_equal(
+    const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op1,
+    const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op2) {
     return almost_equal(op1, op2, testing_double_tolerance);
-}
-template <typename Scalar> bool almost_equal(const Eigen::SparseMatrix<Scalar>& op1, std::string op2) {
+  }
+
+  template <typename Scalar>
+  bool almost_equal(const Eigen::SparseMatrix<Scalar>& op1, std::string op2) {
     Eigen::SparseMatrix<Scalar> mem_buff;
     Eigen::loadMarket(mem_buff, op2);
     return almost_equal(op1, mem_buff);
-}
-template <typename Scalar> bool almost_equal(const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op1, std::string op2) {
+  }
+
+  template <typename Scalar>
+  bool almost_equal(const Eigen::Matrix<Scalar, Dynamic, Dynamic>& op1, std::string op2) {
     Eigen::SparseMatrix<Scalar> mem_buff;
     Eigen::loadMarket(mem_buff, op2);
     return almost_equal(op1, Eigen::Matrix<Scalar, Dynamic, Dynamic>(mem_buff));
-}
-template <typename Scalar> bool almost_equal(const std::vector<Scalar>& op1, std::string op2) {
+  }
+
+  template <typename Scalar>
+  bool almost_equal(const std::vector<Scalar>& op1, std::string op2) {
     Eigen::SparseMatrix<Scalar> mem_buff;
     Eigen::Matrix<double, Dynamic, Dynamic> values(op1.size(), 1);
 
     Eigen::loadMarket(mem_buff, op2);
-    for (int i = 0; i < op1.size(); ++i) { values(i, 0) = op1[i]; }
+    for (int i = 0; i < op1.size(); ++i) {
+      values(i, 0) = op1[i];
+    }
     return almost_equal(values, Eigen::Matrix<Scalar, Dynamic, Dynamic>(mem_buff));
-}
+  }
 
 }   // namespace test
 }   // namespace fdapde
+
 
 // #include "src/sr.cpp"
 // #include "src/gsr.cpp"
@@ -70,4 +82,6 @@ int main(int argc, char **argv){
   // start testing
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+
+  return 0;
 }
