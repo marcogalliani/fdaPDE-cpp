@@ -1,7 +1,11 @@
 
 ```{r}
-loadings <- as.matrix(read.csv("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/fpca/loadings.csv"))
-locs <- as.matrix(read.csv("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/fpca/locs.csv"))[,-1]
+loadings_fpca_kcv <- as.matrix(read.csv("fpca-na-kcv/test-results/loadings.csv"))
+loadings_fpca_gcv <- as.matrix(read.csv("fpca-na-gcv/test-results/loadings.csv"))
+loadings_fsvt <- as.matrix(read.csv("fsvt/test-results/right_singular_functions.csv"))
+
+
+locs <- as.matrix(read.csv("data/fpca-na/locs.csv"))[,-1]
 ```
 
 ```{r}
@@ -9,7 +13,7 @@ library(fdaPDE)
 library(femR)
 
 ## Unit square mesh ----
-meshdir = "../data/mesh/unit_square/"
+meshdir = "mesh/unit_square/"
 options(warn=-1)
 nodes = read.csv(paste0(meshdir, "points.csv"))[,2:3]
 elements = read.csv(paste0(meshdir, "elements.csv"))[,2:4]
@@ -23,10 +27,7 @@ mesh <- Mesh(
     boundary = mesh.2D$nodesmarkers
   )
 )
-
-Psi <- Vh$basis()$eval(as.matrix(locs))
 ```
-
 
 ```{r}
 library(ggplot2)
@@ -83,36 +84,39 @@ plot_stat_units <- function(stat_unit, locations, title=NULL, mybreaks=NULL, iso
 ```
 
 ```{r}
-plot_stat_units(loadings[,1],mesh$nodes())
-plot_stat_units(loadings[,2],mesh$nodes())
-plot_stat_units(loadings[,3],mesh$nodes())
+plot_stat_units(loadings_fpca_gcv[,1],mesh$nodes())
+plot_stat_units(loadings_fpca_kcv[,1],mesh$nodes())
+plot_stat_units(loadings_fsvt[,1],mesh$nodes())
+
+plot_stat_units(loadings_fpca_gcv[,2],mesh$nodes())
+plot_stat_units(loadings_fpca_kcv[,2],mesh$nodes())
+plot_stat_units(loadings_fsvt[,2],mesh$nodes())
+
+plot_stat_units(loadings_fpca_gcv[,3],mesh$nodes())
+plot_stat_units(loadings_fpca_kcv[,3],mesh$nodes())
+plot_stat_units(loadings_fsvt[,3],mesh$nodes())
 
 plot_stat_units(partial_data[6,],locations)
 ```
-
-## Reconstruction error
+## GCV scores
 ```{r}
-library(readr)
-y_partial <- as.matrix(read_csv("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/fpca/y.csv"))[,-1]
+cv_scores_kcv <- as.matrix(read.csv("fpca-na-kcv/test-results/gcv_scores.csv"))
+cv_scores_gcv <- as.matrix(read.csv("fpca-na-gcv/test-results/gcv_scores.csv"))
 
-y_rec_smoothed <- as.matrix(read.csv("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/fpca/y_reconstructed.csv"))
 
-y_imputed <- y_partial
-y_imputed[is.na(y_partial)] <- y_rec_smoothed[is.na(y_partial)]
+matplot(cbind(cv_scores_gcv,cv_scores_kcv),type="l", log="y")
+points(which.min(cv_scores_kcv),min(cv_scores_kcv))
+points(which.min(cv_scores_gcv),min(cv_scores_gcv))
 
-y_original <- as.matrix(read.csv("/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/fpca/y_complete.csv"))[,-1]
-
-sqrt(mean((y_imputed-y_original)^2))
 ```
 
-## DINEOF
+## Errors
 ```{r}
-dineof_fit <- sinkr::dineof(y_partial)
-sqrt(mean((dineof_fit$Xa-y_original)^2))
+Xn_fpca_gcv <- as.matrix(read.csv("fpca-na-gcv/test-results/reconstruction_at_locs.csv"))
+Xn_fpca_fsvt <- as.matrix(read.csv("fsvt/test-results/reconstruction_locs.csv"))
+
+mean((data$X_true-Xn_fpca_gcv)^2)
+mean((data$X_true-Xn_fpca_fsvt)^2)
 ```
 
-
-```{r}
-sum(dineof_fit$Xa - y_partial,na.rm=T)
-```
 

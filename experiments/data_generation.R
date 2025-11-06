@@ -9,7 +9,7 @@ n_nodes <- 400
 mesh <- unit_square.mesh(n_nodes, mesh_path)
 
 ## Sampling locations ----
-n_locs <- 600
+n_locs <- 900
 locs <- unit_square.locs(n_locs, data_path)
 
 # computing the Psi matrix
@@ -30,7 +30,7 @@ plot_eigenfunction(mean_locs,locs)
 
 ## Eigenfunctions ----
 n_pcs <- 3
-laplacian_square_eigenfunction <- function(a, b, locs, x_t=0.2,y_t=0.2) {
+laplacian_square_eigenfunction <- function(a, b, locs, x_t=0.2,y_t=0) {
   return(cos(a * pi * (locs[,1]-x_t)) * cos(b * pi * (locs[, 2]-y_t)))
 }
 
@@ -78,6 +78,86 @@ data <- data_generator(
   mean_locs = mean_locs,
   seed = 1412,
   filename = "y.csv")
+
+
+## Add missingness
+ind.space.NA <- function(data_vector,p=0.75){
+  size <- length(data_vector)
+  data_vector[sample(1:size,size-round(size*p))] <- NA
+  return(data_vector)
+}
+
+## missingness
+library(RANN)
+
+# Optimized distance function
+de <- function(x, y, w = 1) {
+  res <- sum((x[1:2] - y[1:2])^2)
+  if (length(x) == 3) {
+    res <- res + w^2 * (x[3] - y[3])^2
+  }
+  sqrt(res)
+}
+
+# Optimized nearest neighbor function
+nearest <- function(p, points, w = 1) {
+  distances <- apply(points, 1, de, y = p, w = w)
+  which.min(distances)
+}
+
+dep_space.NA_fast <- function(Data, 
+                              p = 0.5, 
+                              schema = "a", 
+                              mesh_ref = NULL, 
+                              locations = NULL, 
+                              RDD_groups = NULL, 
+                              w = 8) {
+  if (schema == "c") {
+    data_vector <- as.vector(Data)
+    size <- length(data_vector)
+    
+    nodes <- mesh_ref$nodes()
+    nobs <- ceiling(RDD_groups * p)
+    pts <- locations
+    
+    # Use precomputed seeds if possible
+    seeds <- nodes[sample(nrow(nodes), RDD_groups), , drop = FALSE]
+    obs_marker <- rep(0, RDD_groups)
+    obs_marker[sample(RDD_groups, nobs)] <- 1
+    
+    # Fast nearest neighbor search using RANN
+    nn_results <- nn2(seeds, pts, k = 1)  # Finds nearest seed for each location
+    nearest_idxs <- nn_results$nn.idx  # Index of the nearest seed
+    
+    # Vectorized NA assignment
+    data_vector[obs_marker[nearest_idxs] == 0] <- NA
+    
+    Data <- matrix(data = data_vector, nrow = 1, ncol = size)
+  }
+  
+  Data
+}
+
+
+## 
+partial_data <- t(apply(data$noisy_data, 1, 
+                        dep_space.NA_fast,
+                        p=0.5,
+                        schema="c",
+                        mesh_ref=mesh,
+                        locations=locs,
+                        RDD_groups=12,
+                        w=8))
+
+## Write data
+write.csv(format(partial_data, digits = 16),
+          paste0(data_path,"y.csv"))
+
+write.csv(format(locs, digits = 16),
+          paste0(data_path,"locs.csv"))
+
+write.csv(format(as.matrix(data$noisy_data), digits = 16),
+          paste0(data_path,"y_complete.csv"))
 
 
 

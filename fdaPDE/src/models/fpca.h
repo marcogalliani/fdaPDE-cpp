@@ -152,7 +152,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     matrix_t s_;                   // PCs scores
     std::vector<double> f_norm_;   // L^2 norm of estimated PCs
     matrix_t lambda_;              // selected PCs smoothing level
-  
+
     // power iteration algorithm parameters
     double tol_ = 1e-6;
     int max_iter_ = 20;
@@ -448,7 +448,7 @@ template <typename fPCASolver> class fpca_na_impl {
 
     fpca_na_impl() noexcept = default;
     fpca_na_impl(fPCASolver& fpca) noexcept :
-        fpca_(std::addressof(fpca)), smoother_(fpca.smoother()), n_dofs_(smoother_->n_dofs()) { }
+        fpca_(std::addressof(fpca)), smoother_(*fpca.smoother()), n_dofs_(fpca.smoother()->n_dofs()) { }
 
     template <typename DataT>
     auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
@@ -460,7 +460,6 @@ template <typename fPCASolver> class fpca_na_impl {
         std::vector<double> opt_lambda_mu(n_lambda);
         std::vector<double> opt_lambda_F(n_lambda);
 
-        //matrix_t U = initial_matrix(X,nan_pattern,std::vector<double>{lambda_grid[0]});
         matrix_t U = matrix_t::Zero(n_units_, n_dofs_);
         int opt_rank;
         switch (calibration) {
@@ -504,7 +503,7 @@ template <typename fPCASolver> class fpca_na_impl {
                 //}
             }
             //optimize over the grid
-            GridOptimizer<2> optimizer;
+            GridSearch<2> optimizer;
             auto optimal_lambdas = optimizer.optimize(gcv_functor,grid_2D);
             // resize to have shape: grid_sz-by-n_lambda
             gcv_scores_.resize(lambda_grid.size(),1);
@@ -655,10 +654,12 @@ template <typename fPCASolver> class fpca_na_impl {
         //construct the matrix of weights
         std::vector<int> observed_indexes = nan_pattern.which(false); // rowmajor ordering
         std::vector<triplet_t> Dwt_triplets;
+        /*
         for (int i=0; i <observed_indexes.size(); i++) Dwt_triplets.emplace_back(observed_indexes[i],observed_indexes[i],1.0);
         sparse_matrix_t Dwt(n_units_*n_locs_, n_units_*n_locs_);
         Dwt.setFromTriplets(Dwt_triplets.begin(), Dwt_triplets.end());
-        //construct the B matrix: B = ...
+        */
+        //construct the B matrix: B = [1/\sqrt{N} ones(N) kron_prod \Psi, S kron_prod Psi]
         //matrix_t design_mat(n_units_,n_units_+1);
         matrix_t design_mat(n_units_,rank+1);
         design_mat.col(0) = 1/std::sqrt(n_units_)*vector_t::Ones(n_units_);
@@ -667,6 +668,32 @@ template <typename fPCASolver> class fpca_na_impl {
         //sparse_matrix_t B(n_units_*n_locs_, (n_units_+1)*n_dofs_);
         sparse_matrix_t B(n_units_*n_locs_, (rank+1)*n_dofs_);
         B = kronecker(design_mat.sparseView(),smoother_.Psi());
+        // ALTERNATIVE: construct the B_obs matrix
+        // You already have observed_indexes (N_obs = observed_indexes.size())
+        // B is your original, full sparse matrix
+        // 1. Create the fast lookup map (old_row -> new_row)
+        std::unordered_map<int, int> row_map;
+        row_map.reserve(observed_indexes.size());
+        for (int i = 0; i < observed_indexes.size(); ++i) {
+            row_map[observed_indexes[i]] = i; // Map old_index -> new_index
+        }
+        // 2. Build B_obs by filtering B's non-zeros
+        std::vector<triplet_t> B_obs_triplets;
+        B_obs_triplets.reserve(B.nonZeros()); // Over-estimate, but fast
+        // Iterate over B (assuming B is ColMajor, which is Eigen's default)
+        for (int k = 0; k < B.outerSize(); ++k) { // Iterates over columns
+            for (typename sparse_matrix_t::InnerIterator it(B, k); it; ++it) {
+                auto map_it = row_map.find(it.row()); // Check if this row is observed
+                if (map_it != row_map.end()) {
+                    // It is! Add it to our new matrix's triplets
+                    // map_it->second is the new, compressed row index
+                    B_obs_triplets.emplace_back(map_it->second, it.col(), it.value());
+                }
+            }
+        }
+        // 3. Create the new, smaller matrix
+        sparse_matrix_t B_obs(observed_indexes.size(), B.cols());
+        B_obs.setFromTriplets(B_obs_triplets.begin(), B_obs_triplets.end());
         //construct the smoothing matrix
         //sparse_matrix_t diag_lambdas(n_units_+1,n_units_+1);
         sparse_matrix_t diag_lambdas(rank+1,rank+1);
@@ -679,8 +706,8 @@ template <typename fPCASolver> class fpca_na_impl {
         diag_lambdas.setFromTriplets(lambda_triplets.begin(),lambda_triplets.end());
         //smoothing matrix
         SparseBlockMatrix<double, 2, 2> A(
-               B.transpose()*Dwt*B,                            kronecker(diag_lambdas,smoother_.stiff()),
-               kronecker(diag_lambdas,smoother_.stiff()),  kronecker(-diag_lambdas,smoother_.mass())
+               B_obs.transpose()*B_obs /*B.transpose()*Dwt*B*/, kronecker(diag_lambdas,smoother_.stiff()),
+               kronecker(diag_lambdas,smoother_.stiff()), kronecker(-diag_lambdas,smoother_.mass())
                );
         //Trace estimation
         //sample from the rademacher distribution
@@ -697,11 +724,11 @@ template <typename fPCASolver> class fpca_na_impl {
         invA.compute(A);
         //building the target
         matrix_t target = matrix_t::Zero(2*B.cols(),n_mc_samples_);
-        target.topRows(B.cols()) = B.transpose()*Dwt*Us;
+        target.topRows(B.cols()) = B.transpose()*Us;//B.transpose()*Dwt*Us;
         matrix_t y = invA.solve(target);
         //compute e^T*S_m(lambda)*y and estimate the trace by averaging these values
         double trS = 0.0;   // monte carlo Tr[S_m] approximation
-        for (int i = 0; i < n_mc_samples_; ++i) { trS += Us.col(i).dot(B*y.topRows(B.cols()).col(i)); }
+        for (int i = 0; i < n_mc_samples_; ++i) { trS += Us.col(i).dot(B*y.topRows(B.cols()).col(i)); }//Us.col(i).dot(Dwt*B*y.topRows(B.cols()).col(i)); }
         trS =  trS / n_mc_samples_;
         return trS;
     }
@@ -823,7 +850,7 @@ template <typename VariationalSolver> class fPCA {
             bool computeMean = !(flag & DoNotComputeMean);
             if (computeMean) {
                 smoother_.update_response(centred_data.colwise().mean());
-                GridOptimizer<1> opt;
+                GridSearch<1> opt;
                 auto gcv_functor = [&](auto lambda) {
                     smoother_.fit(lambda);
                     double dor =  n_locs_ - smoother_.edf();  // residual degrees of freedom

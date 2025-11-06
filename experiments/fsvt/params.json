@@ -4,7 +4,8 @@
     "data": "/Users/marcogalliani/Projects/fdaPDE-cpp/experiments/data/fpca-na"
   },
   "RunParams": {
-    "lambda_grid": [0.0000001,0.000001,0.00001,0.0001,0.001,0.01,0.1],
-    "n_pc": 3
+    "lambda_grid": [0.001],
+    "sing_val_th": 1,
+    "max_rank": 50
   }
 }
