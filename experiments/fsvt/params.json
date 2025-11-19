@@ -5,7 +5,7 @@
   },
   "RunParams": {
     "lambda_grid": [0.001],
-    "sing_val_th": 1,
+    "sing_val_th": 30,
     "max_rank": 50
   }
 }

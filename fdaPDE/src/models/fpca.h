@@ -388,6 +388,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
 
 
 // utilities to handle k-fold cross-validation in the case of missing data
+// only supports 2D data
 class k_fold_missing_cv_impl {
 private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
@@ -461,6 +462,9 @@ template <typename fPCASolver> class fpca_na_impl {
         std::vector<double> opt_lambda_F(n_lambda);
 
         matrix_t U = matrix_t::Zero(n_units_, n_dofs_);
+        //smoother_.update_response((~nan_pattern).select(X,0).colwise().mean().transpose());
+        //smoother_.fit(1e-15);
+        //U.rowwise() += smoother_.f().transpose(); // start by imputing the mean
         int opt_rank;
         switch (calibration) {
         case 0: {   // no calibration
@@ -470,6 +474,7 @@ template <typename fPCASolver> class fpca_na_impl {
             opt_rank = rank;
         } break;
         case OptimizeGCV: {
+            /*
             //define the gcv functor
             auto gcv_functor = [&](auto params) {
                 std::vector<double> lambda_mu(n_lambda);
@@ -479,15 +484,16 @@ template <typename fPCASolver> class fpca_na_impl {
 
                 matrix_t U_init = U;
                 matrix_t center, F, S;
-                for (int k = 1; k <= rank; ++k) {
+                // for (int k = 1; k <= rank; ++k) {
+                    int k = rank;
                     const auto& [c, f, s] = solve_(X, nan_pattern, U_init, k, lambda_mu,lambda_F, flag & 0b1001);
                     U_init = s * f.transpose(); // reconstruction update
                     U_init.rowwise() += c.transpose();
                     center = c; S=s; F=f;
-                }
+                //}
                 double edf = edf_(nan_pattern, center.col(0), S, F, rank, lambda_mu,lambda_F);
-                double dor = n_units_*n_locs_ - edf;
-                double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * (~nan_pattern).select(X - U_init*smoother_.Psi().transpose(), 0).squaredNorm();;
+                double dor = n_units_*n_locs_ - 1.6*edf; //the 1.6 correct the tendency of gcv to undersmooth the data
+                double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * (~nan_pattern).select(X - U_init*smoother_.Psi().transpose(), 0).squaredNorm();
 
                 return gcv;
             };
@@ -515,6 +521,28 @@ template <typename fPCASolver> class fpca_na_impl {
             std::copy(optimal_lambdas.begin(), optimal_lambdas.begin()+n_lambda, opt_lambda_mu.begin());
             std::copy(optimal_lambdas.begin()+n_lambda, optimal_lambdas.begin()+2*n_lambda, opt_lambda_F.begin());
             opt_rank = rank; //optimal_lambdas[optimal_lambdas.size()-1];
+            */
+            // rank selection
+            gcv_scores_.resize(lambda_grid.size(),rank);
+            matrix_t U_init = matrix_t::Zero(n_units_, n_dofs_); //starting guess
+            for(int i = 0; i < lambda_grid.size(); ++i) {
+                // repeat for increasing rank
+                for (int k = 1; k <= rank; ++k) {
+                    // TEMPORARY FIX: std::vector<double>{double} is not nice
+                    const auto& [mu, F, S] = solve_(X, nan_pattern, U_init,k, std::vector<double>{lambda_grid[i]},std::vector<double>{lambda_grid[i]}, flag & 0b1001);
+                    U_init = S * F.transpose();
+                    U_init.rowwise() += mu.transpose(); // reconstruction update
+                    // compute gcv
+                    double edf = edf_(nan_pattern, mu, S, F, k, std::vector<double>{lambda_grid[i]},std::vector<double>{lambda_grid[i]});
+                    double dor = n_units_*n_locs_ - 1.6*edf; //the 1.6 correct the tendency of gcv to undersmooth the data
+                    double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * (~nan_pattern).select(X - U_init*smoother_.Psi().transpose(), 0).squaredNorm();
+                    gcv_scores_(i, k-1) = gcv;
+                } // rank-recursion
+            } // iteration over the lambda
+            Eigen::Index opt_lambda_idx, opt_rank_idx;
+            gcv_scores_.minCoeff(&opt_lambda_idx, &opt_rank_idx);
+            opt_lambda_mu = opt_lambda_F = std::vector<double>{lambda_grid[opt_lambda_idx]};
+            opt_rank = opt_rank_idx + 1; //rank grid is always {1,...,rank}
         } break;
         case OptimizeMSRE: {
             auto k_fold_cv = k_fold_missing_cv_impl(X,n_folds_);
@@ -562,7 +590,6 @@ template <typename fPCASolver> class fpca_na_impl {
         f_norm_.resize(opt_rank);
         lambda_.resize(opt_rank+1, n_lambda);
         // fit with optimal lambda
-        //matrix_t U = matrix_t::Zero(n_units_, n_dofs_); //starting guess
         for (int k = 1; k <= opt_rank; ++k) {
             const auto& [center, F, S] = solve_(X, nan_pattern, U,k, opt_lambda_mu,opt_lambda_F, flag & flag & 0b1001);
             U = S * F.transpose(); // reconstruction update
@@ -635,8 +662,6 @@ template <typename fPCASolver> class fpca_na_impl {
             Jold = Jnew;
             Un = U * smoother_.Psi().transpose();
             Jnew = ((~nan).select(X - Un, 0)).squaredNorm() + n_units_*mu.transpose()*smoother_.P(lambda_mu)*mu + (f.transpose() * smoother_.P(lambda_F) * f).trace();
-            //double edf = edf_(nan, mu, S, F, rank, lambda_F);
-            //Jnew = n_units_*n_locs_*((~nan).select(X - Un, 0)).squaredNorm()/std::pow(n_units_*n_locs_ - edf,2);
             if (almost_equal(Jnew, Jold, tol_) || n_iter == max_iter_) {
                 center = mu; F = f; S = s;
             }

@@ -24,10 +24,6 @@ log_mean_generator <- function(locs) {
   ## I want a function between -1 and 1
   return((2 * log((locs[, 1] + locs[, 2]) + 1) / log(3) - 1))
 }
-sin_mean_generator <- function(locs) {
-  ## I want a function between -1 and 1
-  return(sin(4 * pi * locs[, 1]) * sin(4 * pi * locs[, 2]) * exp(-4*((locs[, 1]-0.5)^2 + (locs[, 2]-0.5)^2)))
-}
 ```
 
 
@@ -169,41 +165,132 @@ $$
 S^TS=I_r
 $$
 
+### Wrappers
 ```{r}
-fpca_na <- function(model_name) {
+#' Wrapper for C++-based fPCA models
+#' This function runs the external C++ executable and reads/formats the results
+#' into a standardized list.
+run_fpca_na <- function(partial_data, model_name, data_path) {
+  ## write data to cpp solver
+  write.csv(format(as.matrix(partial_data), digits = 16),
+            paste0(data_path, "y.csv"))
+  
   ## Initialize empty model
   model <- list()
-  cpp_path <- paste0(model_name,"/")
-  results_path <- paste0(cpp_path,"test-results/")
+  cpp_path <- paste0(model_name, "/")
+  results_path <- paste0(cpp_path, "test-results/")
+  
   # Run C++ executable ----
   start.time <- Sys.time()
   system(paste0("cd ", model_name, " && ", "./fit_model"),
          ignore.stdout = F)
   end.time <- Sys.time()
-  cat(paste("finished after", end.time - start.time, attr(end.time - start.time, "units"), "\n"))
   
-  # Save results ----
-  ## Load results ----
-  model$results$center <- as.matrix(read.csv(paste0(results_path, "center.csv")))
-  model$results$center_locs <- as.matrix(read.csv(paste0(results_path, "center_locs.csv")))
-  model$results$loadings <- as.matrix(read.csv(paste0(results_path, "loadings.csv")))
-  model$results$loadings_locs <- as.matrix(read.csv(paste0(results_path, "loadings_locs.csv")))
-  model$results$scores <- as.matrix(read.csv(paste0(results_path, "scores.csv")))
-  model$results$X_hat <- as.matrix(read.csv(paste0(results_path, "reconstruction.csv")))
-  model$results$X_hat_locs <- as.matrix(read.csv(paste0(results_path, "reconstruction_at_locs.csv")))
-  model$results$lambda <- as.matrix(read.csv(paste0(results_path, "lambda.csv")))
-  model$results$gcv_scores <- as.matrix(read.csv(paste0(results_path, "gcv_scores.csv")))
-  model$results$execution_time <- end.time - start.time
+  # Load results ----
+  results <- list()
+  results$center_locs <- as.matrix(read.csv(paste0(results_path, "center_locs.csv")))
+  results$loadings_locs <- as.matrix(read.csv(paste0(results_path, "loadings_locs.csv")))
+  results$scores <- as.matrix(read.csv(paste0(results_path, "scores.csv")))
+  results$X_hat_locs <- as.matrix(read.csv(paste0(results_path, "reconstruction_at_locs.csv")))
+  results$execution_time <- end.time - start.time
   
-  # Add flags ----
-  model$model_traits$is_functional <- FALSE
-  model$model_traits$has_interpolator <- FALSE
+  # Standardize output
+  return(list(
+    method = model_name,
+    rank = ncol(results$loadings_locs),
+    center_locs = as.vector(results$center_locs),
+    loadings_locs = results$loadings_locs,
+    scores = results$scores,
+    X_hat_locs = results$X_hat_locs, # Smoothed reconstruction
+    X_imputed = results$X_hat_locs,  # For fpca, imputation = reconstruction
+    execution_time = results$execution_time
+  ))
+}
+
+#' Wrapper for DINEOF
+#' This function runs sinkr::dineof, performs PCA on the result, and
+#' formats the output into a standardized list.
+run_dineof <- function(partial_data, n_comp) {
+  start.time <- Sys.time()
+  dineof_fit <- sinkr::dineof(partial_data)
+  pca_fit <- wrapped_pca(dineof_fit$Xa, center = TRUE, n_comp = n_comp)
+  end.time <- Sys.time()
   
-  return(model)
+  # Standardize output
+  return(list(
+    method = "dineof",
+    rank = dineof_fit$n.eof,
+    center_locs = as.vector(pca_fit$results$X_mean_locs),
+    loadings_locs = pca_fit$results$loadings_locs,
+    scores = pca_fit$results$scores,
+    X_hat_locs = pca_fit$results$X_hat_locs, # Smoothed reconstruction
+    X_imputed = dineof_fit$Xa,              # DINEOF's imputation
+    execution_time = end.time - start.time
+  ))
+}
+
+#' Wrapper for SoftImpute
+#' This function runs softImpute::softImpute and formats the output
+#' into a standardized list.
+#' It uses cv.softImpute to automatically select the best lambda.
+
+library(RMCLab)
+run_soft_impute <- function(partial_data, n_pc, rank = 50, lambda = 30) {
+  start.time <- Sys.time()
+  
+  calibrate_soft_impute <- soft_impute_tune(partial_data, 
+                        lambda = fraction_grid(nb_lambda = 6, 
+                                               reverse = TRUE),
+                        splits = cv_folds_control(K = 5L))
+
+  
+  end.time <- Sys.time()
+  
+  # Reconstruct results from the fit at lambda.min
+  # cv_fit itself is a softImpute object fit at lambda.min
+  loadings_at_locs <- calibrate_soft_impute$fit$svd$v
+  scores <- calibrate_soft_impute$fit$svd$u %*% diag(calibrate_soft_impute$fit$svd$d)
+  X_reconstructed <- calibrate_soft_impute$fit$X
+  
+  # Standardize output
+  return(list(
+    method = "soft_impute",
+    rank = length(calibrate_soft_impute$fit$sv$d), # The rank at the optimal lambda
+    # softImpute centers, but doesn't return the mean.
+    # We follow the original script's convention of using 0 for the metric.
+    center_locs = rep(0, ncol(partial_data)), 
+    loadings_locs = loadings_at_locs,
+    scores = scores,
+    X_hat_locs = X_reconstructed, # Smoothed reconstruction
+    X_imputed = X_reconstructed,  # Imputation
+    execution_time = end.time - start.time
+  ))
+}
+
+
+#' General model-fitting dispatcher
+#' This function calls the appropriate wrapper based on the model name.
+fit_model <- function(model_name, partial_data, data_path, n_pc) {
+  switch(model_name,
+    fpca_na_gcv = {
+      return(run_fpca_na(partial_data, "fpca-na-gcv", data_path))
+    },
+    dineof = {
+      return(run_dineof(partial_data, n_pc))
+    },
+    soft_impute = {
+      # Using default params from original loop
+      return(run_soft_impute(partial_data, n_pc, rank = 50, lambda = 30))
+    },
+    {
+      stop(paste("The model", model_name, "does not exist"))
+    }
+  )
 }
 ```
 
 
+### Run
 ```{r message=FALSE, warning=FALSE}
 test_results <- list()
 n_replicas <- 10
@@ -214,17 +301,19 @@ n_pc <- 3
 run_id <- 1
 library(progressr)
 handlers(handler_txtprogressbar(style = 3))  
-n_total <- n_replicas
+n_total <- n_replicas * length(models_to_run) # Total steps
+
+# Define the models to test
+models_to_run <- c("fpca_na_gcv", "dineof", "soft_impute")
+mean_at_locs <- rep(0, nrow(locations)) #log_mean_generator(locations)
 
 # Progress bar
 progressr::with_progress({
-p <- progressor(steps = n_total)
+p <- progressor(steps = n_replicas * length(models_to_run))
 # ---
 
-
-mean_at_locs <- log_mean_generator(locations)
-
 for(i in 1:n_replicas){
+  
   # Generate data
   data <- data_generator(
     n_units,
@@ -233,158 +322,12 @@ for(i in 1:n_replicas){
     scores_sd = c(0.4,0.3,0.2),
     error_sd = 0.1,
     obs_path = data_path,
-    mean_locs = mean_at_locs,
+    mean_locs = rep(0, n_locs),#mean_at_locs,
     seed = seed + 4*i,
     filename = "y_complete.csv"
   )
   # Add missingness
   partial_data <- t(apply(data$noisy_data, 1, 
-      dep_space.NA_fast,
-      p=0.5,
-      schema="c",
-      mesh_nodes=mesh$nodes(),
-      locations=locations,
-      RDD_groups=12))
-      
-  write.csv(format(as.matrix(partial_data), digits = 16),
-            paste(data_path,"y.csv",sep=""))
-  
-
-  p(message = sprintf("Replica %d" , i))
-  
-  # (1) fpca-kcv reconstruction----
-  model <- fpca_na("fpca-na-kcv")
-  res <- model$results
-  
-  X_fpca_imputation <- partial_data
-  X_fpca_imputation[is.na(partial_data)] <- res$X_hat_locs[is.na(partial_data)]
-
-  # Store results
-  global_metrics <- list(
-    replica = i,
-    method = "fpca-na-kcv",
-    rank = ncol(res$loadings),
-    centering = sqrt(mean((mean_at_locs-res$center_locs)^2)),
-    imputation_err =
-      sqrt(mean((data$X_true[is.na(partial_data)] - X_fpca_imputation[is.na(partial_data)])^2)),
-    reconstruction_err =
-      sqrt(mean((data$X_true - res$X_hat_locs)^2))
-  )
-
-  max_rank <- min(ncol(res$loadings),ncol(test_functions.at_locs))
-  aligned_loadings.at_locs <-
-    align_cols(res$loadings_locs[,1:max_rank],test_functions.at_locs[,1:max_rank])
-  aligned_scores <-
-    align_cols(res$scores[,1:max_rank],data$scores[,1:max_rank])
-  component_metrics <- lapply(seq_len(max_rank),
-                              function(j) {
-    list(
-      index = j,
-      RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
-      RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
-    )
-  })
-  test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
-  run_id <- run_id + 1
-  
-  
-  # (2) fpca-gcv reconstruction----
-  model <- fpca_na("fpca-na-gcv")
-  res <- model$results
-  
-  X_fpca_imputation <- partial_data
-  X_fpca_imputation[is.na(partial_data)] <- res$X_hat_locs[is.na(partial_data)]
-
-  # Store results
-  global_metrics <- list(
-    replica = i,
-    method = "fpca-na-gcv",
-    rank = ncol(res$loadings),
-    centering = sqrt(mean((mean_at_locs-res$center_locs)^2)),
-    imputation_err =
-      sqrt(mean((data$X_true[is.na(partial_data)] - X_fpca_imputation[is.na(partial_data)])^2)),
-    reconstruction_err =
-      sqrt(mean((data$X_true - res$X_hat_locs)^2))
-  )
-
-  max_rank <- min(ncol(res$loadings),ncol(test_functions.at_locs))
-  aligned_loadings.at_locs <-
-    align_cols(res$loadings_locs[,1:max_rank],test_functions.at_locs[,1:max_rank])
-  aligned_scores <-
-    align_cols(res$scores[,1:max_rank],data$scores[,1:max_rank])
-  component_metrics <- lapply(seq_len(max_rank),
-                              function(j) {
-    list(
-      index = j,
-      RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
-      RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
-    )
-  })
-  test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
-  run_id <- run_id + 1
-  
-  # (3) DINEOF----
-  start.time <- Sys.time()
-  dineof_fit <- sinkr::dineof(partial_data)
-  pca_fit <- wrapped_pca(dineof_fit$Xa, center = T, n_comp = n_pc)
-  end.time <- Sys.time()
-  cat(paste("dineof: finished after", 
-            end.time - start.time, attr(end.time - start.time, "units"), "\n"))
-  # Read results
-  loadings_at_locs <- pca_fit$results$loadings_locs
-  scores <- pca_fit$results$scores
-  
-  X_smoothed <- pca_fit$results$X_hat_locs
-  
-  # Store results
-  global_metrics <- list(
-    replica = i,
-    method = "dineof",
-    rank = dineof_fit$n.eof,
-    centering = 
-      sqrt(mean((mean_at_locs-pca_fit$results$X_mean_locs)^2)),
-    imputation_err =
-      sqrt(mean(
-        (data$X_true[is.na(partial_data)] - dineof_fit$Xa[is.na(partial_data)] )^2
-        )),
-    reconstruction_err =
-      sqrt(mean((data$X_true - X_smoothed)^2))
-  )
-  
-  
-  max_rank <- 
-  aligned_loadings.at_locs <- align_cols(loadings_at_locs, test_functions.at_locs)
-  aligned_scores <- align_cols(scores,data$scores)
-  component_metrics <- lapply(seq_len(min(n_pc,ncol(loadings_at_locs))), 
-                              function(j) {
-    list(
-      index = j,
-      RMSE.PC = sqrt(mean((aligned_loadings.at_locs[,j]-test_functions.at_locs[,j])^2)),
-      RMSE.Scores = sqrt(mean((aligned_scores[,j]-data$scores[,j])^2))
-    )
-  })
-  test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
-  run_id <- run_id + 1
-}
-### ---
-})
-```
-
-
-```{r}
-data <- data_generator(
-    n_units,
-    true_PCs = as.matrix(test_functions),
-    Psi = Psi,
-    scores_sd = c(0.4,0.3,0.2),
-    error_sd = 1,
-    obs_path = data_path,
-    mean_locs = mean_at_locs,
-    seed = seed + 4*i,
-    filename = "y_complete.csv"
-  )
-# Add missingness
-partial_data <- t(apply(data$noisy_data, 1, 
     dep_space.NA_fast,
     p=0.5,
     schema="c",
@@ -392,34 +335,73 @@ partial_data <- t(apply(data$noisy_data, 1,
     locations=locations,
     RDD_groups=12))
     
-write.csv(format(as.matrix(partial_data), digits = 16),
-          paste(data_path,"y.csv",sep=""))
-
-
-model <- fpca_na("fpca-na-gcv")
-res <- model$results
+  # --- Run all models ---
+  for (model_name in models_to_run) {
+    
+    p(message = sprintf("Replica %d, Model: %s", i, model_name))
+    
+    # Fit the model using the dispatcher
+    res <- fit_model(model_name, partial_data, data_path, n_pc)
+    
+    # --- Generic Metric Calculation ---
+    
+    # Create imputed dataset for metric calculation
+    # (Uses the model-specific imputation)
+    X_imputation <- partial_data
+    X_imputation[is.na(partial_data)] <- res$X_imputed[is.na(partial_data)]
+    
+    # Store global results
+    global_metrics <- list(
+      replica = i,
+      method = res$method,
+      rank = res$rank,
+      centering = sqrt(mean((mean_at_locs - res$center_locs)^2)),
+      imputation_err =
+        sqrt(mean((data$X_true[is.na(partial_data)] - X_imputation[is.na(partial_data)])^2)),
+      reconstruction_err =
+        sqrt(mean((data$X_true - res$X_hat_locs)^2))
+    )
+    
+    # Store component-wise results
+    max_rank <- min(ncol(res$loadings_locs), ncol(test_functions.at_locs), n_pc)
+    
+    if (res$rank > 0 && max_rank > 0) {
+      aligned_loadings.at_locs <-
+        align_cols(res$loadings_locs[, 1:max_rank, drop = FALSE], 
+                   test_functions.at_locs[, 1:max_rank, drop = FALSE])
+      aligned_scores <-
+        align_cols(res$scores[, 1:max_rank, drop = FALSE], 
+                   data$scores[, 1:max_rank, drop = FALSE])
+      
+      component_metrics <- lapply(seq_len(max_rank),
+        function(j) {
+          list(
+            index = j,
+            RMSE.PC = sqrt(mean((aligned_loadings.at_locs[, j] - test_functions.at_locs[, j])^2)),
+            RMSE.Scores = sqrt(mean((aligned_scores[, j] - data$scores[, j])^2))
+          )
+        })
+    } else {
+      # No components found or mismatch, store 0s
+      component_metrics <- lapply(seq_len(n_pc), 
+        function(j) {
+          list(index = j, RMSE.PC = NA, RMSE.Scores = NA)
+        })
+    }
+    
+    test_results[[run_id]] <- list(global = global_metrics, components = component_metrics)
+    run_id <- run_id + 1
+    
+    cat(paste(res$method, ": finished after", 
+              round(res$execution_time, 2), 
+              attr(res$execution_time, "units"), "\n"))
+  }
+}
+### ---
+})
 ```
 
-
-
-```{r}
-idx <- 3
-
-mybreaks <- c(-Inf, 
-              seq(min(data$X_true[idx,],na.rm=T), 
-                  max(data$X_true[idx,],na.rm=T),
-                  length.out = 50), 
-              Inf)
-
-
-plot_stat_units(data$X_true[idx,],locations, mybreaks = mybreaks)
-plot_stat_units(res$X_hat_locs[idx,],locations,mybreaks = mybreaks)
-plot_stat_units(data$noisy_data[idx,],locations,mybreaks = mybreaks)
-plot_stat_units(partial_data[idx,],locations,mybreaks = mybreaks)
-```
-
-
-
+### Flatten results
 ```{r}
 # Flattening the results in convenient ways
 library(dplyr)
@@ -430,12 +412,12 @@ library(tibble)
 component_df <- NULL
 # Step 1: Flatten component-level data with global info
 component_df <- map_dfr(test_results, function(res) {
+  if (is.null(res$components)) return(NULL) # Skip if components are missing
   global_info <- as_tibble(res$global)
   map_dfr(res$components, function(comp) {
     bind_cols(global_info, as_tibble(comp))
   })
 })
-
 
 final_results <- NULL
 # Step 2: Pivot to wide format, creating one column per component metric
@@ -448,133 +430,31 @@ final_results <- component_df %>%
   )
 ```
 
-## Visualization
-
-### Data
-
-```{r}
-plot_stat_units(colMeans(partial_data,na.rm=T),locations)
-plot_stat_units(mean_at_locs,locations)
-```
-```{r}
-plot_stat_units(loadings_at_locs[,1],locations)
-plot_stat_units((Psi%*%data$pcs)[,1],locations)
-```
-
-
-### Results
-
-```{r}
-save <- F
-
-if(save){
- readr::write_csv(format(as.data.frame(final_results), digits = 16),
-          paste("test-results",
-                paste("calibrated-fpca-missing",
-                      "-Mesh", n_nodes,
-                      "-Obs", n_units,
-                      "-Locs",n_locs, 
-                      ".csv",sep=""),
-          sep="/")
-) 
-}
-```
-
-
+## Results
 
 ```{r}
 source("utils/plot_utils.R")
 
 color_map <- c(
-  "fpca-na-gcv" = "yellow",
+  "fpca_na_gcv" = "yellow",
   "fpca-na-kcv" = "#2297E6",
-  "dineof" = "#DF536B")
+  "dineof" = "#DF536B",
+  "soft_impute" = "green" # Added color for new method
+  )
 
 plots_path <- "plots"
-```
-
-
-Principal functions
-```{r}
-for(i in 1:n_pc){
-  errPC.plot <- ggplot(final_results, 
-                       aes(x=method, 
-                           y=get(paste("RMSE.PC_",i,sep="")), 
-                           fill=factor(method, levels = c("fpca-na-gcv","fpca-na-kcv","dineof")))) + 
-    geom_boxplot() +
-    scale_fill_manual(values = color_map) +
-    theme_light() +
-    labs(y=paste("RMSE PC",i,sep=""),fill=NULL)  +
-    theme(text = element_text(size=25), legend.position = "top") +
-    guides(color="none", fill="none")  
-
-  print(errPC.plot)
-  
-  if(save){
-    ggsave(paste(plots_path,
-               "/errPC",i,
-             ".pdf", sep=""), 
-       errPC.plot, width = 10, height = 5)
-  }
-}
-```
-
-PC scores
-```{r}
-for(i in 1:n_pc){
-  errScores.plot <- ggplot(final_results, 
-                       aes(x=method, 
-                           y=get(paste("RMSE.Scores_",i,sep="")), 
-                           fill=factor(method, levels = c("fPCA-GCV","dineof")))) + 
-    geom_boxplot() +
-    scale_fill_manual(values = color_map) +
-    theme_light() +
-    labs(y=paste("RMSE Scores",i,sep=""),fill=NULL)  +
-    theme(text = element_text(size=25), legend.position = "top") +
-    guides(color="none", fill="none")  
-
-  print(errScores.plot)
-  
-  if(save){
-    ggsave(paste(plots_path,
-               "/errScores",i,
-             ".pdf", sep=""), 
-       errScores.plot, width = 10, height = 5)
-  }
-}
-```
-
-```{r}
-imputation_err.plot <- ggplot(final_results, 
-                       aes(x=method, 
-                           y=get("imputation_err"), 
-                           fill=factor(method, levels = c("fpca-na-gcv","fpca-na-kcv","dineof")))) + 
-    geom_boxplot() +
-    scale_fill_manual(values = color_map) +
-    theme_light() +
-    labs(y="imputation error",fill=NULL)  +
-    theme(text = element_text(size=25), legend.position = "top") +
-    guides(color="none", fill="none")  
-
-print(imputation_err.plot)
-  
-if(save){
-  ggsave(paste(plots_path,
-             "/imputation_err",
-           ".pdf", sep=""), 
-     imputation_err.plot, width = 10, height = 5)
-}
+all_methods <- c("fpca_na_gcv", "dineof", "soft_impute")
 ```
 
 ```{r}
 reconstruction_err.plot <- ggplot(final_results, 
-                       aes(x=method, 
-                           y=get("reconstruction_err"), 
-                           fill=factor(method, levels = c("fpca-na-gcv","fpca-na-kcv","dineof")))) + 
+                                  aes(x = method, 
+                                      y = get("reconstruction_err"), 
+                                      fill = factor(method, levels = all_methods))) + 
     geom_boxplot() +
-    scale_fill_manual(values = color_map) +
+    scale_fill_manual(values = color_map, drop = FALSE) +
     theme_light() +
-    labs(y="reconstruction error",fill=NULL)  +
+    labs(y = "reconstruction error", fill = NULL)  +
     theme(text = element_text(size=25), legend.position = "top") +
     guides(color="none", fill="none")  
 
@@ -582,53 +462,31 @@ print(reconstruction_err.plot)
   
 if(save){
   ggsave(paste(plots_path,
-             "/reconstruction_err",
+           "/reconstruction_err",
            ".pdf", sep=""), 
      reconstruction_err.plot, width = 10, height = 5)
 }
 ```
 
 ```{r}
-rank.plot <- ggplot(final_results, 
-                       aes(x=method, 
-                           y=get("rank"), 
-                           fill=factor(method, levels = c("fPCA","dineof")))) + 
+
+
+§
+
+
+
+imputation_err.plot <- ggplot(final_results, 
+                                  aes(x = method, 
+                                      y = get("imputation_err"), 
+                                      fill = factor(method, levels = all_methods))) + 
     geom_boxplot() +
-    scale_fill_manual(values = color_map) +
+    scale_fill_manual(values = color_map, drop = FALSE) +
     theme_light() +
-    labs(y="rank",fill=NULL)  +
+    labs(y = "imputation error", fill = NULL)  +
     theme(text = element_text(size=25), legend.position = "top") +
     guides(color="none", fill="none")  
 
-print(rank.plot)
-  
-if(save){
-  ggsave(paste(plots_path,
-             "/reconstruction_err",i,
-           ".pdf", sep=""), 
-     rank.plot, width = 10, height = 5)
-}
+print(imputation_err.plot)
 ```
 
-```{r}
-centering.plot <- ggplot(final_results, 
-                       aes(x=method, 
-                           y=get("centering"), 
-                           fill=factor(method, levels = c("fpca-na-gcv","fpca-na-kcv","dineof")))) + 
-    geom_boxplot() +
-    scale_fill_manual(values = color_map) +
-    theme_light() +
-    labs(y="centering error",fill=NULL)  +
-    theme(text = element_text(size=25), legend.position = "top") +
-    guides(color="none", fill="none")  
-
-print(centering.plot)
-  
-if(save){
-  ggsave(paste(plots_path,
-             "/centering_err",
-           ".pdf", sep=""), 
-     centering.plot, width = 10, height = 5)
-}
-```
 

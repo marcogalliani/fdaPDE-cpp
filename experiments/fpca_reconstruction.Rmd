@@ -1,9 +1,13 @@
-
+Run the `data_generation.R` script before!
 ```{r}
-loadings_fpca_kcv <- as.matrix(read.csv("fpca-na-kcv/test-results/loadings.csv"))
-loadings_fpca_gcv <- as.matrix(read.csv("fpca-na-gcv/test-results/loadings.csv"))
-loadings_fsvt <- as.matrix(read.csv("fsvt/test-results/right_singular_functions.csv"))
+loadings <- list()
+model_names <- c("fpca-na-gcv","fsvt")
 
+for(model_name in model_names){
+  system(paste0("cd ", model_name, " && ", "./fit_model"),
+         ignore.stdout = F)
+  loadings[[model_name]] <- as.matrix(read.csv(paste0(model_name,"/test-results/loadings.csv")))
+}
 
 locs <- as.matrix(read.csv("data/fpca-na/locs.csv"))[,-1]
 ```
@@ -84,19 +88,11 @@ plot_stat_units <- function(stat_unit, locations, title=NULL, mybreaks=NULL, iso
 ```
 
 ```{r}
-plot_stat_units(loadings_fpca_gcv[,1],mesh$nodes())
-plot_stat_units(loadings_fpca_kcv[,1],mesh$nodes())
-plot_stat_units(loadings_fsvt[,1],mesh$nodes())
-
-plot_stat_units(loadings_fpca_gcv[,2],mesh$nodes())
-plot_stat_units(loadings_fpca_kcv[,2],mesh$nodes())
-plot_stat_units(loadings_fsvt[,2],mesh$nodes())
-
-plot_stat_units(loadings_fpca_gcv[,3],mesh$nodes())
-plot_stat_units(loadings_fpca_kcv[,3],mesh$nodes())
-plot_stat_units(loadings_fsvt[,3],mesh$nodes())
-
-plot_stat_units(partial_data[6,],locations)
+for(idx in 1:3){
+  for(model_name in model_names){
+    print(plot_stat_units(loadings[[model_name]][,idx],mesh$nodes()))
+  }
+}
 ```
 ## GCV scores
 ```{r}

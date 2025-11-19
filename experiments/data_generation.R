@@ -4,6 +4,9 @@ source("data/mesh_utils.R")
 data_path <- "data/fpca-na/"
 mesh_path <- "mesh/unit_square/"
 
+
+
+
 ## Mesh ----
 n_nodes <- 400
 mesh <- unit_square.mesh(n_nodes, mesh_path)
@@ -25,6 +28,9 @@ log_mean_generator <- function(locs) {
   ## I want a function between -1 and 1
   return((2 * log((locs[, 1] + locs[, 2]) + 1) / log(3) - 1))
 }
+
+
+
 mean_locs <- log_mean_generator(locs)
 plot_eigenfunction(mean_locs,locs)
 

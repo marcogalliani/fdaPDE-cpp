@@ -87,6 +87,12 @@ template <typename fPCASolver> class fsvt_impl {
         // init algorithm
         matrix_t Xh = Xh0;
         matrix_t Xhn = Xh * smoother_.Psi().transpose();
+        // smoothing matrix
+        // normalise results with respect to the norm induced by the smoother: \norm{f} = \sqrt{f^\top*(\Psi^\top\Psi + P_{\lambda})*f}
+        vector_t lumped_mass = lump(smoother_.mass()).diagonal(); // use mass lumping for efficiency
+        // WARNING: only supports single lambda (e.g., fe_ls_separable not supported)
+        // possible solution: implemente lumped mass within each solver
+        Eigen::SparseMatrix<double> smooth_mat = smoother_.Psi().transpose() * smoother_.Psi() + lambda[0]*smoother_.stiff()*lumped_mass.cwiseInverse().asDiagonal()*smoother_.stiff();
         // MM scheme
         /* Majorization: -> impute the data with previous estimate
          * Minimisation: -> proximal operator (singular value thresholding)
@@ -101,15 +107,21 @@ template <typename fPCASolver> class fsvt_impl {
             // fPCA on imputed data (using a large enough rank)
             auto [v, u] = fpca_->fit(Xn.transpose(), max_rank_, lambda, flag & 0x1); //always run with no calibration
             // assemble singular value decomposition
-            vector_t sigma = u.colwise().norm().transpose();
-            u.array().rowwise() /= sigma.array().transpose();
+            vector_t sigma(max_rank_);
+            for (int i = 0; i < max_rank_; ++i) {
+                // normalisation
+                sigma(i) = std::sqrt(v.col(i).dot(smooth_mat * v.col(i))); // norm w.r.t. the modified inner product
+                v.col(i) /= sigma(i);
+                sigma(i) *= u.col(i).norm(); // norm l2
+                u.col(i) /= u.col(i).norm();
+            }
             // shrink sigma values
             sigma = (sigma.array() - singular_val_threshold_).max(0.0).matrix();
             // find rank
             int rank_kept = 0;
             for (rank_kept = 0; rank_kept < sigma.size(); ++rank_kept) {
                 // Use a small tolerance for floating point comparison
-                if (sigma(rank_kept) == 0) {
+                if (sigma(rank_kept) < 1e-15) {
                     break; // Stop at the first value that is effectively zero
                 }
             }
