@@ -620,10 +620,11 @@ template <typename fPCASolver> class fpca_na_impl {
         }
         // iterate until the MM scheme converges
         int n_iter = 0;
+        matrix_t Xn(n_units_, n_locs_);
         double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
         while (!almost_equal(Jnew, Jold, tol_) && n_iter < max_iter_) {
             // imputation update
-            matrix_t Xn = (~nan).select(X, Un);
+            Xn = (~nan).select(X, Un);
             const auto mu = mean_functor(Xn, lambda_mu[0]);
             Xn.rowwise() -= (smoother_->Psi() * mu).transpose();
             // rank-k fPCA on imputed data
