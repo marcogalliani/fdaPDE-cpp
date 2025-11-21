@@ -49,9 +49,9 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     fpca_power_iteration_impl(VariationalSolver& smoother, int max_iter, double tol) noexcept :
         smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()), max_iter_(max_iter), tol_(tol) { }
 
-    template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
+    template <typename DataT> auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
         fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
-        matrix_t X = data.transpose();
+        //matrix_t X = data.transpose();
         n_locs_ = X.cols(), n_units_ = X.rows();
         // first guess of PCs set to a multivariate PCA (SVD)
         matrix_t V;
@@ -173,9 +173,9 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     fpca_subspace_iteration_impl(VariationalSolver& smoother, int max_iter, double tol) noexcept :
         smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()), max_iter_(max_iter), tol_(tol) { }
 
-    template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
+    template <typename DataT> auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
         fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
-        matrix_t X = data.transpose();
+        //matrix_t X = data.transpose();
         n_locs_ = X.cols(), n_units_ = X.rows();
         // first guess of PCs set to a multivariate PCA (SVD)
         matrix_t V;
@@ -296,9 +296,9 @@ template <typename VariationalSolver> class fpca_direct_impl {
     fpca_direct_impl(VariationalSolver& smoother) noexcept :
         smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()) { }
 
-    template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
+    template <typename DataT> auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
         fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
-        matrix_t X = data.transpose();
+        //matrix_t X = data.transpose();
         n_locs_ = X.cols(), n_units_ = X.rows();
         // allocate memory
         f_.resize(n_dofs_, rank);
@@ -452,8 +452,8 @@ template <typename fPCASolver> class fpca_na_impl {
         smoother_(std::addressof(smoother)), // Store address. No Copy.
         n_dofs_(smoother.n_dofs()) { }
     template <typename DataT>
-    auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
-        matrix_t X = data.transpose();         // create temporary of mapped data
+    auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
+        //matrix_t X = data.transpose();         // create temporary of mapped data
         binary_t nan_pattern = na_matrix(X);   // compute missingness pattern
         n_locs_ = X.cols(), n_units_ = X.rows();
 
@@ -627,7 +627,7 @@ template <typename fPCASolver> class fpca_na_impl {
             const auto mu = mean_functor(Xn, lambda_mu[0]);
             Xn.rowwise() -= (smoother_->Psi() * mu).transpose();
             // rank-k fPCA on imputed data
-            auto [f, s] = fpca_->fit(Xn.transpose(), rank, lambda_F, flag & 0x1); //always run with no calibration
+            auto [f, s] = fpca_->fit(Xn, rank, lambda_F, flag & 0x1); //always run with no calibration
             // return orthonormal scores
             for (int i = 0; i < rank; ++i) {
                 s.col(i) = s.col(i) / fpca_->loadings_norm()[i];
@@ -658,12 +658,6 @@ template <typename fPCASolver> class fpca_na_impl {
         using triplet_t = Eigen::Triplet<double>;
         //construct the matrix of weights
         std::vector<int> observed_indexes = nan_pattern.which(false); // rowmajor ordering
-        std::vector<triplet_t> Dwt_triplets;
-        /*
-        for (int i=0; i <observed_indexes.size(); i++) Dwt_triplets.emplace_back(observed_indexes[i],observed_indexes[i],1.0);
-        sparse_matrix_t Dwt(n_units_*n_locs_, n_units_*n_locs_);
-        Dwt.setFromTriplets(Dwt_triplets.begin(), Dwt_triplets.end());
-        */
         //construct the B matrix: B = [1/\sqrt{N} ones(N) kron_prod \Psi, S kron_prod Psi]
         //matrix_t design_mat(n_units_,n_units_+1);
         matrix_t design_mat(n_units_,rank+1);
@@ -711,7 +705,7 @@ template <typename fPCASolver> class fpca_na_impl {
         diag_lambdas.setFromTriplets(lambda_triplets.begin(),lambda_triplets.end());
         //smoothing matrix
         SparseBlockMatrix<double, 2, 2> A(
-               B_obs.transpose()*B_obs /*B.transpose()*Dwt*B*/, kronecker(diag_lambdas,smoother_->stiff()),
+               B_obs.transpose()*B_obs, kronecker(diag_lambdas,smoother_->stiff()),
                kronecker(diag_lambdas,smoother_->stiff()), kronecker(-diag_lambdas,smoother_->mass())
                );
         //Trace estimation
@@ -786,7 +780,7 @@ class fpca_direct_solver {
     fpca_direct_solver() noexcept = default;
     template <typename Smoother> [[nodiscard]] auto get(Smoother&& solver) const { return impl_t<Smoother>(solver); }
 };
-  
+
 template <typename VariationalSolver> class fPCA {
    private:
     using smoother_t = std::decay_t<VariationalSolver>;
@@ -840,7 +834,7 @@ template <typename VariationalSolver> class fPCA {
             // default to OptimMSRE calibration, if no calibration provided
             if (lambda_grid.size() > n_lambda && (flag & 0b11110) == 0) { flag = flag | OptimizeMSRE; }
             internals::fpca_na_impl mm_scheme(solver_, smoother_);
-            const auto& [mu,f, s] = mm_scheme.fit(data_, rank, lambda_grid, flag);
+            const auto& [mu,f, s] = mm_scheme.fit(data_.transpose(), rank, lambda_grid, flag);
             center_ = std::move(mu);
             f_ = std::move(f);
             s_ = std::move(s);
@@ -867,7 +861,7 @@ template <typename VariationalSolver> class fPCA {
                 centred_data.rowwise() -= smoother_.fn().transpose();
             }
             // performing fPCA on the zero-centred data
-            const auto& [f, s] = solver_.fit(centred_data.transpose(), rank, lambda_grid, flag);
+            const auto& [f, s] = solver_.fit(centred_data, rank, lambda_grid, flag);
             f_ = std::move(f);
             s_ = std::move(s);
             f_norm_ = solver_.loadings_norm();
