@@ -462,9 +462,7 @@ template <typename fPCASolver> class fpca_na_impl {
         std::vector<double> opt_lambda_F(n_lambda);
 
         matrix_t U = matrix_t::Zero(n_units_, n_dofs_);
-        //smoother_.update_response((~nan_pattern).select(X,0).colwise().mean().transpose());
-        //smoother_.fit(1e-15);
-        //U.rowwise() += smoother_.f().transpose(); // start by imputing the mean
+        //U.rowwise() += (~nan_pattern).select(X,0).colwise().mean(); // start by imputing the mean
         int opt_rank;
         switch (calibration) {
         case 0: {   // no calibration
@@ -474,54 +472,6 @@ template <typename fPCASolver> class fpca_na_impl {
             opt_rank = rank;
         } break;
         case OptimizeGCV: {
-            /*
-            //define the gcv functor
-            auto gcv_functor = [&](auto params) {
-                std::vector<double> lambda_mu(n_lambda);
-                std::vector<double> lambda_F(n_lambda);
-                std::copy(params.begin(), params.begin()+n_lambda, lambda_mu.begin());
-                std::copy(params.begin()+n_lambda, params.begin()+2*n_lambda, lambda_F.begin());
-
-                matrix_t U_init = U;
-                matrix_t center, F, S;
-                // for (int k = 1; k <= rank; ++k) {
-                    int k = rank;
-                    const auto& [c, f, s] = solve_(X, nan_pattern, U_init, k, lambda_mu,lambda_F, flag & 0b1001);
-                    U_init = s * f.transpose(); // reconstruction update
-                    U_init.rowwise() += c.transpose();
-                    center = c; S=s; F=f;
-                //}
-                double edf = edf_(nan_pattern, center.col(0), S, F, rank, lambda_mu,lambda_F);
-                double dor = n_units_*n_locs_ - 1.6*edf; //the 1.6 correct the tendency of gcv to undersmooth the data
-                double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * (~nan_pattern).select(X - U_init*smoother_.Psi().transpose(), 0).squaredNorm();
-
-                return gcv;
-            };
-            Eigen::Matrix<double, Dynamic, Dynamic, Eigen::RowMajor> grid_2D(lambda_grid.size(), 2);
-            int idx = 0;
-            for (int i = 0; i < lambda_grid.size(); ++i) {
-                //for (int j = 0; j < lambda_grid.size(); ++j) {
-                    //for(int k = 1; k <= rank; k++){
-                        grid_2D(idx, 0) = lambda_grid[i];
-                        grid_2D(idx, 1) = lambda_grid[i];
-                        ++idx;
-                    //}
-                //}
-            }
-            //optimize over the grid
-            GridSearch<2> optimizer;
-            auto optimal_lambdas = optimizer.optimize(gcv_functor,grid_2D);
-            // resize to have shape: grid_sz-by-n_lambda
-            gcv_scores_.resize(lambda_grid.size(),1);
-            for (int i = 0; i < lambda_grid.size(); ++i) {
-                //for (int j = 0; j < lambda_grid.size(); j++){
-                    gcv_scores_(i, 0) = optimizer.values()[i];
-                //}
-            }
-            std::copy(optimal_lambdas.begin(), optimal_lambdas.begin()+n_lambda, opt_lambda_mu.begin());
-            std::copy(optimal_lambdas.begin()+n_lambda, optimal_lambdas.begin()+2*n_lambda, opt_lambda_F.begin());
-            opt_rank = rank; //optimal_lambdas[optimal_lambdas.size()-1];
-            */
             // rank selection
             gcv_scores_.resize(lambda_grid.size(),rank);
             matrix_t U_init = matrix_t::Zero(n_units_, n_dofs_); //starting guess
