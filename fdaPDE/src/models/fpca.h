@@ -460,7 +460,8 @@ template <typename fPCASolver> class fpca_na_impl {
         std::vector<double> opt_lambda_mu(n_lambda);
         std::vector<double> opt_lambda_F(n_lambda);
 
-        matrix_t U = matrix_t::Zero(n_units_, n_dofs_);
+        matrix_t Un = matrix_t::Zero(n_units_, n_locs_);
+        Un.rowwise() += (~nan_pattern).select(X,0).colwise().mean(); // start by imputing the mean
         int opt_rank;
         switch (calibration) {
         case 0: {   // no calibration
@@ -477,17 +478,18 @@ template <typename fPCASolver> class fpca_na_impl {
                 std::copy(params.begin(), params.begin()+n_lambda, lambda_mu.begin());
                 std::copy(params.begin()+n_lambda, params.begin()+2*n_lambda, lambda_F.begin());
 
-                matrix_t U_init = U;
+                Un = matrix_t::Zero(n_units_, n_locs_);
+                Un.rowwise() += (~nan_pattern).select(X,0).colwise().mean(); // start by imputing the mean;
                 matrix_t center, F, S;
                 for (int k = 1; k <= rank; ++k) {
-                    const auto& [c, f, s] = solve_(X, nan_pattern, U_init, k, lambda_mu,lambda_F, flag & 0b1001);
-                    U_init = s * f.transpose(); // reconstruction update
-                    U_init.rowwise() += c.transpose();
+                    const auto& [c, f, s] = solve_(X, nan_pattern, Un, k, lambda_mu,lambda_F, flag & 0b1001);
+                    Un = s * f.transpose() * smoother_.Psi().transpose(); // reconstruction update
+                    Un.rowwise() += c.transpose() * smoother_.Psi().transpose();
                     center = c; S=s; F=f;
                 }
                 double edf = edf_(nan_pattern, center.col(0), S, F, rank, lambda_mu,lambda_F);
                 double dor = n_units_*n_locs_ - edf;
-                double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * (~nan_pattern).select(X - U_init*smoother_.Psi().transpose(), 0).squaredNorm();;
+                double gcv  = n_units_*n_locs_/ std::pow(dor, 2) * (~nan_pattern).select(X - Un, 0).squaredNorm();;
 
                 return gcv;
             };
@@ -527,14 +529,15 @@ template <typename fPCASolver> class fpca_na_impl {
                     matrix_t X_train = train_mask.select(X,std::numeric_limits<double>::quiet_NaN());
                     binary_t train_nan_pattern = na_matrix(X_train);
                     // repeat for increasing rank
-                    matrix_t U = matrix_t::Zero(n_units_, n_dofs_); //starting guess
+                    Un = matrix_t::Zero(n_units_, n_locs_);
+                    Un.rowwise() += (~nan_pattern).select(X,0).colwise().mean(); // start by imputing the mean;
                     for (int k = 1; k <= rank; ++k) {
                         // TEMPORARY FIX: std::vector<double>{double} is not nice
-                        const auto& [mu, F, S] = solve_(X_train, train_nan_pattern, U,k, std::vector<double>{lambda_grid[i]},std::vector<double>{lambda_grid[i]}, flag & flag & 0b1001);
-                        U = S * F.transpose();
-                        U.rowwise() += mu.transpose(); // reconstruction update
+                        const auto& [mu, F, S] = solve_(X_train, train_nan_pattern, Un,k, std::vector<double>{lambda_grid[i]},std::vector<double>{lambda_grid[i]}, flag & flag & 0b1001);
+                        Un = S * F.transpose()*smoother_.Psi().transpose();
+                        Un.rowwise() += mu.transpose()*smoother_.Psi().transpose(); // reconstruction update
                         // check the loss for each k in {1,...,rank}
-                        double loss = test_mask.select(X-U*smoother_.Psi().transpose(),0).squaredNorm();
+                        double loss = test_mask.select(X-Un,0).squaredNorm();
                         double n_test_obs = test_mask.count();
                         //average for the number of observations
                         mse_per_fold(j,k-1) = loss/n_test_obs;
@@ -562,11 +565,12 @@ template <typename fPCASolver> class fpca_na_impl {
         f_norm_.resize(opt_rank);
         lambda_.resize(opt_rank+1, n_lambda);
         // fit with optimal lambda
-        //matrix_t U = matrix_t::Zero(n_units_, n_dofs_); //starting guess
+        Un = matrix_t::Zero(n_units_, n_locs_);
+        Un.rowwise() += (~nan_pattern).select(X,0).colwise().mean(); // start by imputing the mean;
         for (int k = 1; k <= opt_rank; ++k) {
-            const auto& [center, F, S] = solve_(X, nan_pattern, U,k, opt_lambda_mu,opt_lambda_F, flag & flag & 0b1001);
-            U = S * F.transpose(); // reconstruction update
-            U.rowwise() += center.transpose();
+            const auto& [center, F, S] = solve_(X, nan_pattern, Un,k, opt_lambda_mu,opt_lambda_F, flag & flag & 0b1001);
+            Un = S * F.transpose()*smoother_.Psi().transpose(); // reconstruction update
+            Un.rowwise() += center.transpose()*smoother_.Psi().transpose();
             center_ = center;
             f_.leftCols(k) = F;
             s_.leftCols(k) = S;
@@ -592,13 +596,13 @@ template <typename fPCASolver> class fpca_na_impl {
     // the solve_ method implements the MM scheme (the rank recursion is performed during the fit)
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
-    auto solve_(const matrix_t& X, const binary_t& nan, const matrix_t& U0, int rank, const LambdaT lambda_mu, const LambdaT lambda_F, int flag) {
+    auto solve_(const matrix_t& X, const binary_t& nan, const matrix_t& Un0, int rank, const LambdaT lambda_mu, const LambdaT lambda_F, int flag) {
         for (int i = 0; i < lambda_mu.size(); ++i) { fdapde_assert(lambda_mu[i] > 0); fdapde_assert(lambda_F[i] > 0);}
         vector_t center(n_dofs_);
         matrix_t F(n_dofs_ , rank);
 	    matrix_t S(n_units_, rank);
-        matrix_t U = U0;
-	    matrix_t Un = U * smoother_.Psi().transpose();
+        matrix_t U;
+	    matrix_t Un = Un0;
         // define the mean function used to center the data in the mean estimation step
         std::function<vector_t(const matrix_t &, double)> mean_functor;
         bool computeMean = !(flag & DoNotComputeMean);
