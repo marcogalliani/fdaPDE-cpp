@@ -844,7 +844,7 @@ template <typename VariationalSolver> class fPCA {
     }
     // observers
     const vector_t& center() const { return center_;} // mean vector
-    const vector_t& center_locs() const { return smoother_.Psi() * center_;} // mean vector
+    vector_t center_locs() const { return smoother_.Psi() * center_;} // mean vector
     const matrix_t& S() const { return s_; }   // scoring matrix
     const matrix_t& F() const { return f_; }   // loading matrix
     matrix_t Fn() const { return smoother_.Psi() * f_; }
