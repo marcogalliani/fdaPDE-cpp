@@ -49,9 +49,9 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     fpca_power_iteration_impl(VariationalSolver& smoother, int max_iter, double tol) noexcept :
         smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()), max_iter_(max_iter), tol_(tol) { }
 
-    template <typename DataT> auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
+    template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
         fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
-        //matrix_t X = data.transpose();
+        matrix_t X = data.transpose();
         n_locs_ = X.cols(), n_units_ = X.rows();
         // first guess of PCs set to a multivariate PCA (SVD)
         matrix_t V;
@@ -173,9 +173,9 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     fpca_subspace_iteration_impl(VariationalSolver& smoother, int max_iter, double tol) noexcept :
         smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()), max_iter_(max_iter), tol_(tol) { }
 
-    template <typename DataT> auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
+    template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
         fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
-        //matrix_t X = data.transpose();
+        const matrix_t &X = data.transpose();
         n_locs_ = X.cols(), n_units_ = X.rows();
         // first guess of PCs set to a multivariate PCA (SVD)
         matrix_t V;
@@ -296,9 +296,9 @@ template <typename VariationalSolver> class fpca_direct_impl {
     fpca_direct_impl(VariationalSolver& smoother) noexcept :
         smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()) { }
 
-    template <typename DataT> auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
+    template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
         fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
-        //matrix_t X = data.transpose();
+        const matrix_t &X = data.transpose();
         n_locs_ = X.cols(), n_units_ = X.rows();
         // allocate memory
         f_.resize(n_dofs_, rank);
@@ -452,8 +452,8 @@ template <typename fPCASolver> class fpca_na_impl {
         smoother_(std::addressof(smoother)), // Store address. No Copy.
         n_dofs_(smoother.n_dofs()) { }
     template <typename DataT>
-    auto fit(const DataT& X, int rank, const std::vector<double>& lambda_grid, int flag) {
-        //matrix_t X = data.transpose();         // create temporary of mapped data
+    auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
+        const matrix_t &X = data.transpose();         // create temporary of mapped data
         binary_t nan_pattern = na_matrix(X);   // compute missingness pattern
         n_locs_ = X.cols(), n_units_ = X.rows();
 
