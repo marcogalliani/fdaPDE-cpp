@@ -453,7 +453,7 @@ template <typename fPCASolver> class fpca_na_impl {
         n_dofs_(smoother.n_dofs()) { }
     template <typename DataT>
     auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
-        const matrix_t &X = data.transpose();         // create temporary of mapped data
+        const matrix_t &X = data;         // create temporary of mapped data
         binary_t nan_pattern = na_matrix(X);   // compute missingness pattern
         n_locs_ = X.cols(), n_units_ = X.rows();
 
@@ -600,7 +600,7 @@ template <typename fPCASolver> class fpca_na_impl {
             const auto mu = mean_functor(Xn, lambda_mu[0]);
             Xn.rowwise() -= (smoother_->Psi() * mu).transpose();
             // rank-k fPCA on imputed data
-            auto [f, s] = fpca_->fit(Xn, rank, lambda_F, flag & 0x1); //always run with no calibration
+            auto [f, s] = fpca_->fit(Xn.transpose(), rank, lambda_F, flag & 0x1); //always run with no calibration
             // return orthonormal scores
             for (int i = 0; i < rank; ++i) {
                 s.col(i) = s.col(i) / fpca_->loadings_norm()[i];
