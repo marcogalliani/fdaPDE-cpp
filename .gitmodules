@@ -1,4 +1,4 @@
 [submodule "fdaPDE/core"]
 	path = fdaPDE/core
-	url = https://github.com/fdaPDE/fdaPDE-core
-	branch = stable
+	url = git@github.com:marcogalliani/fdaPDE-core.git
+	branch = bugfix/apple-clang-patch

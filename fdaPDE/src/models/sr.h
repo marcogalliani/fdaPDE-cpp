@@ -219,12 +219,12 @@ class SRPDE {
         auto confint_sim_beta(double alpha) const { return confint_sim_beta(alpha, matrix_t::Identity(q_, q_)); }
         // bonferroni corrected
         std::pair<vector_t, vector_t> confint_bon_beta(double alpha, const matrix_t& C) const {
-            return confint_beta_(1 - alpha, C, normal_distribution(1 - alpha / (2 * C.rows())));
+            return confint_beta_(1 - alpha / (2 * C.rows()), C, normal_distribution());
         }
         auto confint_bon_beta(double alpha) const { return confint_bon_beta(alpha, matrix_t::Identity(q_, q_)); }
         // one-at-a-time
         std::pair<vector_t, vector_t> confint_oat_beta(double alpha, const matrix_t& C) const {
-            return confint_beta_(1 - alpha, C, normal_distribution(1 - alpha / 2));
+            return confint_beta_(1 - alpha / 2, C, normal_distribution());
         }
         auto confint_oat_beta(double alpha) const { return confint_oat_beta(alpha, matrix_t::Identity(q_, q_)); }
         // parametric testing
@@ -290,7 +290,7 @@ class SRPDE {
 
 	    
 	    
-	    return confint_f_(1 - alpha, Psi_p, normal_distribution(1 - alpha / 2));
+	    return confint_f_(1 - alpha / 2, Psi_p, normal_distribution());
         }
         auto confint_oat_f(double alpha) const { return confint_f_(alpha, m_->solver_.PsiNA()); }
 

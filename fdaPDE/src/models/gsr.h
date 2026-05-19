@@ -149,12 +149,12 @@ class GSRPDE {
 
         template <typename InputType_>
             requires(internals::is_subscriptable<InputType_, int>)
-        constexpr double operator()(const InputType_& lambda) {
+        double operator()(const InputType_& lambda) {
             return internals::apply_index_pack<n_lambda>([&]<int... Ns_>() { return operator()(lambda[Ns_]...); });
         }
         template <typename... LambdaT>
             requires(std::is_convertible_v<LambdaT, double> && ...)
-        constexpr double operator()(LambdaT... lambda) {
+        double operator()(LambdaT... lambda) {
             model_->fit(static_cast<double>(lambda)...);
             std::array<double, StaticInputSize> lambda_vec {lambda...};
             if (edf_cache_.find(lambda_vec) == edf_cache_.end()) {   // cache Tr[S]
