@@ -14,7 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-// #include <fdaPDE/models.h>   // fdaPDE
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <fdaPDE/models.h>   // fdaPDE
 #include <gtest/gtest.h>     // testing framework
 
 // namespace fdapde {
@@ -62,11 +64,10 @@
 // #include "src/gsr.cpp"
 // #include "src/qsr.cpp"
 // #include "src/de.cpp"
+#include "src/ts_ode.cpp"
 
-int main(/*int argc, char **argv*/){
+int main(int argc, char** argv) {
   // start testing
-  // testing::InitGoogleTest(&argc, argv);
-  // return RUN_ALL_TESTS();
-
-  return 0;
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }
