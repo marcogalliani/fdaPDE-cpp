@@ -77,24 +77,28 @@ struct fixture {
             Yobs(t, 1) += noise * std::cos(5.0 * t);
         }
     }
-    internals::ts_ls_ode make_solver(const ButcherTableau& tab = ode_schemes::gauss_legendre_2()) {
+    // the solver is not templated on the stage count; only the tableau argument carries it, and it is
+    // erased away when the penalty descriptor builds its any_rk_integrator
+    template <int Stages>
+    internals::ts_ls_ode make_solver(const ButcherTableau<Stages>& tab) {
         ts_ls_ode penalty(f, tab);
         internals::ts_ls_ode solver;
         solver.discretize(penalty.get());
         solver.analyze_data(time, Yobs);
         return solver;
     }
+    internals::ts_ls_ode make_solver() { return make_solver(ode_schemes::gauss_legendre_2()); }
 };
 
 }   // namespace
 
-// Gauss-Newton converges quickly and the fit denoises (closer to truth than the raw data).
+// the adjoint-method BFGS solve converges within the iteration budget and the fit denoises
+// (closer to truth than the raw data).
 TEST(ts_ls_ode, fit_denoises_and_converges) {
     fixture fx;
     auto solver = fx.make_solver();
     solver.fit(1.0);
     EXPECT_TRUE(solver.converged());
-    EXPECT_LE(solver.n_iter(), 10);
     EXPECT_LT(rmse(solver.trajectory(), fx.Ytrue), rmse(fx.Yobs, fx.Ytrue));
 }
 
@@ -155,14 +159,18 @@ TEST(ts_ls_ode, handles_missing_observations) {
 // every time-stepping scheme produces a valid, converged fit.
 TEST(ts_ls_ode, scheme_variants_converge) {
     fixture fx;
-    for (const auto& tab :
-         {ode_schemes::forward_euler(), ode_schemes::crank_nicolson(), ode_schemes::implicit_midpoint(),
-          ode_schemes::gauss_legendre_2()}) {
+    // the schemes have distinct stage counts (ButcherTableau<Stages>), so each is exercised through a
+    // generic lambda rather than a single heterogeneous loop.
+    auto run = [&](auto tab) {
         auto solver = fx.make_solver(tab);
         solver.fit(1.0);
         EXPECT_TRUE(solver.trajectory().allFinite());
         EXPECT_TRUE(solver.converged());
-    }
+    };
+    run(ode_schemes::forward_euler());
+    run(ode_schemes::crank_nicolson());
+    run(ode_schemes::implicit_midpoint());
+    run(ode_schemes::gauss_legendre_2());
 }
 
 // the NPRODE model wrapper drives the solver and selects lambda by GCV over a grid.
@@ -182,7 +190,7 @@ TEST(ts_ls_ode, model_wrapper_and_gcv) {
     std::vector<double> grid;
     for (int e = -4; e <= 3; ++e) { grid.push_back(std::pow(10.0, e)); }
     auto gcv = model.gcv(50, 42);
-    GridOptimizer<1> optimizer;
+    GridSearch<1> optimizer;
     optimizer.optimize(gcv, grid);
     double opt = optimizer.optimum()[0];
     EXPECT_GE(opt, grid.front());
@@ -228,4 +236,39 @@ TEST(ts_ls_ode, edf_in_range_and_monotone) {
     EXPECT_LT(edf_low_lambda, n_obs);
     EXPECT_GT(edf_high_lambda, 0.0);
     EXPECT_LT(edf_high_lambda, edf_low_lambda);   // more regularization -> fewer effective dof
+}
+
+// the discrete adjoint of one forward step reproduces the finite-difference sensitivities of the
+// step w.r.t. the initial state and the additive control, for every Butcher tableau. This is the
+// core correctness check behind RKIntegrator::adjoint_step (hence the reduced-problem gradient).
+TEST(ts_ls_ode, adjoint_step_matches_finite_differences) {
+    nonlinear_field f;
+    const int d = 2;
+    vector_t y(d), u(d), w(d);
+    y << 0.4, -0.2;
+    u << 0.1, -0.05;
+    w << 1.3, -0.7;   // linear cost C = w . y_next, so the incoming costate is p_next = w
+    const double t = 0.3, dt = 0.05, fd = 1e-6;
+    // exercised per scheme through a generic lambda: the tableaux have distinct stage counts and so
+    // cannot share a single heterogeneous loop.
+    auto check = [&](auto tab) {
+        RKIntegrator integ(tab);
+        ode_field field(f);
+        auto step = [&](const vector_t& yy, const vector_t& uu) {
+            return integ.step(field.shifted(uu), t, yy, dt);
+        };
+        auto [p_curr, grad_contrib] = integ.adjoint_step(field.shifted(u), t, y, dt, w);
+        for (int j = 0; j < d; ++j) {
+            vector_t yp = y, ym = y, up = u, um = u;
+            yp[j] += fd, ym[j] -= fd, up[j] += fd, um[j] -= fd;
+            double dC_dy = w.dot(step(yp, u) - step(ym, u)) / (2 * fd);   // d(w.y_next)/dy_j
+            double dC_du = w.dot(step(y, up) - step(y, um)) / (2 * fd);   // d(w.y_next)/du_j
+            EXPECT_NEAR(p_curr[j], dC_dy, 1e-5) << "dC/dy, j = " << j;
+            EXPECT_NEAR(grad_contrib[j], dC_du, 1e-5) << "dC/du, j = " << j;
+        }
+    };
+    check(ode_schemes::forward_euler());
+    check(ode_schemes::crank_nicolson());
+    check(ode_schemes::implicit_midpoint());
+    check(ode_schemes::gauss_legendre_2());
 }

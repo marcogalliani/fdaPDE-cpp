@@ -65,6 +65,7 @@
 // #include "src/qsr.cpp"
 // #include "src/de.cpp"
 #include "src/ts_ode.cpp"
+#include "src/npr.cpp"
 
 int main(int argc, char** argv) {
   // start testing

@@ -27,16 +27,13 @@ namespace internals {
 // Over a time grid t_1 < ... < t_m and a d-dimensional response, it fits the nodal trajectory
 // Y in R^{m x d} minimizing
 //
-//   J(Y) = sum_{t,v} m_{t,v} (y_{t,v} - y^obs_{t,v})^2 + lambda * sum_{t=1}^{m-1} dt_t || u_t ||^2,
+//   J = sum_{t,v} m_{t,v} (y_{t,v} - y^obs_{t,v})^2 + lambda * sum_{t=1}^{m-1} dt_t || u_t ||^2,
 //
-// with the discrete control defect u_t = (y_{t+1} - step(t_t, y_t, dt_t)) / dt_t, where 'step'
-// is a Runge-Kutta step of the prior dynamics y' = f(t, y) computed by the core RKIntegrator.
-// The problem is solved by Gauss-Newton; each defect couples only consecutive nodes, so the
-// Gauss-Newton Hessian is block-tridiagonal in time. An optional initial condition y_1 = y0 is
-// imposed as a hard constraint. lambda spans pure data fitting (-> 0) to an exact discrete ODE
-// solution (-> inf). The prior dynamics are stored as a type-erased `ode_field`, so the solver
-// is a plain (non-template) class like the other least-squares solvers; the user still supplies
-// f (and optionally its Jacobian) as a C++ functor, type-erased at the penalty boundary.
+// where the control u(t) is an additive forcing of the prior dynamics y' = f(t, y) + u(t). The
+// trajectory Y is not optimized directly: it is recovered by forward Runge-Kutta integration of
+// f + u from the initial state (the core RKIntegrator), so the control u is the only decision
+// variable (the reduced / adjoint-method formulation).
+
 class ts_ls_ode {
    private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
@@ -46,7 +43,7 @@ class ts_ls_ode {
     template <typename Penalty> struct is_valid_penalty {
         static constexpr bool value = requires(Penalty penalty) {
             penalty.field();
-            penalty.tableau();
+            penalty.integrator();
             penalty.max_iter();
             penalty.tol();
         };
@@ -77,15 +74,14 @@ class ts_ls_ode {
         requires(is_valid_penalty_v<Penalty>)
     void discretize(Penalty&& penalty) {
         field_ = penalty.field();
-        integrator_ = RKIntegrator(penalty.tableau());
+        integrator_ = penalty.integrator();
         max_iter_ = penalty.max_iter();
         tol_ = penalty.tol();
-        d_ = field_.n_components();
+        // the system dimension d is taken from the response (set in analyze_data), not the field
         if constexpr (requires(Penalty p) { p.has_ic(); }) {
             if (penalty.has_ic()) {
                 has_ic_ = true;
                 y0_ = penalty.ic();
-                fdapde_assert(y0_.size() == d_);
             }
         }
         return;
@@ -124,50 +120,35 @@ class ts_ls_ode {
         return;
     }
 
-    // main fit entry point: minimize J(Y) for the given penalty weight
+    // main fit entry point: minimize J for the given penalty weight.
+    //
+    // Reduced (adjoint-method) optimal control formulation: the decision variable is the
+    // piecewise-constant control u that drives the prior dynamics y' = f(t, y) + u(t); the
+    // trajectory is recovered by forward integration and the gradient of the data misfit w.r.t.
+    // u by the consistent discrete adjoint of the RK scheme (RKIntegrator::adjoint_step). The
+    // resulting smooth, gradient-based program is solved with BFGS + a backtracking line search.
     const vector_t& fit(double lambda) {
-        fdapde_assert(lambda > 0 && d_ > 0 && m_ >= 2 && field_.n_components() == d_);
+        fdapde_assert(lambda > 0 && d_ > 0 && m_ >= 2 && static_cast<bool>(field_));
+        if (has_ic_) { fdapde_assert(y0_.size() == d_); }
         lambda_ = lambda;
-        Y_ = initial_guess_();
+        const int nu = (m_ - 1) * d_;
+        const bool free_y1 = !has_ic_;
+        const int nz = nu + (free_y1 ? d_ : 0);
+        // initial decision vector: zero control; initial state from the data-based guess (or the IC)
+        vector_t z = vector_t::Zero(nz);
+        if (free_y1) { z.segment(nu, d_) = initial_guess_().row(0).transpose(); }
+        // minimize the reduced objective over the control with BFGS
+        control_objective problem {this};
+        BFGS<Dynamic> optimizer(max_iter_, tol_, 1.0);
+        // Wolfe line search: its curvature condition keeps the BFGS inverse Hessian positive
+        // definite (descent directions), and its Armijo test rejects the divergent-cost surrogate.
+        vector_t z_opt = optimizer.optimize(problem, z, WolfeLineSearch());
+        // recover trajectory and diagnostics from the optimal control
+        Y_ = forward_recover_(z_opt);
         if (has_ic_) { Y_.row(0) = y0_.transpose(); }
-        double J_old = objective_(Y_);
-        converged_ = false;
-        n_iter_ = 0;
-        for (int iter = 0; iter < max_iter_; ++iter) {
-            sparse_matrix_t H;
-            vector_t g;
-            assemble_(Y_, H, g);
-            Eigen::SparseLU<sparse_matrix_t> solver;
-            solver.compute(H);
-            fdapde_assert(solver.info() == Eigen::Success);
-            vector_t dY = solver.solve(-g);
-            // backtracking line search on the objective (damps Gauss-Newton overshoot)
-            double alpha = 1.0, J_new = J_old;
-            matrix_t Y_try = Y_;
-            bool decreased = false;
-            for (int ls = 0; ls < max_line_search_; ++ls) {
-                Y_try = Y_;
-                for (int t = 0; t < m_; ++t) { Y_try.row(t) += alpha * dY.segment(t * d_, d_).transpose(); }
-                J_new = objective_(Y_try);
-                if (J_new < J_old) { decreased = true; break; }
-                alpha *= 0.5;
-            }
-            ++n_iter_;
-            // dY = -H^{-1} g is a descent direction (H SPD), so if no backtracking step reduces
-            // J the gradient is ~0: a stationary point, i.e. convergence.
-            if (!decreased) {
-                converged_ = true;
-                break;
-            }
-            Y_ = Y_try;
-            if (std::abs(J_old - J_new) < tol_ * (1.0 + std::abs(J_old))) {
-                J_old = J_new;
-                converged_ = true;
-                break;
-            }
-            J_old = J_new;
-        }
-        objective_value_ = J_old;
+        objective_value_ = optimizer.value();
+        n_iter_ = optimizer.n_iter();
+        converged_ = (n_iter_ < max_iter_);   // stopped on the gradient tolerance, not the iter cap
         compute_control_();
         flatten_();
         return f_;
@@ -179,6 +160,7 @@ class ts_ls_ode {
         return fit(lambda[0]);
     }
 
+    // TODO: remove gauss-newton hessian computation
     // hutchinson approximation of Tr[S] for the linearized hat matrix S = M H^{-1} M
     double edf(int r = 100, int seed = random_seed) {
         fdapde_assert(m_ > 0 && lambda_ > 0);
@@ -298,24 +280,83 @@ class ts_ls_ode {
         return Y;
     }
 
-    double objective_(const matrix_t& Y) const {
+    // --- reduced (adjoint-method) optimal control over the control u ---------------------------
+    // Decision vector layout: z = [u_0; ...; u_{m-2}; (y_1)], interval-major control blocks of
+    // size d, optionally followed by the free initial state y_1 (absent under a hard IC).
+
+    // forward-recover the trajectory: y_1 from z (or the IC), then y_{t+1} = RK step of f + u_t
+    matrix_t forward_recover_(const vector_t& z) const {
+        const int nu = (m_ - 1) * d_;
+        matrix_t Y(m_, d_);
+        Y.row(0) = (has_ic_ ? y0_ : vector_t(z.segment(nu, d_))).transpose();
+        for (int t = 0; t < m_ - 1; ++t) {
+            vector_t u_t = z.segment(t * d_, d_);
+            vector_t yc = Y.row(t).transpose();
+            // u_t is the (constant) control on interval t; field_.shifted injects it as f + u_t
+            Y.row(t + 1) = integrator_.step(field_.shifted(u_t), time_(t), yc, dt_(t)).transpose();
+        }
+        return Y;
+    }
+
+    // control objective J = SSE(observed) + lambda * sum_t dt_t ||u_t||^2
+    double objective_(const vector_t& z) const {
+        matrix_t Y = forward_recover_(z);
+        // a control may drive the (possibly nonlinear) forward integration to blow up: report a
+        // large finite cost so the line search backtracks out of the divergent region.
+        if (!Y.allFinite()) { return divergent_cost_; }
         double J = 0;
         for (int t = 0; t < m_; ++t) {
             for (int v = 0; v < d_; ++v) {
                 if (mask_(t, v) != 0.0) { J += std::pow(Y(t, v) - y_obs_(t, v), 2); }
             }
         }
-        for (int t = 0; t < m_ - 1; ++t) {
-            double dt = dt_(t);
-            vector_t yc = Y.row(t).transpose();
-            vector_t step = integrator_.step(field_, time_(t), yc, dt);
-            vector_t u = (Y.row(t + 1).transpose() - step) / dt;
-            J += lambda_ * dt * u.squaredNorm();
-        }
+        for (int t = 0; t < m_ - 1; ++t) { J += lambda_ * dt_(t) * z.segment(t * d_, d_).squaredNorm(); }
         return J;
     }
 
-    // assemble the Gauss-Newton system H * dY = -g for the current trajectory
+    // control gradient dJ/dz by a backward discrete-adjoint sweep (the reduced gradient: the state
+    // has been eliminated by forward integration, leaving only the control). Node data-source
+    // s_t = 2 * mask_t * (y_t - y^obs_t); the costate satisfies p_t = s_t + (dy_{t+1}/dy_t)^T p_{t+1}
+    // with p_m = s_m, while RKIntegrator::adjoint_step yields dJ_data/du_t per interval.
+    vector_t gradient_(const vector_t& z) const {
+        const int nu = (m_ - 1) * d_;
+        const bool free_y1 = !has_ic_;
+        matrix_t Y = forward_recover_(z);
+        // divergent control: return a finite (zero) gradient so the optimizer state stays clean;
+        // the matching large objective makes the line search reject the step.
+        if (!Y.allFinite()) { return vector_t::Zero(nu + (free_y1 ? d_ : 0)); }
+        auto source = [&](int t) {
+            vector_t s = vector_t::Zero(d_);
+            for (int v = 0; v < d_; ++v) {
+                if (mask_(t, v) != 0.0) { s(v) = 2.0 * (Y(t, v) - y_obs_(t, v)); }
+            }
+            return s;
+        };
+        vector_t g = vector_t::Zero(nu + (free_y1 ? d_ : 0));
+        vector_t p = source(m_ - 1);
+        for (int t = m_ - 2; t >= 0; --t) {
+            vector_t u_t = z.segment(t * d_, d_);
+            vector_t yc = Y.row(t).transpose();
+            auto [p_prop, grad_contrib] =
+              integrator_.adjoint_step(field_.shifted(u_t), time_(t), yc, dt_(t), p);
+            g.segment(t * d_, d_) = 2.0 * lambda_ * dt_(t) * u_t + grad_contrib;
+            p = source(t) + p_prop;
+        }
+        if (free_y1) { g.segment(nu, d_) = p; }   // dJ/dy_1 = costate at the first node
+        return g;
+    }
+
+    // objective functor over the control z, adapting J and its gradient to the core BFGS interface
+    struct control_objective {
+        const ts_ls_ode* solver;
+        double operator()(const vector_t& z) const { return solver->objective_(z); }
+        auto gradient() const {
+            return [s = solver](const vector_t& z) { return s->gradient_(z); };
+        }
+    };
+
+    // TODO: remove gauss-newton system computation
+    // assemble the Gauss-Newton system H * dY = -g for the current trajectory (used by edf())
     void assemble_(const matrix_t& Y, sparse_matrix_t& H, vector_t& g) const {
         const int N = m_ * d_;
         const matrix_t Id = matrix_t::Identity(d_, d_);
@@ -383,12 +424,13 @@ class ts_ls_ode {
 
     // model and discretization
     ode_field field_;
-    RKIntegrator integrator_;
+    // type-erased so the solver is independent of the scheme's stage count (see any_rk_integrator)
+    any_rk_integrator integrator_;
     int max_iter_ = 50;
     double tol_ = 1e-8;
-    int max_line_search_ = 20;
     bool has_ic_ = false;
     vector_t y0_;
+    static constexpr double divergent_cost_ = 1e20;   // objective surrogate for a blown-up forward solve
 
     // data
     vector_t time_;                    // m time nodes
@@ -407,42 +449,46 @@ class ts_ls_ode {
 }   // namespace internals
 
 // time-stepping ODE-penalty solver API: penalty descriptor wrapping the vector field, the
-// time-integration scheme (Butcher tableau) and an optional initial condition. The user-supplied
-// field functor is type-erased into an `ode_field` here, so neither the descriptor nor the solver
-// is templated on the field type.
+// time-integration scheme (Butcher tableau) and an optional initial condition. 
 struct ts_ls_ode {
     using solver_t = internals::ts_ls_ode;
    private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
+    // the scheme is chosen here (via the ButcherTableau<Stages> constructor argument) and erased
+    // into a non-templated any_rk_integrator at construction, so the descriptor, the solver and the
+    // model wrapper that consume it are all free of the stage-count template parameter.
     struct penalty_packet {
         ode_field field_;
-        ButcherTableau tableau_;
+        any_rk_integrator integrator_;
         vector_t ic_;
         bool has_ic_ = false;
         int max_iter_ = 50;
         double tol_ = 1e-8;
        public:
-        penalty_packet(ode_field field, ButcherTableau tableau, int max_iter, double tol) :
-            field_(std::move(field)), tableau_(std::move(tableau)), max_iter_(max_iter), tol_(tol) { }
-        penalty_packet(ode_field field, ButcherTableau tableau, vector_t ic, int max_iter, double tol) :
-            field_(std::move(field)), tableau_(std::move(tableau)), ic_(std::move(ic)), has_ic_(true),
+        penalty_packet(ode_field field, any_rk_integrator integrator, int max_iter, double tol) :
+            field_(std::move(field)), integrator_(std::move(integrator)), max_iter_(max_iter), tol_(tol) { }
+        penalty_packet(ode_field field, any_rk_integrator integrator, vector_t ic, int max_iter, double tol) :
+            field_(std::move(field)), integrator_(std::move(integrator)), ic_(std::move(ic)), has_ic_(true),
             max_iter_(max_iter), tol_(tol) { }
         // observers
         const ode_field& field() const { return field_; }
-        const ButcherTableau& tableau() const { return tableau_; }
+        const any_rk_integrator& integrator() const { return integrator_; }
         const vector_t& ic() const { return ic_; }
         bool has_ic() const { return has_ic_; }
         int max_iter() const { return max_iter_; }
         double tol() const { return tol_; }
     };
    public:
-    template <typename Field>
-    ts_ls_ode(const Field& field, const ButcherTableau& tableau, int max_iter = 50, double tol = 1e-8) :
-        penalty_(ode_field(field), tableau, max_iter, tol) { }
-    template <typename Field>
+    // Stages is deduced locally by the constructor (from the tableau) and erased away; the class
+    // itself is not templated.
+    template <typename Field, int Stages>
+    ts_ls_ode(const Field& field, const ButcherTableau<Stages>& tableau, int max_iter = 50, double tol = 1e-8) :
+        penalty_(ode_field(field), any_rk_integrator(RKIntegrator(tableau)), max_iter, tol) { }
+    template <typename Field, int Stages>
     ts_ls_ode(
-      const Field& field, const ButcherTableau& tableau, const vector_t& ic, int max_iter = 50, double tol = 1e-8) :
-        penalty_(ode_field(field), tableau, ic, max_iter, tol) { }
+      const Field& field, const ButcherTableau<Stages>& tableau, const vector_t& ic, int max_iter = 50,
+      double tol = 1e-8) :
+        penalty_(ode_field(field), any_rk_integrator(RKIntegrator(tableau)), ic, max_iter, tol) { }
     const penalty_packet& get() const { return penalty_; }
    private:
     penalty_packet penalty_;
