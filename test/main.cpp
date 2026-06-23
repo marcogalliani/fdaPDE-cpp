@@ -16,8 +16,9 @@
 
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
-#include <fdaPDE/models.h>   // fdaPDE
-#include <gtest/gtest.h>     // testing framework
+#include <fdaPDE/models.h>       // fdaPDE
+#include <fdaPDE/functional.h>   // fdaPDE (fPCA)
+#include <gtest/gtest.h>         // testing framework
 
 // namespace fdapde {
 // namespace test {
@@ -66,6 +67,7 @@
 // #include "src/de.cpp"
 #include "src/ts_ode.cpp"
 #include "src/npr.cpp"
+#include "src/fpca.cpp"
 
 int main(int argc, char** argv) {
   // start testing
