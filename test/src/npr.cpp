@@ -24,11 +24,14 @@ using vector_t = Eigen::Matrix<double, Dynamic, 1>;
 using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
 
 
-vector_t f(double t, const vector_t& y) {
+// ODE rhs functor returning a dynamic VectorXd -> ode_rhs_field deduces the dynamic-Dim path
+struct field_2d {
+    vector_t operator()(double t, const vector_t& y) const {
         vector_t out(2);
         out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
         return out;
     }
+};
 
 // end-to-end through an order-1 (time) GeoFrame and a formula: the multi-column response is
 // read as a block column and the fit matches the plain-input path exactly.
@@ -41,16 +44,10 @@ TEST(npr, test1) {
     Triangulation<1, 1> T = Triangulation<1, 1>::Interval(time[0], time[m - 1], m);
     
     // reference solution
+    field_2d f;
     vector_t y0(2);
     y0 << 0.5, -0.3;
-    RKIntegrator ref(ode_schemes::gauss_legendre_2());
-    matrix_t Y(time.size(), y0.size());
-    vector_t y = y0;
-    Y.row(0) = y.transpose();
-    for (int t = 0; t + 1 < time.size(); ++t) {
-        y = ref.step(f, time[t], y, time[t + 1] - time[t]);
-        Y.row(t + 1) = y.transpose();
-    }
+    matrix_t Y = RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(f, time, y0);
     
     // data
     GeoFrame data(T);
@@ -58,13 +55,7 @@ TEST(npr, test1) {
     layer.load_blk("y", Y);
     
     // solver
-    ts_ls_ode penalty(
-        [](double t, const vector_t& y) {
-            vector_t out(2);
-            out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
-            return out;
-        },
-        ode_schemes::gauss_legendre_2());
+    ts_ls_ode penalty(f, ode_schemes::gauss_legendre_2());
 
     NPRODE<internals::ts_ls_ode> model("y ~ f", data, penalty);
     model.fit(1.0);

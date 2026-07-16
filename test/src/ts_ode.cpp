@@ -27,7 +27,6 @@ using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
 // nonlinear, non-autonomous test field, d = 2:
 //   f(t, y) = [ y0*y1 + sin(t) ; y0 - y1^2 ],   df_dy = [ [y1, y0] ; [1, -2*y1] ]
 struct nonlinear_field {
-    int n_components() const { return 2; }
     vector_t operator()(double t, const vector_t& y) const {
         vector_t out(2);
         out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
@@ -48,15 +47,7 @@ vector_t make_time(int m, double T) {
 
 // exact (discrete) trajectory of the prior dynamics from y0, using a high-order scheme
 matrix_t integrate_field(const nonlinear_field& f, const vector_t& time, const vector_t& y0) {
-    RKIntegrator ref(ode_schemes::gauss_legendre_2());
-    matrix_t Y(time.size(), y0.size());
-    vector_t y = y0;
-    Y.row(0) = y.transpose();
-    for (int t = 0; t + 1 < time.size(); ++t) {
-        y = ref.step(f, time[t], y, time[t + 1] - time[t]);
-        Y.row(t + 1) = y.transpose();
-    }
-    return Y;
+    return RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(f, time, y0);
 }
 
 double rmse(const matrix_t& A, const matrix_t& B) { return std::sqrt((A - B).squaredNorm() / A.size()); }
@@ -77,11 +68,11 @@ struct fixture {
             Yobs(t, 1) += noise * std::cos(5.0 * t);
         }
     }
-    // the solver is not templated on the stage count; only the tableau argument carries it, and it is
-    // erased away when the penalty descriptor builds its any_rk_integrator
+    // the solver is templated on neither the stage count nor the system dimension; the tableau and the
+    // field carry them, and both are erased away when the penalty descriptor builds its any_rk_engine
     template <int Stages>
     internals::ts_ls_ode make_solver(const ButcherTableau<Stages>& tab) {
-        ts_ls_ode penalty(f, tab);
+        ts_ls_ode penalty(f, tab);   // f returns VectorXd -> Dim deduced Dynamic
         internals::ts_ls_ode solver;
         solver.discretize(penalty.get());
         solver.analyze_data(time, Yobs);
@@ -253,11 +244,11 @@ TEST(ts_ls_ode, adjoint_step_matches_finite_differences) {
     // cannot share a single heterogeneous loop.
     auto check = [&](auto tab) {
         RKIntegrator integ(tab);
-        ode_field field(f);
+        ode_rhs_field field(f);
         auto step = [&](const vector_t& yy, const vector_t& uu) {
-            return integ.step(field.shifted(uu), t, yy, dt);
+            return integ.step(field + uu, t, yy, dt);
         };
-        auto [p_curr, grad_contrib] = integ.adjoint_step(field.shifted(u), t, y, dt, w);
+        auto [p_curr, grad_contrib] = integ.adjoint_step(field + u, t, y, dt, w);
         for (int j = 0; j < d; ++j) {
             vector_t yp = y, ym = y, up = u, um = u;
             yp[j] += fd, ym[j] -= fd, up[j] += fd, um[j] -= fd;
@@ -271,4 +262,71 @@ TEST(ts_ls_ode, adjoint_step_matches_finite_differences) {
     check(ode_schemes::crank_nicolson());
     check(ode_schemes::implicit_midpoint());
     check(ode_schemes::gauss_legendre_2());
+}
+
+// the same dynamics as nonlinear_field but WITHOUT an analytic df_dy: routes ode_rhs_field through the
+// MatrixField-based finite-difference Jacobian. Returning VectorXd keeps it on the dynamic-Dim path.
+struct nonlinear_field_no_jac {
+    vector_t operator()(double t, const vector_t& y) const {
+        vector_t out(2);
+        out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
+        return out;
+    }
+};
+
+// the same dynamics with a fixed-size (Vector2d) return: ode_rhs_field deduces a static Dim = 2.
+struct nonlinear_field_static {
+    Eigen::Vector2d operator()(double t, const vector_t& y) const {
+        Eigen::Vector2d out;
+        out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
+        return out;
+    }
+    Eigen::Matrix2d df_dy(double, const vector_t& y) const {
+        Eigen::Matrix2d J;
+        J << y[1], y[0], 1.0, -2.0 * y[1];
+        return J;
+    }
+};
+
+// an ode_rhs_field built from a callable WITHOUT an analytic Jacobian falls back to the MatrixField
+// finite-difference Jacobian; it must agree with the analytic Jacobian of the same dynamics. Also
+// checks the value path and that field + c offsets the value while preserving the (FD) Jacobian.
+TEST(ts_ls_ode, ode_rhs_field_fd_jacobian_matches_analytic) {
+    nonlinear_field f;                 // provides an analytic df_dy
+    ode_rhs_field fd_field{nonlinear_field_no_jac{}};   // no df_dy -> FD Jacobian backend
+    vector_t y(2), c(2);
+    y << 0.4, -0.2;
+    c << 0.5, -0.25;
+    const double t = 0.3;
+    EXPECT_LT((fd_field.df_dy(t, y) - f.df_dy(t, y)).cwiseAbs().maxCoeff(), 1e-4);   // FD Jacobian
+    EXPECT_LT((fd_field(t, y) - f(t, y)).cwiseAbs().maxCoeff(), 1e-12);              // value path
+    ode_rhs_field shifted = fd_field + c;
+    EXPECT_LT((shifted.df_dy(t, y) - f.df_dy(t, y)).cwiseAbs().maxCoeff(), 1e-4);    // Jacobian unchanged by +c
+    EXPECT_LT((shifted(t, y) - (f(t, y) + c)).cwiseAbs().maxCoeff(), 1e-12);         // value offset by c
+}
+
+// a field with a fixed-size return makes the stage math static: Dim is deduced (no n_components()),
+// ode_rhs_field<2> and an internals::rk_engine<Stages, 2> are built inside the (non-templated) solver,
+// and the fit (through the fixed-size RKIntegrator stage math) denoises just like the dynamic path.
+TEST(ts_ls_ode, static_dim_deduced_and_fits) {
+    nonlinear_field_static sf;
+    ode_rhs_field field{sf};                                  // Dim deduced from the Vector2d return
+    static_assert(decltype(field)::dim == 2, "static dimension must be deduced from the field");
+    vector_t y(2), c(2);
+    y << 0.4, -0.2;
+    c << 0.5, -0.25;
+    // field algebra and Jacobian still hold on the static field
+    EXPECT_LT(((field + c)(0.3, y) - (field(0.3, y) + c)).cwiseAbs().maxCoeff(), 1e-12);
+    EXPECT_LT(((field + c).df_dy(0.3, y) - field.df_dy(0.3, y)).cwiseAbs().maxCoeff(), 1e-12);
+
+    // end-to-end fit through the static-dimension stack
+    fixture fx;
+    ts_ls_ode penalty(sf, ode_schemes::gauss_legendre_2());   // Dim = 2 deduced internally, not in the type
+    static_assert(decltype(penalty)::solver_t::n_lambda == 1);   // solver type is dimension-agnostic now
+    internals::ts_ls_ode solver;
+    solver.discretize(penalty.get());
+    solver.analyze_data(fx.time, fx.Yobs);
+    solver.fit(1.0);
+    EXPECT_TRUE(solver.converged());
+    EXPECT_LT(rmse(solver.trajectory(), fx.Ytrue), rmse(fx.Yobs, fx.Ytrue));
 }
