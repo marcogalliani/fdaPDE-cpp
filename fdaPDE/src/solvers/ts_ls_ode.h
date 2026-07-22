@@ -53,6 +53,12 @@ struct rk_engine {
     std::pair<vector_t, matrix_t> step_with_flow_jacobian(double t, const vector_t& y, double dt) const {
         return integrator_.step_with_flow_jacobian(field_, t, y, dt);
     }
+    // forced step together with its state (flow) and control Jacobians (control-aware; u = 0 recovers the
+    // prior dynamics). The forward-mode primitive the full-space SQP solver assembles its KKT system from.
+    std::tuple<vector_t, matrix_t, matrix_t> step_with_jacobians(
+      double t, const vector_t& y, double dt, const vector_t& u) const {
+        return integrator_.step_with_jacobians(field_ + u, t, y, dt);
+    }
 
     ode_rhs_field<Dim> field_;
     RKIntegrator<Stages> integrator_;
@@ -64,7 +70,7 @@ struct IRkEngine {
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
     template <typename T> using fn_ptrs =
-      fdapde::bindings<&T::step, &T::adjoint_step, &T::step_with_flow_jacobian>;
+      fdapde::bindings<&T::step, &T::adjoint_step, &T::step_with_flow_jacobian, &T::step_with_jacobians>;
     vector_t step(double t, const vector_t& y, double dt, const vector_t& u) const {
         return fdapde::invoke<vector_t, 0>(*this, t, y, dt, u);
     }
@@ -74,6 +80,10 @@ struct IRkEngine {
     }
     std::pair<vector_t, matrix_t> step_with_flow_jacobian(double t, const vector_t& y, double dt) const {
         return fdapde::invoke<std::pair<vector_t, matrix_t>, 2>(*this, t, y, dt);
+    }
+    std::tuple<vector_t, matrix_t, matrix_t> step_with_jacobians(
+      double t, const vector_t& y, double dt, const vector_t& u) const {
+        return fdapde::invoke<std::tuple<vector_t, matrix_t, matrix_t>, 3>(*this, t, y, dt, u);
     }
 };
 
@@ -112,6 +122,15 @@ class ts_ls_ode {
    public:
     static constexpr int n_lambda = 1;
     using solver_category = ls_solver;
+    // optimization strategy chosen at fit time. Both minimize the very same objective over the same
+    // decision variables (the additive control u and, if free, the initial state) and reach the same
+    // minimizer, so they fill the identical result members and differ only in how they get there:
+    //   - adjoint : reduced-space BFGS driven by the consistent discrete-adjoint gradient (state
+    //               eliminated by forward integration).
+    //   - sqp     : full-space Gauss-Newton Sequential Quadratic Programming (state Y and control u kept
+    //               as unknowns tied by the RK dynamics as equality constraints; forward-mode Jacobians,
+    //               no adjoint sweep).
+    enum class fit_policy { adjoint, sqp };
 
     ts_ls_ode() noexcept = default;
     // construct from formula + geoframe (time mesh and response read from the frame)
@@ -178,11 +197,23 @@ class ts_ls_ode {
         return;
     }
 
+    // fit at a given lambda with the selected optimization strategy (default: adjoint). Both policies fill
+    // the same result members, so edf()/rss()/observers behave identically afterwards.
+    const vector_t& fit(double lambda, fit_policy policy = fit_policy::adjoint) {
+        return policy == fit_policy::sqp ? fit_sqp_(lambda) : fit_adjoint_(lambda);
+    }
+    template <typename LambdaT>
+        requires(internals::is_vector_like_v<LambdaT>)
+    const vector_t& fit(LambdaT&& lambda, fit_policy policy = fit_policy::adjoint) {
+        fdapde_assert(lambda.size() == n_lambda);
+        return fit(lambda[0], policy);
+    }
+
     // Optimal control formulation: the decision variable is the
     // piecewise-constant control u that drives the prior dynamics y' = f(t, y) + u(t); the
     // trajectory is recovered by forward integration and the gradient of the data misfit w.r.t.
     // u by the consistent discrete adjoint of the RK scheme.
-    const vector_t& fit(double lambda) {
+    const vector_t& fit_adjoint_(double lambda) {
         fdapde_assert(lambda > 0 && d_ > 0 && m_ >= 2 && static_cast<bool>(engine_));
         if (has_ic_) { fdapde_assert(y0_.size() == d_); }
         lambda_ = lambda;
@@ -207,12 +238,6 @@ class ts_ls_ode {
         compute_control_();
         flatten_();
         return f_;
-    }
-    template <typename LambdaT>
-        requires(internals::is_vector_like_v<LambdaT>)
-    const vector_t& fit(LambdaT&& lambda) {
-        fdapde_assert(lambda.size() == n_lambda);
-        return fit(lambda[0]);
     }
 
     // TODO: remove gauss-newton hessian computation, try to see if we can compute the edf
@@ -412,6 +437,172 @@ class ts_ls_ode {
             return [s = solver](const vector_t& z) { return s->gradient_(z); };
         }
     };
+
+    // --- Full-space Gauss-Newton SQP over z = (Y, u) ------------------
+    // Keep the trajectory Y and the additive control u as decision variables, tie them by the discrete RK
+    // dynamics as equality constraints c_t = y_{t+1} - step(f + u_t)(y_t) = 0, and take constrained
+    // Gauss-Newton steps: each iteration solves the KKT saddle-point QP (exact quadratic objective Hessian
+    // + linearized constraints) and is globalized by an L1-merit backtracking line search. The constraint
+    // linearization uses the forward-mode step Jacobians d step/d y (flow) and d step/d u (control), so no
+    // adjoint sweep is involved.
+    const vector_t& fit_sqp_(double lambda) {
+        fdapde_assert(lambda > 0 && d_ > 0 && m_ >= 2 && static_cast<bool>(engine_));
+        if (has_ic_) { fdapde_assert(y0_.size() == d_); }
+        lambda_ = lambda;
+        const int d = d_, m = m_;
+        const int nY = m * d, nU = (m - 1) * d, n_primal = nY + nU;
+        const int nC_dyn = (m - 1) * d, nC = nC_dyn + (has_ic_ ? d : 0);
+        const int N = n_primal + nC;
+
+        // decision variables: trajectory Y (data-based guess, IC-pinned first node), zero control u, zero
+        // constraint multipliers -- the same starting-point basin as the adjoint policy.
+        matrix_t Y = initial_guess_();
+        if (has_ic_) { Y.row(0) = y0_.transpose(); }
+        matrix_t U = matrix_t::Zero(m - 1, d);
+        vector_t mu = vector_t::Zero(nC);
+
+        int it = 0;
+        bool converged = false;
+        for (; it < max_iter_; ++it) {
+            // objective gradient (exact; J is quadratic in (Y, u)): data part 2 m (y - yobs), control part
+            // 2 lambda dt u
+            vector_t g = vector_t::Zero(n_primal);
+            for (int t = 0; t < m; ++t) {
+                for (int v = 0; v < d; ++v) {
+                    if (mask_(t, v) != 0.0) { g(t * d + v) = 2.0 * (Y(t, v) - y_obs_(t, v)); }
+                }
+            }
+            for (int t = 0; t < m - 1; ++t) {
+                g.segment(nY + t * d, d) = 2.0 * lambda_ * dt_(t) * U.row(t).transpose();
+            }
+            // constraints c and their Jacobian A: dynamics c_t = y_{t+1} - step(f + u_t)(y_t), with
+            // d c_t/d y_{t+1} = I, d c_t/d y_t = -Flow_t, d c_t/d u_t = -B_t, plus the optional hard-IC
+            // block c = y_0 - y0.
+            vector_t c = vector_t::Zero(nC);
+            std::vector<Eigen::Triplet<double>> A_trip;
+            A_trip.reserve(static_cast<std::size_t>((m - 1) * d * (2 * d + 1) + (has_ic_ ? d : 0)));
+            for (int t = 0; t < m - 1; ++t) {
+                vector_t yc = Y.row(t).transpose();
+                vector_t ut = U.row(t).transpose();
+                auto [ynext, flow_t, b_t] = engine_.step_with_jacobians(time_(t), yc, dt_(t), ut);
+                c.segment(t * d, d) = Y.row(t + 1).transpose() - ynext;
+                const int r = t * d;
+                for (int i = 0; i < d; ++i) {
+                    A_trip.emplace_back(r + i, (t + 1) * d + i, 1.0);
+                    for (int j = 0; j < d; ++j) {
+                        A_trip.emplace_back(r + i, t * d + j, -flow_t(i, j));
+                        A_trip.emplace_back(r + i, nY + t * d + j, -b_t(i, j));
+                    }
+                }
+            }
+            if (has_ic_) {
+                for (int i = 0; i < d; ++i) { A_trip.emplace_back(nC_dyn + i, i, 1.0); }
+                c.segment(nC_dyn, d) = Y.row(0).transpose() - y0_;
+            }
+            sparse_matrix_t A(nC, n_primal);
+            A.setFromTriplets(A_trip.begin(), A_trip.end());
+
+            // KKT residual: stationarity ||g + A^T mu||_inf and feasibility ||c||_inf
+            double stat = (g + A.transpose() * mu).template lpNorm<Eigen::Infinity>();
+            double feas = (nC > 0) ? c.template lpNorm<Eigen::Infinity>() : 0.0;
+            if (std::max(stat, feas) < tol_) { converged = true; break; }
+
+            // assemble the KKT saddle-point matrix [[H, A^T], [A, 0]] (H = exact objective Hessian,
+            // block-diagonal) and solve for the primal step and the next multipliers.
+            std::vector<Eigen::Triplet<double>> K_trip;
+            K_trip.reserve(static_cast<std::size_t>(n_primal + 2 * A_trip.size()));
+            for (int t = 0; t < m; ++t) {
+                for (int v = 0; v < d; ++v) {
+                    if (mask_(t, v) != 0.0) { K_trip.emplace_back(t * d + v, t * d + v, 2.0 * mask_(t, v)); }
+                }
+            }
+            for (int t = 0; t < m - 1; ++t) {
+                for (int v = 0; v < d; ++v) {
+                    K_trip.emplace_back(nY + t * d + v, nY + t * d + v, 2.0 * lambda_ * dt_(t));
+                }
+            }
+            for (const auto& tr : A_trip) {
+                K_trip.emplace_back(n_primal + tr.row(), tr.col(), tr.value());   // A
+                K_trip.emplace_back(tr.col(), n_primal + tr.row(), tr.value());   // A^T
+            }
+            sparse_matrix_t K(N, N);
+            K.setFromTriplets(K_trip.begin(), K_trip.end());
+            K.makeCompressed();
+            Eigen::SparseLU<sparse_matrix_t> kkt_solver;
+            kkt_solver.compute(K);
+            fdapde_assert(kkt_solver.info() == Eigen::Success);
+            vector_t rhs(N);
+            rhs.head(n_primal) = -g;
+            rhs.segment(n_primal, nC) = -c;
+            vector_t sol = kkt_solver.solve(rhs);
+            fdapde_assert(kkt_solver.info() == Eigen::Success);
+            vector_t p = sol.head(n_primal);
+            vector_t mu_new = sol.segment(n_primal, nC);
+
+            // reshape the primal step into node/interval blocks
+            matrix_t dY(m, d), dU(m - 1, d);
+            for (int t = 0; t < m; ++t) { dY.row(t) = p.segment(t * d, d).transpose(); }
+            for (int t = 0; t < m - 1; ++t) { dU.row(t) = p.segment(nY + t * d, d).transpose(); }
+
+            // L1-merit backtracking line search: M(z; rho) = J(z) + rho ||c(z)||_1 with rho > ||mu_new||_inf
+            // guarantees a descent direction (A p = -c linearizes the constraint away).
+            double c1 = c.template lpNorm<1>();
+            double rho = 1.5 * mu_new.template lpNorm<Eigen::Infinity>() + 1e-6;
+            double M0 = objective_YU_(Y, U) + rho * c1;
+            double DM = g.dot(p) - rho * c1;
+            double alpha = 1.0;
+            const double eta = 1e-4, shrink = 0.5;
+            bool accepted = false;
+            for (int ls = 0; ls < 40; ++ls) {
+                matrix_t Yt = Y + alpha * dY, Ut = U + alpha * dU;
+                double Mt = std::numeric_limits<double>::infinity();
+                if (Yt.allFinite() && Ut.allFinite()) {
+                    vector_t ct = constraints_(Yt, Ut);
+                    if (ct.allFinite()) { Mt = objective_YU_(Yt, Ut) + rho * ct.template lpNorm<1>(); }
+                }
+                if (Mt <= M0 + eta * alpha * DM) { Y = Yt; U = Ut; accepted = true; break; }
+                alpha *= shrink;
+            }
+            if (!accepted) { Y += alpha * dY; U += alpha * dU; }   // damped step to keep progressing
+            mu = mu_new;
+        }
+        n_iter_ = it;
+        converged_ = converged;
+
+        // recover trajectory and diagnostics
+        Y_ = Y;
+        if (has_ic_) { Y_.row(0) = y0_.transpose(); }
+        objective_value_ = objective_YU_(Y_, U);
+        compute_control_();
+        flatten_();
+        return f_;
+    }
+
+    // objective J = SSE(observed) + lambda sum_t dt_t ||u_t||^2 as a function of the full-space (Y, u)
+    double objective_YU_(const matrix_t& Y, const matrix_t& U) const {
+        double J = 0;
+        for (int t = 0; t < m_; ++t) {
+            for (int v = 0; v < d_; ++v) {
+                if (mask_(t, v) != 0.0) { J += std::pow(Y(t, v) - y_obs_(t, v), 2); }
+            }
+        }
+        for (int t = 0; t < m_ - 1; ++t) { J += lambda_ * dt_(t) * U.row(t).squaredNorm(); }
+        return J;
+    }
+    // equality-constraint residual c(Y, u): dynamics defects c_t = y_{t+1} - step(f + u_t)(y_t) followed
+    // by the optional hard-IC defect y_0 - y0 (used to re-evaluate the merit during the line search)
+    vector_t constraints_(const matrix_t& Y, const matrix_t& U) const {
+        const int d = d_, nC_dyn = (m_ - 1) * d;
+        vector_t c(nC_dyn + (has_ic_ ? d : 0));
+        for (int t = 0; t < m_ - 1; ++t) {
+            vector_t yc = Y.row(t).transpose();
+            vector_t ut = U.row(t).transpose();
+            vector_t ynext = engine_.step(time_(t), yc, dt_(t), ut);
+            c.segment(t * d, d) = Y.row(t + 1).transpose() - ynext;
+        }
+        if (has_ic_) { c.segment(nC_dyn, d) = Y.row(0).transpose() - y0_; }
+        return c;
+    }
 
     // TODO: remove gauss-newton system computation
     // assemble the Gauss-Newton system H * dY = -g for the current trajectory (used by edf())
