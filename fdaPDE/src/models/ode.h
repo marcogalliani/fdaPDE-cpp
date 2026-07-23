@@ -50,6 +50,10 @@ class NPRODE {
     void analyze_data(const vector_t& time_nodes, const matrix_t& y_obs) {
         solver_.analyze_data(time_nodes, y_obs);
     }
+    // optional per-component state box constraints lb <= y(t) <= ub (honoured by the SQP fit policy)
+    void set_state_bounds(const vector_t& lb, const vector_t& ub) { solver_.set_state_bounds(lb, ub); }
+    void clear_state_bounds() { solver_.clear_state_bounds(); }
+    bool has_state_bounds() const { return solver_.has_state_bounds(); }
     // fitting
     template <typename... Args> auto fit(Args&&... args) { return solver_.fit(std::forward<Args>(args)...); }
 

@@ -209,6 +209,16 @@ class ts_ls_ode {
         return fit(lambda[0], policy);
     }
 
+    // Optional state-variable box constraints lb <= y(t) <= ub, enforced at every time node (per component;
+    // set a component of lb/ub to -/+ infinity to leave that side free). Only the SQP fit policy honours
+    // them; the adjoint policy ignores them. lb/ub are d-vectors; call once, undo with clear_state_bounds().
+    void set_state_bounds(const vector_t& lb, const vector_t& ub) {
+        fdapde_assert(lb.size() == ub.size());
+        y_lb_ = lb; y_ub_ = ub; has_state_bounds_ = true;
+    }
+    void clear_state_bounds() { has_state_bounds_ = false; }
+    bool has_state_bounds() const { return has_state_bounds_; }
+
     // Optimal control formulation: the decision variable is the
     // piecewise-constant control u that drives the prior dynamics y' = f(t, y) + u(t); the
     // trajectory is recovered by forward integration and the gradient of the data misfit w.r.t.
@@ -452,12 +462,18 @@ class ts_ls_ode {
         const int d = d_, m = m_;
         const int nY = m * d, nU = (m - 1) * d, n_primal = nY + nU;
         const int nC_dyn = (m - 1) * d, nC = nC_dyn + (has_ic_ ? d : 0);
-        const int N = n_primal + nC;
+
+        if (has_state_bounds_) { fdapde_assert(y_lb_.size() == d_ && y_ub_.size() == d_); }
 
         // decision variables: trajectory Y (data-based guess, IC-pinned first node), zero control u, zero
         // constraint multipliers -- the same starting-point basin as the adjoint policy.
         matrix_t Y = initial_guess_();
         if (has_ic_) { Y.row(0) = y0_.transpose(); }
+        if (has_state_bounds_) {   // start feasible so the bound-preserving line search stays feasible
+            for (int t = 0; t < m; ++t)
+                for (int v = 0; v < d; ++v) Y(t, v) = std::min(std::max(Y(t, v), y_lb_(v)), y_ub_(v));
+            if (has_ic_) { Y.row(0) = y0_.transpose(); }   // IC stays exact (assumed feasible)
+        }
         matrix_t U = matrix_t::Zero(m - 1, d);
         vector_t mu = vector_t::Zero(nC);
 
@@ -499,45 +515,27 @@ class ts_ls_ode {
                 for (int i = 0; i < d; ++i) { A_trip.emplace_back(nC_dyn + i, i, 1.0); }
                 c.segment(nC_dyn, d) = Y.row(0).transpose() - y0_;
             }
-            sparse_matrix_t A(nC, n_primal);
-            A.setFromTriplets(A_trip.begin(), A_trip.end());
-
-            // KKT residual: stationarity ||g + A^T mu||_inf and feasibility ||c||_inf
-            double stat = (g + A.transpose() * mu).template lpNorm<Eigen::Infinity>();
+            // convergence test. Unbounded: the KKT residual (stationarity ||g + A^T mu||_inf + feasibility).
+            // Bounded: reduced stationarity is enforced by the active set, so test feasibility + a
+            // vanishing step after the subproblem solve instead.
             double feas = (nC > 0) ? c.template lpNorm<Eigen::Infinity>() : 0.0;
-            if (std::max(stat, feas) < tol_) { converged = true; break; }
+            if (!has_state_bounds_) {
+                sparse_matrix_t A(nC, n_primal);
+                A.setFromTriplets(A_trip.begin(), A_trip.end());
+                double stat = (g + A.transpose() * mu).template lpNorm<Eigen::Infinity>();
+                if (std::max(stat, feas) < tol_) { converged = true; break; }
+            }
 
-            // assemble the KKT saddle-point matrix [[H, A^T], [A, 0]] (H = exact objective Hessian,
-            // block-diagonal) and solve for the primal step and the next multipliers.
-            std::vector<Eigen::Triplet<double>> K_trip;
-            K_trip.reserve(static_cast<std::size_t>(n_primal + 2 * A_trip.size()));
-            for (int t = 0; t < m; ++t) {
-                for (int v = 0; v < d; ++v) {
-                    if (mask_(t, v) != 0.0) { K_trip.emplace_back(t * d + v, t * d + v, 2.0 * mask_(t, v)); }
-                }
+            // solve the SQP subproblem: the plain KKT saddle point, or -- if state bounds are set -- the
+            // bound-constrained QP  min 1/2 p'Hp + g'p  s.t.  A p = -c,  lb - Y <= p_Y <= ub - Y  (PDAS).
+            vector_t p, mu_new;
+            bool solve_ok = true;
+            sqp_subproblem_(g, c, A_trip, n_primal, nC, Y, p, mu_new, solve_ok);
+            if (!solve_ok) { break; }   // singular / NaN KKT: stop gracefully rather than abort
+
+            if (has_state_bounds_ && std::max(feas, p.template lpNorm<Eigen::Infinity>()) < tol_) {
+                converged = true; break;
             }
-            for (int t = 0; t < m - 1; ++t) {
-                for (int v = 0; v < d; ++v) {
-                    K_trip.emplace_back(nY + t * d + v, nY + t * d + v, 2.0 * lambda_ * dt_(t));
-                }
-            }
-            for (const auto& tr : A_trip) {
-                K_trip.emplace_back(n_primal + tr.row(), tr.col(), tr.value());   // A
-                K_trip.emplace_back(tr.col(), n_primal + tr.row(), tr.value());   // A^T
-            }
-            sparse_matrix_t K(N, N);
-            K.setFromTriplets(K_trip.begin(), K_trip.end());
-            K.makeCompressed();
-            Eigen::SparseLU<sparse_matrix_t> kkt_solver;
-            kkt_solver.compute(K);
-            fdapde_assert(kkt_solver.info() == Eigen::Success);
-            vector_t rhs(N);
-            rhs.head(n_primal) = -g;
-            rhs.segment(n_primal, nC) = -c;
-            vector_t sol = kkt_solver.solve(rhs);
-            fdapde_assert(kkt_solver.info() == Eigen::Success);
-            vector_t p = sol.head(n_primal);
-            vector_t mu_new = sol.segment(n_primal, nC);
 
             // reshape the primal step into node/interval blocks
             matrix_t dY(m, d), dU(m - 1, d);
@@ -576,6 +574,84 @@ class ts_ls_ode {
         compute_control_();
         flatten_();
         return f_;
+    }
+
+    // Solve one SQP subproblem. Without state bounds: the KKT saddle [[H, A^T],[A,0]] [p; mu] = [-g; -c]
+    // (H = the exact, diagonal objective Hessian) -- one sparse solve, identical to the unconstrained SQP.
+    // With state bounds: the same objective/dynamics plus the box  lb - Y <= p_Y <= ub - Y, solved by a
+    // primal-dual active-set loop -- append the active-bound rows e_k^T p = bound - Y_k to the KKT, then
+    // ADD a bound whose step violates it and RELEASE an active bound whose multiplier has the wrong sign
+    // (reduced gradient = -nu: a lower bound stays iff nu <= 0, an upper bound iff nu >= 0). The active set
+    // at convergence is exactly the set of boundary arcs. Sets ok=false on a failed factorization so the
+    // caller bails gracefully instead of asserting.
+    void sqp_subproblem_(const vector_t& g, const vector_t& c,
+                         const std::vector<Eigen::Triplet<double>>& A_trip, int n_primal, int nC,
+                         const matrix_t& Y, vector_t& p, vector_t& mu_new, bool& ok) const {
+        const int d = d_, m = m_, nY = m * d;
+        std::vector<int> st(nY, 0);   // per (node, component): 0 free, -1 pinned at lb, +1 pinned at ub
+        for (int sweep = 0; sweep < 6 * nY + 20; ++sweep) {
+            std::vector<int> W; std::vector<double> bW;
+            if (has_state_bounds_) {
+                for (int t = 0; t < m; ++t) {
+                    if (has_ic_ && t == 0) { continue; }   // node 0 is pinned by the IC equality already
+                    for (int v = 0; v < d; ++v) {
+                        const int k = t * d + v;
+                        if (st[k] == -1) { W.push_back(k); bW.push_back(y_lb_(v) - Y(t, v)); }
+                        else if (st[k] == 1) { W.push_back(k); bW.push_back(y_ub_(v) - Y(t, v)); }
+                    }
+                }
+            }
+            const int nW = static_cast<int>(W.size()), N = n_primal + nC + nW;
+            std::vector<Eigen::Triplet<double>> K_trip;
+            K_trip.reserve(static_cast<std::size_t>(n_primal + 2 * A_trip.size() + 2 * nW));
+            // H (exact objective Hessian): 2*mask on the Y-block, 2*lambda*dt on the u-block
+            for (int t = 0; t < m; ++t)
+                for (int v = 0; v < d; ++v)
+                    if (mask_(t, v) != 0.0) { K_trip.emplace_back(t * d + v, t * d + v, 2.0 * mask_(t, v)); }
+            for (int t = 0; t < m - 1; ++t)
+                for (int v = 0; v < d; ++v)
+                    K_trip.emplace_back(nY + t * d + v, nY + t * d + v, 2.0 * lambda_ * dt_(t));
+            for (const auto& tr : A_trip) {                                    // A and A^T
+                K_trip.emplace_back(n_primal + tr.row(), tr.col(), tr.value());
+                K_trip.emplace_back(tr.col(), n_primal + tr.row(), tr.value());
+            }
+            for (int w = 0; w < nW; ++w) {                                     // active-bound rows e_k and e_k^T
+                K_trip.emplace_back(n_primal + nC + w, W[w], 1.0);
+                K_trip.emplace_back(W[w], n_primal + nC + w, 1.0);
+            }
+            sparse_matrix_t K(N, N); K.setFromTriplets(K_trip.begin(), K_trip.end()); K.makeCompressed();
+            Eigen::SparseLU<sparse_matrix_t> lu; lu.compute(K);
+            if (lu.info() != Eigen::Success) { ok = false; return; }
+            vector_t rhs(N); rhs.head(n_primal) = -g; rhs.segment(n_primal, nC) = -c;
+            for (int w = 0; w < nW; ++w) { rhs(n_primal + nC + w) = bW[w]; }
+            vector_t sol = lu.solve(rhs);
+            if (lu.info() != Eigen::Success) { ok = false; return; }
+            p = sol.head(n_primal);
+            mu_new = sol.segment(n_primal, nC);
+            if (!has_state_bounds_) { ok = true; return; }
+            const vector_t nu = sol.segment(n_primal + nC, nW);
+            // 1) activate the inactive bounds the step violates
+            bool changed = false;
+            for (int t = 0; t < m; ++t) {
+                if (has_ic_ && t == 0) { continue; }
+                for (int v = 0; v < d; ++v) {
+                    const int k = t * d + v;
+                    if (st[k] != 0) { continue; }
+                    const double lo = y_lb_(v) - Y(t, v), hi = y_ub_(v) - Y(t, v);
+                    if (p(k) < lo - 1e-10) { st[k] = -1; changed = true; }
+                    else if (p(k) > hi + 1e-10) { st[k] = 1; changed = true; }
+                }
+            }
+            if (changed) { continue; }
+            // 2) release one active bound whose multiplier has the wrong sign
+            for (int w = 0; w < nW; ++w) {
+                const int k = W[w];
+                if (st[k] == -1 && nu(w) > 1e-9) { st[k] = 0; changed = true; break; }
+                if (st[k] == 1 && nu(w) < -1e-9) { st[k] = 0; changed = true; break; }
+            }
+            if (!changed) { ok = true; return; }   // KKT + bound complementarity satisfied
+        }
+        ok = true;   // reached the sweep cap (rare): return the last computed step
     }
 
     // objective J = SSE(observed) + lambda sum_t dt_t ||u_t||^2 as a function of the full-space (Y, u)
@@ -680,6 +756,12 @@ class ts_ls_ode {
     bool has_ic_ = false;
     vector_t y0_;
     static constexpr double divergent_cost_ = 1e20;   // objective surrogate for a blown-up forward solve
+
+    // optional per-component state box constraints y_lb_ <= y_{t,:} <= y_ub_ (d-vectors, applied at every
+    // time node; use +/- infinity to leave a side free). Honoured by the SQP policy via a primal-dual
+    // active-set inner solve; the adjoint policy ignores them.
+    bool has_state_bounds_ = false;
+    vector_t y_lb_, y_ub_;
 
     // data
     vector_t time_;                    // m time nodes
