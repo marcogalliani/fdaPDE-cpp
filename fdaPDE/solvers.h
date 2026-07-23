@@ -38,6 +38,7 @@ struct de_solver { };
 #include "src/solvers/fe_ls_separable.h"
 #include "src/solvers/fe_ls_parabolic.h"
 #include "src/solvers/ts_ls_ode.h"
+#include "src/solvers/ts_ls_ode_tracking.h"
 
 // density estimation solvers
 #include "src/solvers/fe_de_elliptic.h"

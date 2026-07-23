@@ -105,7 +105,7 @@ using any_rk_engine = fdapde::erase<fdapde::heap_storage, IRkEngine>;
 // solver: they are erased into the any_rk_engine the penalty descriptor hands over (so a static-Dim
 // field still drives the fixed-size stage math inside, without leaking the parameter here).
 class ts_ls_ode {
-   private:
+   protected:   // protected (not private): the inverse solvers derive from this and drive the inner fit
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
     using sparse_matrix_t = Eigen::SparseMatrix<double>;
@@ -242,6 +242,9 @@ class ts_ls_ode {
         // recover trajectory and diagnostics from the optimal control
         Y_ = forward_recover_(z_opt);
         if (has_ic_) { Y_.row(0) = y0_.transpose(); }
+        U_.resize(m_ - 1, d_);   // the additive control itself (the decision variable)
+        for (int t = 0; t < m_ - 1; ++t) { U_.row(t) = z_opt.segment(t * d_, d_).transpose(); }
+        bound_mult_.setZero(m_, d_);   // the adjoint policy ignores state bounds
         objective_value_ = optimizer.value();
         n_iter_ = optimizer.n_iter();
         converged_ = (n_iter_ < max_iter_);   // stopped on the gradient tolerance, not the iter cap
@@ -311,11 +314,18 @@ class ts_ls_ode {
     const vector_t& response() const { return y_; }     // flattened response (m*d), NaN -> 0
     const matrix_t& trajectory() const { return Y_; }   // m x d
     const matrix_t& control() const { return control_; }
+    // the additive control u_t itself ((m-1) x d), i.e. the decision variable forcing the dynamics as
+    // f + u_t. Distinct from control() above, which reports the finite-difference defect
+    // (y_{t+1} - step_f(y_t))/dt -- the two coincide only for forward Euler. Inverse solvers must use
+    // this one, since the outer sensitivities are evaluated on the correctly forced dynamics.
+    const matrix_t& additive_control() const { return U_; }
+    // dual variables of the state box constraints (m x d, zero where inactive / unbounded)
+    const matrix_t& bound_multipliers() const { return bound_mult_; }
     double objective() const { return objective_value_; }
     int n_iter() const { return n_iter_; }
     bool converged() const { return converged_; }
 
-   private:
+   protected:
     double dt_(int t) const { return time_(t + 1) - time_(t); }
 
     void set_response_(const matrix_t& y_obs) {
@@ -476,6 +486,7 @@ class ts_ls_ode {
         }
         matrix_t U = matrix_t::Zero(m - 1, d);
         vector_t mu = vector_t::Zero(nC);
+        bound_mult_.setZero(m, d);   // filled by sqp_subproblem_ when state bounds are active
 
         int it = 0;
         bool converged = false;
@@ -570,13 +581,15 @@ class ts_ls_ode {
         // recover trajectory and diagnostics
         Y_ = Y;
         if (has_ic_) { Y_.row(0) = y0_.transpose(); }
+        U_ = U;   // the additive control itself (the decision variable)
         objective_value_ = objective_YU_(Y_, U);
         compute_control_();
         flatten_();
         return f_;
     }
 
-    // Solve one SQP subproblem. Without state bounds: the KKT saddle [[H, A^T],[A,0]] [p; mu] = [-g; -c]
+    // Solve one SQP subproblem. 
+    // Without state bounds: the KKT saddle [[H, A^T],[A,0]] [p; mu] = [-g; -c]
     // (H = the exact, diagonal objective Hessian) -- one sparse solve, identical to the unconstrained SQP.
     // With state bounds: the same objective/dynamics plus the box  lb - Y <= p_Y <= ub - Y, solved by a
     // primal-dual active-set loop -- append the active-bound rows e_k^T p = bound - Y_k to the KKT, then
@@ -586,7 +599,7 @@ class ts_ls_ode {
     // caller bails gracefully instead of asserting.
     void sqp_subproblem_(const vector_t& g, const vector_t& c,
                          const std::vector<Eigen::Triplet<double>>& A_trip, int n_primal, int nC,
-                         const matrix_t& Y, vector_t& p, vector_t& mu_new, bool& ok) const {
+                         const matrix_t& Y, vector_t& p, vector_t& mu_new, bool& ok) {
         const int d = d_, m = m_, nY = m * d;
         std::vector<int> st(nY, 0);   // per (node, component): 0 free, -1 pinned at lb, +1 pinned at ub
         for (int sweep = 0; sweep < 6 * nY + 20; ++sweep) {
@@ -630,6 +643,11 @@ class ts_ls_ode {
             mu_new = sol.segment(n_primal, nC);
             if (!has_state_bounds_) { ok = true; return; }
             const vector_t nu = sol.segment(n_primal + nC, nW);
+            // record the active-bound multipliers on the (node, component) grid: they are the dual
+            // variables of the state box, and an inverse solver needs them to augment the node source
+            // (the constrained envelope theorem -- the bounds constrain Y, which depends on theta).
+            bound_mult_.setZero(m_, d_);
+            for (int w = 0; w < nW; ++w) { bound_mult_(W[w] / d, W[w] % d) = nu(w); }
             // 1) activate the inactive bounds the step violates
             bool changed = false;
             for (int t = 0; t < m; ++t) {
@@ -771,6 +789,8 @@ class ts_ls_ode {
     // results
     double lambda_ = -1;
     matrix_t Y_, control_;        // fitted trajectory (m x d) and control defects ((m-1) x d)
+    matrix_t U_;                  // additive control ((m-1) x d), the actual decision variable
+    matrix_t bound_mult_;         // state-box dual variables (m x d), zero where inactive
     vector_t f_, g_, y_, beta_;   // flattened trajectory / control / response
     double objective_value_ = 0;
     int n_iter_ = 0;
