@@ -22,73 +22,6 @@
 namespace fdapde {
 namespace internals {
 
-// Control-aware adapter over the core RKIntegrator, local to the ODE-penalty solver 
-// rk_engine<Stages, Dim> bundles the prior field ode_rhs_field<Dim> with an RKIntegrator<Stages> 
-// and exposes exactly the single-step operations the optimal control solver needs, with the per-interval 
-// control entering as an additive forcing of the dynamics (g = field + u). 
-// Both the stage count Stages and the system dimension Dim are concrete here,
-// so the wrapped integrator keeps its fixed-stage / fixed-dimension fast paths; the
-// type-erased any_rk_engine then hides both parameters so the solver and the model wrapper that hold it
-// are free of the Stages and Dim template parameters.
-template <int Stages, int Dim>
-struct rk_engine {
-    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
-    using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
-
-    rk_engine() = default;
-    rk_engine(ode_rhs_field<Dim> field, RKIntegrator<Stages> integrator) :
-        field_(std::move(field)), integrator_(std::move(integrator)) { }
-
-    // forced forward step: integrate field + u over [t, t + dt] (u = 0 recovers the prior dynamics)
-    vector_t step(double t, const vector_t& y, double dt, const vector_t& u) const {
-        return integrator_.step(field_ + u, t, y, dt);
-    }
-    // forced discrete adjoint of one step: u is the constant additive control on the interval, p_next
-    // the incoming costate; returns {p_curr, dC/du} (see RKIntegrator::adjoint_step)
-    std::pair<vector_t, vector_t> adjoint_step(
-      double t, const vector_t& y, double dt, const vector_t& p_next, const vector_t& u) const {
-        return integrator_.adjoint_step(field_ + u, t, y, dt, p_next);
-    }
-    // unforced step together with the flow Jacobian of the prior dynamics (no control); used by edf()
-    std::pair<vector_t, matrix_t> step_with_flow_jacobian(double t, const vector_t& y, double dt) const {
-        return integrator_.step_with_flow_jacobian(field_, t, y, dt);
-    }
-    // forced step together with its state (flow) and control Jacobians (control-aware; u = 0 recovers the
-    // prior dynamics). The forward-mode primitive the full-space SQP solver assembles its KKT system from.
-    std::tuple<vector_t, matrix_t, matrix_t> step_with_jacobians(
-      double t, const vector_t& y, double dt, const vector_t& u) const {
-        return integrator_.step_with_jacobians(field_ + u, t, y, dt);
-    }
-
-    ode_rhs_field<Dim> field_;
-    RKIntegrator<Stages> integrator_;
-};
-
-// type-erased control-aware engine: the solver-facing interface (forced step, forced adjoint step,
-// unforced step + flow Jacobian) with Stages and Dim erased. 
-struct IRkEngine {
-    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
-    using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
-    template <typename T> using fn_ptrs =
-      fdapde::bindings<&T::step, &T::adjoint_step, &T::step_with_flow_jacobian, &T::step_with_jacobians>;
-    vector_t step(double t, const vector_t& y, double dt, const vector_t& u) const {
-        return fdapde::invoke<vector_t, 0>(*this, t, y, dt, u);
-    }
-    std::pair<vector_t, vector_t> adjoint_step(
-      double t, const vector_t& y, double dt, const vector_t& p_next, const vector_t& u) const {
-        return fdapde::invoke<std::pair<vector_t, vector_t>, 1>(*this, t, y, dt, p_next, u);
-    }
-    std::pair<vector_t, matrix_t> step_with_flow_jacobian(double t, const vector_t& y, double dt) const {
-        return fdapde::invoke<std::pair<vector_t, matrix_t>, 2>(*this, t, y, dt);
-    }
-    std::tuple<vector_t, matrix_t, matrix_t> step_with_jacobians(
-      double t, const vector_t& y, double dt, const vector_t& u) const {
-        return fdapde::invoke<std::tuple<vector_t, matrix_t, matrix_t>, 3>(*this, t, y, dt, u);
-    }
-};
-
-using any_rk_engine = fdapde::erase<fdapde::heap_storage, IRkEngine>;
-
 // Time-stepping (discretize-then-optimize) least-squares solver for ODE-penalized smoothing.
 //
 // Over a time grid t_1 < ... < t_m and a d-dimensional response, it fits the nodal trajectory
@@ -102,7 +35,7 @@ using any_rk_engine = fdapde::erase<fdapde::heap_storage, IRkEngine>;
 // variable (the reduced / adjoint-method formulation).
 
 // The ODE system dimension and the integration scheme's stage count are not template parameters of the
-// solver: they are erased into the any_rk_engine the penalty descriptor hands over (so a static-Dim
+// solver: they are erased into the any_controlled_ode_solver the penalty descriptor hands over (so a static-Dim
 // field still drives the fixed-size stage math inside, without leaking the parameter here).
 class ts_ls_ode {
    protected:   // protected (not private): the inverse solvers derive from this and drive the inner fit
@@ -768,7 +701,7 @@ class ts_ls_ode {
 
     // model and discretization: the type-erased control-aware engine (bundles the prior field and the
     // RK integrator; both the stage count and the system dimension are erased inside it)
-    any_rk_engine engine_;
+    any_controlled_ode_solver engine_;
     int max_iter_ = 50;
     double tol_ = 1e-8;
     bool has_ic_ = false;
@@ -810,18 +743,18 @@ struct ts_ls_ode {
    private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     struct penalty_packet {
-        internals::any_rk_engine engine_;
+        any_controlled_ode_solver engine_;
         vector_t ic_;
         bool has_ic_ = false;
         int max_iter_ = 50;
         double tol_ = 1e-8;
        public:
-        penalty_packet(internals::any_rk_engine engine, int max_iter, double tol) :
+        penalty_packet(any_controlled_ode_solver engine, int max_iter, double tol) :
             engine_(std::move(engine)), max_iter_(max_iter), tol_(tol) { }
-        penalty_packet(internals::any_rk_engine engine, vector_t ic, int max_iter, double tol) :
+        penalty_packet(any_controlled_ode_solver engine, vector_t ic, int max_iter, double tol) :
             engine_(std::move(engine)), ic_(std::move(ic)), has_ic_(true), max_iter_(max_iter), tol_(tol) { }
         // observers
-        const internals::any_rk_engine& engine() const { return engine_; }
+        const any_controlled_ode_solver& engine() const { return engine_; }
         const vector_t& ic() const { return ic_; }
         bool has_ic() const { return has_ic_; }
         int max_iter() const { return max_iter_; }
@@ -829,12 +762,13 @@ struct ts_ls_ode {
     };
     // bundle the field and the freshly-built integrator into the erased control-aware engine. Dim is the
     // field's static dimension (fixed-size return -> static, VectorXd -> Dynamic), deduced here and used
-    // only to build the typed rk_engine<Stages, Dim>; it never escapes this function.
+    // together with the functor type Field only to build the typed controlled_ode_solver<Stages, Dim, Field>; neither
+    // escapes this function (both are hidden behind the erased any_controlled_ode_solver).
     template <typename Field, int Stages>
-    static internals::any_rk_engine make_engine_(const Field& field, const ButcherTableau<Stages>& tableau) {
+    static any_controlled_ode_solver make_engine_(const Field& field, const ButcherTableau<Stages>& tableau) {
         constexpr int Dim = ode_rhs_dim_v<Field>;
-        return internals::any_rk_engine(
-          internals::rk_engine<Stages, Dim>(ode_rhs_field<Dim>(field), RKIntegrator(tableau)));
+        return any_controlled_ode_solver(
+          controlled_ode_solver<Stages, Dim, Field>(ode_rhs_field<Dim, Field>(field), RKIntegrator(tableau)));
     }
    public:
     // both the stage count (from the tableau) and the system dimension (from the field) are deduced

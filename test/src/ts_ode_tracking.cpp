@@ -36,12 +36,12 @@ struct param_field {
         out << th[0] * y[0] * y[1] + std::sin(t), th[1] * y[0] - th[2] * y[1] * y[1];
         return out;
     }
-    matrix_t df_dy(double, const vector_t& y, const vector_t& th) const {
+    matrix_t state_jacobian(double, const vector_t& y, const vector_t& th) const {
         matrix_t J(2, 2);
         J << th[0] * y[1], th[0] * y[0], th[1], -2.0 * th[2] * y[1];
         return J;
     }
-    matrix_t df_dtheta(double, const vector_t& y, const vector_t& th) const {
+    matrix_t param_jacobian(double, const vector_t& y, const vector_t& th) const {
         matrix_t J = matrix_t::Zero(2, 3);
         J(0, 0) = y[0] * y[1];
         J(1, 1) = y[0];
@@ -51,15 +51,15 @@ struct param_field {
     }
 };
 
-// same dynamics WITHOUT an analytic df_dtheta: routes the parameter sensitivity through the
-// finite-difference fallback (param_jacobian_fd)
+// same dynamics WITHOUT an analytic param_jacobian: routes the parameter sensitivity through the
+// finite-difference fallback inside ode_rhs_field::param_jacobian
 struct param_field_no_dtheta {
     vector_t operator()(double t, const vector_t& y, const vector_t& th) const {
         vector_t out(2);
         out << th[0] * y[0] * y[1] + std::sin(t), th[1] * y[0] - th[2] * y[1] * y[1];
         return out;
     }
-    matrix_t df_dy(double, const vector_t& y, const vector_t& th) const {
+    matrix_t state_jacobian(double, const vector_t& y, const vector_t& th) const {
         matrix_t J(2, 2);
         J << th[0] * y[1], th[0] * y[0], th[1], -2.0 * th[2] * y[1];
         return J;
@@ -80,8 +80,8 @@ vector_t theta_of(double a, double b, double c) {
 
 // discrete trajectory of the prior dynamics at a given theta
 matrix_t integrate_param(const vector_t& theta, const vector_t& time, const vector_t& y0) {
-    theta_bound_rhs<param_field> bound {param_field {}, theta};
-    return RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(bound, time, y0);
+    ode_rhs_field field {param_field {}, theta};   // parameterized field with theta bound
+    return RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(field, time, y0);
 }
 
 struct fixture {
@@ -115,31 +115,33 @@ struct fixture {
 
 }   // namespace tracking_ode_test
 
-// the finite-difference df/dtheta fallback agrees with the analytic parameter Jacobian
+// the finite-difference df/dtheta fallback agrees with the analytic parameter Jacobian. A field wrapping
+// a functor WITHOUT an analytic param_jacobian routes ode_rhs_field::param_jacobian through central differences.
 TEST(ts_ls_ode_tracking, param_jacobian_fd_matches_analytic) {
     tracking_ode_test::param_field f;
-    tracking_ode_test::param_field_no_dtheta f_nojac;
     vector_t y(2);
     y << 0.4, -0.2;
     vector_t th = tracking_ode_test::theta_of(0.8, 1.2, 0.9);
-    matrix_t analytic = f.df_dtheta(0.3, y, th);
-    matrix_t fd = param_jacobian_fd(f_nojac, 0.3, y, th);
+    matrix_t analytic = f.param_jacobian(0.3, y, th);
+    ode_rhs_field fd_field {tracking_ode_test::param_field_no_dtheta {}, th};   // no param_jacobian -> FD
+    matrix_t fd = fd_field.param_jacobian(0.3, y);
     EXPECT_EQ(fd.rows(), 2);
     EXPECT_EQ(fd.cols(), 3);
     EXPECT_LT((fd - analytic).cwiseAbs().maxCoeff(), 1e-6);
 }
 
-// binding theta yields a plain ODE rhs whose analytic df_dy is preserved through the binding
+// wrapping a parameterized functor with a bound theta yields a plain ODE rhs whose analytic state_jacobian is
+// preserved through the binding (the merged ode_rhs_field is the theta-bound rhs)
 TEST(ts_ls_ode_tracking, theta_binding_preserves_jacobian) {
     vector_t th = tracking_ode_test::theta_of(0.8, 1.2, 0.9);
-    theta_bound_rhs<tracking_ode_test::param_field> bound {tracking_ode_test::param_field {}, th};
+    ode_rhs_field bound {tracking_ode_test::param_field {}, th};
     static_assert(is_ode_rhs<decltype(bound)>, "the theta-bound field must be a plain ODE rhs");
-    static_assert(has_jacobian<decltype(bound)>, "the analytic df_dy must survive the binding");
+    static_assert(ode_rhs_has_state_jacobian<decltype(bound)>, "the analytic state_jacobian must survive the binding");
     vector_t y(2);
     y << 0.4, -0.2;
     tracking_ode_test::param_field f;
     EXPECT_LT((bound(0.3, y) - f(0.3, y, th)).cwiseAbs().maxCoeff(), 1e-10);
-    EXPECT_LT((bound.df_dy(0.3, y) - f.df_dy(0.3, y, th)).cwiseAbs().maxCoeff(), 1e-10);
+    EXPECT_LT((bound.state_jacobian(0.3, y) - f.state_jacobian(0.3, y, th)).cwiseAbs().maxCoeff(), 1e-10);
 }
 
 // THE key correctness test: the envelope (adjoint) outer gradient reproduces central finite differences
@@ -197,11 +199,11 @@ TEST(ts_ls_ode_tracking, outer_gradient_with_fd_param_jacobian) {
     tracking_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t th = tracking_ode_test::theta_of(0.85, 1.15, 0.9);
     const double lambda = 10.0;
-    // analytic-df_dtheta solver
+    // analytic-param_jacobian solver
     auto solver_a = fx.make_solver(th);
     solver_a.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
     vector_t g_analytic = solver_a.outer_gradient_at(lambda, th);
-    // finite-difference-df_dtheta solver on the same dynamics
+    // finite-difference-param_jacobian solver on the same dynamics
     ts_ls_ode_param penalty(
       tracking_ode_test::param_field_no_dtheta {}, ode_schemes::gauss_legendre_2(), th, 200, 1e-10);
     internals::ts_ls_ode_tracking solver_b;

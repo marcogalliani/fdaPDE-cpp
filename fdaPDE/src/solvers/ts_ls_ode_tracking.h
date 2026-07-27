@@ -17,90 +17,11 @@
 #ifndef __TS_LS_ODE_TRACKING_SOLVER_H__
 #define __TS_LS_ODE_TRACKING_SOLVER_H__
 
+
 #include "header_check.h"
 
 namespace fdapde {
 namespace internals {
-
-// Parameter-aware engine: the theta-parameterized dynamics f(t, y, theta) together with the RK scheme.
-// It is NOT the engine the inner solver runs on -- it *produces* one. For a given theta it binds the
-// parameter away (theta_bound_rhs) and hands back an ordinary rk_engine, so the whole forward stack
-// (ts_ls_ode, its two fit policies, the integrator) is reused untouched. On top of that it exposes the
-// one extra quantity the inverse problem needs: d step / d theta on the control-forced dynamics.
-template <int Stages, int Dim, typename F> struct param_rk_engine {
-    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
-    using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
-
-    param_rk_engine() = default;
-    param_rk_engine(F field, RKIntegrator<Stages> integrator, vector_t theta) :
-        field_(std::move(field)), integrator_(std::move(integrator)), theta_(std::move(theta)) { }
-
-    void set_theta(const vector_t& theta) { theta_ = theta; }
-    const vector_t& theta() const { return theta_; }
-    int n_params() const { return theta_.size(); }
-
-    // the plain (theta-bound) control-aware engine the inner solver runs on
-    rk_engine<Stages, Dim> engine() const {
-        return rk_engine<Stages, Dim>(ode_rhs_field<Dim>(bound_()), integrator_);
-    }
-    // d step / d theta at (t, y, dt) on the dynamics forced by the constant control u (d x n_theta).
-    // u is theta-independent, so the parameter Jacobian fed to the integrator is that of the unforced
-    // parametric field, while the stage system itself is built on the forced one.
-    matrix_t param_jacobian(double t, const vector_t& y, double dt, const vector_t& u) const {
-        ode_rhs_field<Dim> bound(bound_());
-        return integrator_.step_param_jacobian(
-          bound + u, t, y, dt,
-          [this](double tt, const vector_t& yy) { return df_dtheta_(tt, yy); }, theta_.size());
-    }
-
-   private:
-    theta_bound_rhs<F> bound_() const { return theta_bound_rhs<F> {field_, theta_}; }
-    // analytic df/dtheta when the field supplies one, central finite differences otherwise
-    matrix_t df_dtheta_(double t, const vector_t& y) const {
-        if constexpr (has_param_jacobian<F>) {
-            return field_.df_dtheta(t, y, theta_);
-        } else {
-            return param_jacobian_fd(field_, t, y, theta_);
-        }
-    }
-
-    F field_;
-    RKIntegrator<Stages> integrator_;
-    vector_t theta_;
-};
-
-// The handle the tracking solver keeps: closures over one shared param_rk_engine, so Stages / Dim / the
-// field type are all erased without introducing a second type-erasure interface. engine() snapshots the
-// engine at the currently bound theta into the plain any_rk_engine the base solver consumes.
-struct param_engine_handle {
-    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
-    using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
-
-    std::function<void(const vector_t&)> set_theta;
-    std::function<any_rk_engine()> engine;
-    std::function<matrix_t(double, const vector_t&, double, const vector_t&)> param_jacobian;
-    int n_params = 0;
-
-    explicit operator bool() const { return static_cast<bool>(engine); }
-};
-
-template <int Stages, int Dim, typename F>
-param_engine_handle make_param_engine_handle(
-  F field, RKIntegrator<Stages> integrator, Eigen::Matrix<double, Dynamic, 1> theta) {
-    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
-    auto eng = std::make_shared<param_rk_engine<Stages, Dim, F>>(
-      std::move(field), std::move(integrator), std::move(theta));
-    param_engine_handle h;
-    h.set_theta = [eng](const vector_t& th) { eng->set_theta(th); };
-    // erase's templated converting constructor accepts the concrete engine: it implements the whole
-    // IRkEngine surface, so no new erased interface is needed.
-    h.engine = [eng]() { return any_rk_engine(eng->engine()); };
-    h.param_jacobian = [eng](double t, const vector_t& y, double dt, const vector_t& u) {
-        return eng->param_jacobian(t, y, dt, u);
-    };
-    h.n_params = eng->n_params();
-    return h;
-}
 
 // Tracking inverse solver: estimates the ODE parameters theta of a parameterized prior dynamics
 // y' = f(t, y, theta) + u(t) from the same data the forward solver smooths.
@@ -141,13 +62,12 @@ class ts_ls_ode_tracking : public ts_ls_ode {
         analyze_data(formula, gf);
     }
 
-    // discretize a parametric penalty: the base takes the engine at theta0 (so a plain forward fit()
-    // works immediately), and we keep the handle to rebind theta during the outer solve.
+    // discretize a parametric penalty: the base takes the (parametric) engine at theta0 -- so a plain
+    // forward fit() works immediately -- and the outer solve rebinds theta directly on that inherited engine.
     template <typename Penalty> void discretize(Penalty&& penalty) {
         Base::discretize(penalty);
-        handle_ = penalty.handle();
         theta_ = penalty.theta0();
-        fdapde_assert(static_cast<bool>(handle_) && theta_.size() == handle_.n_params);
+        fdapde_assert(static_cast<bool>(engine_) && theta_.size() == engine_.n_params());
         invalidate_cache_();
     }
 
@@ -175,8 +95,8 @@ class ts_ls_ode_tracking : public ts_ls_ode {
     // minimize H(theta) = min_u J(u, theta) over theta by BFGS on the envelope gradient. On return the
     // inherited forward state (trajectory, control, f(), ...) is the inner fit at the estimated theta.
     const vector_t& solve(double lambda, const vector_t& theta0) {
-        fdapde_assert(lambda > 0 && static_cast<bool>(handle_));
-        fdapde_assert(theta0.size() == handle_.n_params);
+        fdapde_assert(lambda > 0 && static_cast<bool>(engine_));
+        fdapde_assert(theta0.size() == engine_.n_params());
         lambda_outer_ = lambda;
         inner_failures_ = 0;
         invalidate_cache_();
@@ -198,7 +118,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
 
     // --- observers -----------------------------------------------------
     const vector_t& theta() const { return theta_; }            // parameter estimate
-    int n_params() const { return handle_.n_params; }
+    int n_params() const { return engine_.n_params(); }
     double outer_objective() const { return outer_value_; }     // H(theta*)
     int outer_n_iter() const { return outer_n_iter_; }
     bool outer_converged() const { return outer_converged_; }
@@ -226,8 +146,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
     // point, and one inner solve serves both.
     void inner_solve_(const vector_t& theta) {
         if (cache_valid_ && theta_cache_.size() == theta.size() && theta_cache_ == theta) { return; }
-        handle_.set_theta(theta);
-        engine_ = handle_.engine();   // rebind the inherited engine to the new parameters
+        engine_.set_theta(theta);   // rebind the inherited engine to the new parameters, in place
         fit(lambda_outer_, inner_policy());
         theta_cache_ = theta;
         cache_valid_ = true;
@@ -260,7 +179,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
     // envelope gradient: a single backward adjoint sweep at frozen control.
     vector_t grad_H_(const vector_t& theta) {
         inner_solve_(theta);
-        const int n_theta = handle_.n_params;
+        const int n_theta = engine_.n_params();
         vector_t grad = vector_t::Zero(n_theta);
         // divergent inner solve: report a finite (zero) gradient, the large objective drives the line
         // search back on its own.
@@ -282,7 +201,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
             vector_t yc = Y_.row(t).transpose();
             vector_t ut = U_.row(t).transpose();
             // d y_{t+1}/d theta on the forced dynamics; p is the costate p_{t+1}
-            matrix_t Theta = handle_.param_jacobian(time_(t), yc, dt_(t), ut);
+            matrix_t Theta = engine_.param_jacobian(time_(t), yc, dt_(t), ut);
             grad.noalias() += Theta.transpose() * p;
             // Flow_t^T p, from the engine's existing discrete adjoint of one step
             vector_t p_prop = engine_.adjoint_step(time_(t), yc, dt_(t), p, ut).first;
@@ -302,7 +221,6 @@ class ts_ls_ode_tracking : public ts_ls_ode {
         }
     };
 
-    param_engine_handle handle_;
     std::function<matrix_t(const vector_t&)> ic_jacobian_;
 
     vector_t theta_;                                  // current / estimated parameters
@@ -327,60 +245,64 @@ class ts_ls_ode_tracking : public ts_ls_ode {
 }   // namespace internals
 
 // Parametric ODE-penalty descriptor: the theta-parameterized field, the time-integration scheme, an
-// initial guess for theta and an optional initial condition. Mirrors the ts_ls_ode descriptor -- the
-// stage count and the system dimension are deduced here and erased away -- and additionally carries the
-// handle that lets the tracking solver rebind theta.
+// initial guess for theta and an optional initial condition. Mirrors the ts_ls_ode descriptor -- the stage
+// count and the system dimension are deduced here and erased away -- the only difference being that the
+// erased engine wraps a parametric field (theta bound to theta0), so the tracking solver rebinds theta
+// directly on the inherited any_controlled_ode_solver.
 struct ts_ls_ode_param {
     using solver_t = internals::ts_ls_ode_tracking;
    private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     struct penalty_packet {
-        internals::param_engine_handle handle_;
+        any_controlled_ode_solver engine_;
         vector_t theta0_, ic_;
         bool has_ic_ = false;
         int max_iter_ = 50;
         double tol_ = 1e-10;   // tighter than the forward default: the envelope gradient needs dJ/du ~ 0
        public:
-        penalty_packet(internals::param_engine_handle handle, vector_t theta0, int max_iter, double tol) :
-            handle_(std::move(handle)), theta0_(std::move(theta0)), max_iter_(max_iter), tol_(tol) { }
+        penalty_packet(any_controlled_ode_solver engine, vector_t theta0, int max_iter, double tol) :
+            engine_(std::move(engine)), theta0_(std::move(theta0)), max_iter_(max_iter), tol_(tol) { }
         penalty_packet(
-          internals::param_engine_handle handle, vector_t theta0, vector_t ic, int max_iter, double tol) :
-            handle_(std::move(handle)),
+          any_controlled_ode_solver engine, vector_t theta0, vector_t ic, int max_iter, double tol) :
+            engine_(std::move(engine)),
             theta0_(std::move(theta0)),
             ic_(std::move(ic)),
             has_ic_(true),
             max_iter_(max_iter),
             tol_(tol) { }
         // observers (the first five are what ts_ls_ode::discretize consumes)
-        internals::any_rk_engine engine() const { return handle_.engine(); }
+        const any_controlled_ode_solver& engine() const { return engine_; }
         const vector_t& ic() const { return ic_; }
         bool has_ic() const { return has_ic_; }
         int max_iter() const { return max_iter_; }
         double tol() const { return tol_; }
-        const internals::param_engine_handle& handle() const { return handle_; }
         const vector_t& theta0() const { return theta0_; }
     };
-    // Dim is the parametric field's static dimension (fixed-size return -> static, VectorXd -> Dynamic),
-    // deduced here and used only to build the typed param_rk_engine; it never escapes this function.
+    // build the erased control-aware engine over the parametric field with theta0 bound. Dim is the field's
+    // static dimension (fixed-size return -> static, VectorXd -> Dynamic), deduced here and used only to
+    // build the typed controlled_ode_solver; it never escapes this function.
     template <typename Field, int Stages>
-    static internals::param_engine_handle make_handle_(
+    static any_controlled_ode_solver make_engine_(
       const Field& field, const ButcherTableau<Stages>& tableau, const vector_t& theta0) {
-        constexpr int Dim = ode_rhs_param_dim_v<Field>;
-        return internals::make_param_engine_handle<Stages, Dim, Field>(field, RKIntegrator(tableau), theta0);
+        constexpr int Dim = ode_rhs_dim_v<Field>;
+        ode_rhs_field<Dim, Field> f(field);
+        f.set_theta(theta0);
+        return any_controlled_ode_solver(
+          controlled_ode_solver<Stages, Dim, Field>(std::move(f), RKIntegrator(tableau)));
     }
    public:
     template <typename Field, int Stages>
-        requires(is_ode_param_rhs<Field>)
+        requires(is_parameterized_ode_rhs<Field>)
     ts_ls_ode_param(
       const Field& field, const ButcherTableau<Stages>& tableau, const vector_t& theta0, int max_iter = 50,
       double tol = 1e-10) :
-        penalty_(make_handle_(field, tableau, theta0), theta0, max_iter, tol) { }
+        penalty_(make_engine_(field, tableau, theta0), theta0, max_iter, tol) { }
     template <typename Field, int Stages>
-        requires(is_ode_param_rhs<Field>)
+        requires(is_parameterized_ode_rhs<Field>)
     ts_ls_ode_param(
       const Field& field, const ButcherTableau<Stages>& tableau, const vector_t& theta0, const vector_t& ic,
       int max_iter = 50, double tol = 1e-10) :
-        penalty_(make_handle_(field, tableau, theta0), theta0, ic, max_iter, tol) { }
+        penalty_(make_engine_(field, tableau, theta0), theta0, ic, max_iter, tol) { }
     const penalty_packet& get() const { return penalty_; }
    private:
     penalty_packet penalty_;

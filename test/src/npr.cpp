@@ -47,7 +47,7 @@ TEST(npr, test1) {
     field_2d f;
     vector_t y0(2);
     y0 << 0.5, -0.3;
-    matrix_t Y = RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(f, time, y0);
+    matrix_t Y = RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(ode_rhs_field {f}, time, y0);
     
     // data
     GeoFrame data(T);

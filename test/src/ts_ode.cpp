@@ -24,15 +24,22 @@ namespace {
 using vector_t = Eigen::Matrix<double, Dynamic, 1>;
 using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
 
+// f + c: the prior field forced by a constant control c, formed via ode_rhs_field's field-field addition
+// (the production constant_rhs carries d(c)/dy = 0). Dim is deduced from f so the addition type-checks.
+template <int Dim, typename F>
+auto operator_plus_c(const ode_rhs_field<Dim, F>& f, const vector_t& c) {
+    return f + ode_rhs_field<Dim, constant_rhs>(constant_rhs {c});
+}
+
 // nonlinear, non-autonomous test field, d = 2:
-//   f(t, y) = [ y0*y1 + sin(t) ; y0 - y1^2 ],   df_dy = [ [y1, y0] ; [1, -2*y1] ]
+//   f(t, y) = [ y0*y1 + sin(t) ; y0 - y1^2 ],   state_jacobian = [ [y1, y0] ; [1, -2*y1] ]
 struct nonlinear_field {
     vector_t operator()(double t, const vector_t& y) const {
         vector_t out(2);
         out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
         return out;
     }
-    matrix_t df_dy(double, const vector_t& y) const {
+    matrix_t state_jacobian(double, const vector_t& y) const {
         matrix_t J(2, 2);
         J << y[1], y[0], 1.0, -2.0 * y[1];
         return J;
@@ -47,7 +54,7 @@ vector_t make_time(int m, double T) {
 
 // exact (discrete) trajectory of the prior dynamics from y0, using a high-order scheme
 matrix_t integrate_field(const nonlinear_field& f, const vector_t& time, const vector_t& y0) {
-    return RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(f, time, y0);
+    return RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(ode_rhs_field {f}, time, y0);
 }
 
 double rmse(const matrix_t& A, const matrix_t& B) { return std::sqrt((A - B).squaredNorm() / A.size()); }
@@ -69,7 +76,7 @@ struct fixture {
         }
     }
     // the solver is templated on neither the stage count nor the system dimension; the tableau and the
-    // field carry them, and both are erased away when the penalty descriptor builds its any_rk_engine
+    // field carry them, and both are erased away when the penalty descriptor builds its any_controlled_ode_solver
     template <int Stages>
     internals::ts_ls_ode make_solver(const ButcherTableau<Stages>& tab) {
         ts_ls_ode penalty(f, tab);   // f returns VectorXd -> Dim deduced Dynamic
@@ -231,7 +238,9 @@ TEST(ts_ls_ode, edf_in_range_and_monotone) {
 
 // the discrete adjoint of one forward step reproduces the finite-difference sensitivities of the
 // step w.r.t. the initial state and the additive control, for every Butcher tableau. This is the
-// core correctness check behind RKIntegrator::adjoint_step (hence the reduced-problem gradient).
+// core correctness check behind RKIntegrator::adjoint_step (hence the reduced-problem gradient). The
+// additive control is passed to the (control-free) core as a parameter with identity Jacobian d f/d u = I,
+// so the parameter gradient dC/dtheta returned under that map is exactly dC/du.
 TEST(ts_ls_ode, adjoint_step_matches_finite_differences) {
     nonlinear_field f;
     const int d = 2;
@@ -240,15 +249,16 @@ TEST(ts_ls_ode, adjoint_step_matches_finite_differences) {
     u << 0.1, -0.05;
     w << 1.3, -0.7;   // linear cost C = w . y_next, so the incoming costate is p_next = w
     const double t = 0.3, dt = 0.05, fd = 1e-6;
+    auto identity_df_du = [d](double, const vector_t&) -> matrix_t { return matrix_t::Identity(d, d); };
     // exercised per scheme through a generic lambda: the tableaux have distinct stage counts and so
     // cannot share a single heterogeneous loop.
     auto check = [&](auto tab) {
         RKIntegrator integ(tab);
         ode_rhs_field field(f);
         auto step = [&](const vector_t& yy, const vector_t& uu) {
-            return integ.step(field + uu, t, yy, dt);
+            return integ.step(operator_plus_c(field, uu), t, yy, dt);
         };
-        auto [p_curr, grad_contrib] = integ.adjoint_step(field + u, t, y, dt, w);
+        auto [p_curr, grad_contrib] = integ.adjoint_step(operator_plus_c(field, u), t, y, dt, w, identity_df_du);
         for (int j = 0; j < d; ++j) {
             vector_t yp = y, ym = y, up = u, um = u;
             yp[j] += fd, ym[j] -= fd, up[j] += fd, um[j] -= fd;
@@ -264,7 +274,7 @@ TEST(ts_ls_ode, adjoint_step_matches_finite_differences) {
     check(ode_schemes::gauss_legendre_2());
 }
 
-// the same dynamics as nonlinear_field but WITHOUT an analytic df_dy: routes ode_rhs_field through the
+// the same dynamics as nonlinear_field but WITHOUT an analytic state_jacobian: routes ode_rhs_field through the
 // MatrixField-based finite-difference Jacobian. Returning VectorXd keeps it on the dynamic-Dim path.
 struct nonlinear_field_no_jac {
     vector_t operator()(double t, const vector_t& y) const {
@@ -281,7 +291,7 @@ struct nonlinear_field_static {
         out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
         return out;
     }
-    Eigen::Matrix2d df_dy(double, const vector_t& y) const {
+    Eigen::Matrix2d state_jacobian(double, const vector_t& y) const {
         Eigen::Matrix2d J;
         J << y[1], y[0], 1.0, -2.0 * y[1];
         return J;
@@ -292,21 +302,21 @@ struct nonlinear_field_static {
 // finite-difference Jacobian; it must agree with the analytic Jacobian of the same dynamics. Also
 // checks the value path and that field + c offsets the value while preserving the (FD) Jacobian.
 TEST(ts_ls_ode, ode_rhs_field_fd_jacobian_matches_analytic) {
-    nonlinear_field f;                 // provides an analytic df_dy
-    ode_rhs_field fd_field{nonlinear_field_no_jac{}};   // no df_dy -> FD Jacobian backend
+    nonlinear_field f;                 // provides an analytic state_jacobian
+    ode_rhs_field fd_field{nonlinear_field_no_jac{}};   // no state_jacobian -> FD Jacobian backend
     vector_t y(2), c(2);
     y << 0.4, -0.2;
     c << 0.5, -0.25;
     const double t = 0.3;
-    EXPECT_LT((fd_field.df_dy(t, y) - f.df_dy(t, y)).cwiseAbs().maxCoeff(), 1e-4);   // FD Jacobian
+    EXPECT_LT((fd_field.state_jacobian(t, y) - f.state_jacobian(t, y)).cwiseAbs().maxCoeff(), 1e-4);   // FD Jacobian
     EXPECT_LT((fd_field(t, y) - f(t, y)).cwiseAbs().maxCoeff(), 1e-12);              // value path
-    ode_rhs_field shifted = fd_field + c;
-    EXPECT_LT((shifted.df_dy(t, y) - f.df_dy(t, y)).cwiseAbs().maxCoeff(), 1e-4);    // Jacobian unchanged by +c
+    ode_rhs_field shifted = operator_plus_c(fd_field, c);
+    EXPECT_LT((shifted.state_jacobian(t, y) - f.state_jacobian(t, y)).cwiseAbs().maxCoeff(), 1e-4);    // Jacobian unchanged by +c
     EXPECT_LT((shifted(t, y) - (f(t, y) + c)).cwiseAbs().maxCoeff(), 1e-12);         // value offset by c
 }
 
 // a field with a fixed-size return makes the stage math static: Dim is deduced (no n_components()),
-// ode_rhs_field<2> and an internals::rk_engine<Stages, 2> are built inside the (non-templated) solver,
+// ode_rhs_field<2> and a controlled_ode_solver<Stages, 2> are built inside the (non-templated) solver,
 // and the fit (through the fixed-size RKIntegrator stage math) denoises just like the dynamic path.
 TEST(ts_ls_ode, static_dim_deduced_and_fits) {
     nonlinear_field_static sf;
@@ -316,8 +326,8 @@ TEST(ts_ls_ode, static_dim_deduced_and_fits) {
     y << 0.4, -0.2;
     c << 0.5, -0.25;
     // field algebra and Jacobian still hold on the static field
-    EXPECT_LT(((field + c)(0.3, y) - (field(0.3, y) + c)).cwiseAbs().maxCoeff(), 1e-12);
-    EXPECT_LT(((field + c).df_dy(0.3, y) - field.df_dy(0.3, y)).cwiseAbs().maxCoeff(), 1e-12);
+    EXPECT_LT((operator_plus_c(field, c)(0.3, y) - (field(0.3, y) + c)).cwiseAbs().maxCoeff(), 1e-12);
+    EXPECT_LT((operator_plus_c(field, c).state_jacobian(0.3, y) - field.state_jacobian(0.3, y)).cwiseAbs().maxCoeff(), 1e-12);
 
     // end-to-end fit through the static-dimension stack
     fixture fx;

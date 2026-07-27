@@ -33,14 +33,14 @@ constexpr auto SQP = internals::ts_ls_ode::fit_policy::sqp;
 constexpr auto ADJ = internals::ts_ls_ode::fit_policy::adjoint;
 
 // nonlinear, non-autonomous test field, d = 2 (same dynamics as the adjoint-solver tests):
-//   f(t, y) = [ y0*y1 + sin(t) ; y0 - y1^2 ],   df_dy = [ [y1, y0] ; [1, -2*y1] ]
+//   f(t, y) = [ y0*y1 + sin(t) ; y0 - y1^2 ],   state_jacobian = [ [y1, y0] ; [1, -2*y1] ]
 struct nonlinear_field {
     vector_t operator()(double t, const vector_t& y) const {
         vector_t out(2);
         out << y[0] * y[1] + std::sin(t), y[0] - y[1] * y[1];
         return out;
     }
-    matrix_t df_dy(double, const vector_t& y) const {
+    matrix_t state_jacobian(double, const vector_t& y) const {
         matrix_t J(2, 2);
         J << y[1], y[0], 1.0, -2.0 * y[1];
         return J;
@@ -54,7 +54,7 @@ vector_t make_time(int m, double T) {
 }
 
 matrix_t integrate_field(const nonlinear_field& f, const vector_t& time, const vector_t& y0) {
-    return RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(f, time, y0);
+    return RKIntegrator(ode_schemes::gauss_legendre_2()).integrate(ode_rhs_field {f}, time, y0);
 }
 
 double rmse(const matrix_t& A, const matrix_t& B) { return std::sqrt((A - B).squaredNorm() / A.size()); }
