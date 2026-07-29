@@ -55,14 +55,13 @@ class ts_ls_ode {
    public:
     static constexpr int n_lambda = 1;
     using solver_category = ls_solver;
-    // optimization strategy chosen at fit time. Both minimize the very same objective over the same
-    // decision variables (the additive control u and, if free, the initial state) and reach the same
-    // minimizer, so they fill the identical result members and differ only in how they get there:
-    //   - adjoint : reduced-space BFGS driven by the consistent discrete-adjoint gradient (state
-    //               eliminated by forward integration).
-    //   - sqp     : full-space Gauss-Newton Sequential Quadratic Programming (state Y and control u kept
-    //               as unknowns tied by the RK dynamics as equality constraints; forward-mode Jacobians,
-    //               no adjoint sweep).
+    /* Optimization strategy (runtime)
+        - adjoint:  reduced-space BFGS driven by the consistent discrete-adjoint gradient (state
+                    eliminated by forward integration).
+        - sqp:      full-space Gauss-Newton Sequential Quadratic Programming (state Y and control u kept
+                    as unknowns tied by the RK dynamics as equality constraints; forward-mode Jacobians,
+                    no adjoint sweep).
+    */
     enum class fit_policy { adjoint, sqp };
 
     ts_ls_ode() noexcept = default;
@@ -143,8 +142,7 @@ class ts_ls_ode {
     }
 
     // Optional state-variable box constraints lb <= y(t) <= ub, enforced at every time node (per component;
-    // set a component of lb/ub to -/+ infinity to leave that side free). Only the SQP fit policy honours
-    // them; the adjoint policy ignores them. lb/ub are d-vectors; call once, undo with clear_state_bounds().
+    // set a component of lb/ub to -/+ infinity to leave that side free). [LIMITED TO SQP]
     void set_state_bounds(const vector_t& lb, const vector_t& ub) {
         fdapde_assert(lb.size() == ub.size());
         y_lb_ = lb; y_ub_ = ub; has_state_bounds_ = true;
@@ -152,49 +150,15 @@ class ts_ls_ode {
     void clear_state_bounds() { has_state_bounds_ = false; }
     bool has_state_bounds() const { return has_state_bounds_; }
 
-    // Optimal control formulation: the decision variable is the
-    // piecewise-constant control u that drives the prior dynamics y' = f(t, y) + u(t); the
-    // trajectory is recovered by forward integration and the gradient of the data misfit w.r.t.
-    // u by the consistent discrete adjoint of the RK scheme.
-    const vector_t& fit_adjoint_(double lambda) {
-        fdapde_assert(lambda > 0 && d_ > 0 && m_ >= 2 && static_cast<bool>(engine_));
-        if (has_ic_) { fdapde_assert(y0_.size() == d_); }
-        lambda_ = lambda;
-        const int nu = (m_ - 1) * d_;
-        const bool free_y1 = !has_ic_;
-        const int nz = nu + (free_y1 ? d_ : 0);
-        // initial decision vector: zero control; initial state from the data-based guess (or the IC)
-        vector_t z = vector_t::Zero(nz);
-        if (free_y1) { z.segment(nu, d_) = initial_guess_().row(0).transpose(); }
-        // minimize the reduced objective over the control with BFGS
-        control_objective problem {this};
-        BFGS<Dynamic> optimizer(max_iter_, tol_, 1.0);
-        // Wolfe line search: its curvature condition keeps the BFGS inverse Hessian positive
-        // definite (descent directions), and its Armijo test rejects the divergent-cost surrogate.
-        vector_t z_opt = optimizer.optimize(problem, z, WolfeLineSearch());
-        // recover trajectory and diagnostics from the optimal control
-        Y_ = forward_recover_(z_opt);
-        if (has_ic_) { Y_.row(0) = y0_.transpose(); }
-        U_.resize(m_ - 1, d_);   // the additive control itself (the decision variable)
-        for (int t = 0; t < m_ - 1; ++t) { U_.row(t) = z_opt.segment(t * d_, d_).transpose(); }
-        bound_mult_.setZero(m_, d_);   // the adjoint policy ignores state bounds
-        objective_value_ = optimizer.value();
-        n_iter_ = optimizer.n_iter();
-        converged_ = (n_iter_ < max_iter_);   // stopped on the gradient tolerance, not the iter cap
-        compute_control_();
-        flatten_();
-        return f_;
-    }
-
-    // TODO: remove gauss-newton hessian computation, try to see if we can compute the edf
-    // in another way
-
+    /* GCV computation
+    To compute the GCV index we need to linearise the objective around the solution (Y_, U_) found using the fit
+    method. Such a linearization is required to estimate the effective degrees of freedom (edf) through the trace of the hat matrix. In fact, the relationship between data and fitted values is not linear, hence a linearization is needed.
+    */
     // hutchinson approximation of Tr[S] for the linearized hat matrix S = M H^{-1} M
     double edf(int r = 100, int seed = random_seed) {
         fdapde_assert(m_ > 0 && lambda_ > 0);
         sparse_matrix_t H;
-        vector_t g;
-        assemble_(Y_, H, g);   // Gauss-Newton Hessian at the current solution
+        assemble_(H);   // Gauss-Newton Hessian at the current solution (Y_, U_)
         Eigen::SparseLU<sparse_matrix_t> solver;
         solver.compute(H);
         fdapde_assert(solver.info() == Eigen::Success);
@@ -242,16 +206,15 @@ class ts_ls_ode {
     const vector_t& f() const { return f_; }            // flattened trajectory (m*d), node-major
     const vector_t& fn() const { return f_; }           // fitted at observation nodes (Psi = I)
     vector_t fitted() const { return f_; }
-    const vector_t& beta() const { return beta_; }
-    const vector_t& misfit() const { return g_; }       // flattened control defects ((m-1)*d)
+    const vector_t& misfit() const { return g_; }       // flattened ODE-residual misfit ((m-1)*d)
     const vector_t& response() const { return y_; }     // flattened response (m*d), NaN -> 0
     const matrix_t& trajectory() const { return Y_; }   // m x d
-    const matrix_t& control() const { return control_; }
-    // the additive control u_t itself ((m-1) x d), i.e. the decision variable forcing the dynamics as
-    // f + u_t. Distinct from control() above, which reports the finite-difference defect
-    // (y_{t+1} - step_f(y_t))/dt -- the two coincide only for forward Euler. Inverse solvers must use
-    // this one, since the outer sensitivities are evaluated on the correctly forced dynamics.
-    const matrix_t& additive_control() const { return U_; }
+    // additive control u_t ((m-1) x d): the decision variable forcing the dynamics as
+    // f + u_t. This is the true control -- inverse solvers rely on it, since the outer sensitivities
+    // are evaluated on the correctly forced dynamics. Distinct from misfit(), the finite-difference
+    // defect (y_{t+1} - step_f(y_t))/dt against the *unforced* dynamics: the two coincide only for
+    // forward Euler (see compute_misfit_).
+    const matrix_t& control() const { return U_; }
     // dual variables of the state box constraints (m x d, zero where inactive / unbounded)
     const matrix_t& bound_multipliers() const { return bound_mult_; }
     double objective() const { return objective_value_; }
@@ -259,8 +222,10 @@ class ts_ls_ode {
     bool converged() const { return converged_; }
 
    protected:
+    // Common utilities
+    // grid time step
     double dt_(int t) const { return time_(t + 1) - time_(t); }
-
+    // Fill mask and response variable from raw data
     void set_response_(const matrix_t& y_obs) {
         d_ = y_obs.cols();
         fdapde_assert(d_ > 0);
@@ -283,7 +248,6 @@ class ts_ls_ode {
         for (int t = 0; t < m_; ++t) { y_.segment(t * d_, d_) = y_fill_.row(t).transpose(); }
         return;
     }
-
     // per-component linear interpolation/extrapolation of the observed values (start point)
     matrix_t initial_guess_() const {
         matrix_t Y(m_, d_);
@@ -316,27 +280,72 @@ class ts_ls_ode {
         return Y;
     }
 
-    // --- Optimal control over the control u ---------------------------
+    // ODE-residual misfit ((m-1) x d): the finite-difference defect (y_{t+1} - step_f(y_t))/dt of the
+    // fitted trajectory against the *unforced* prior dynamics f (zero forcing). A scheme-independent
+    // diagnostic, exposed (flattened) as misfit(). It coincides with the additive control control()/U_
+    // only for forward Euler -- a general RK scheme samples f at the forcing-shifted stage states, so
+    // the two differ. Reported only; inverse solvers use control()/U_, the correctly forced control.
+    void compute_misfit_() {
+        misfit_.resize(m_ - 1, d_);
+        for (int t = 0; t < m_ - 1; ++t) {
+            double dt = dt_(t);
+            vector_t yc = Y_.row(t).transpose();
+            // prior dynamics only (no control): pass a zero forcing
+            vector_t step = engine_.step(time_(t), yc, dt, vector_t::Zero(d_));
+            misfit_.row(t) = ((Y_.row(t + 1).transpose() - step) / dt).transpose();
+        }
+        return;
+    }
+    void flatten_() {
+        f_.resize(m_ * d_);
+        for (int t = 0; t < m_; ++t) { f_.segment(t * d_, d_) = Y_.row(t).transpose(); }
+        g_.resize((m_ - 1) * d_);
+        for (int t = 0; t < m_ - 1; ++t) { g_.segment(t * d_, d_) = misfit_.row(t).transpose(); }
+        return;
+    }
+
+    // Adjoint method
     // Decision vector layout: z = [u_0; ...; u_{m-2}; (y_1)], interval-major control blocks of
     // size d, optionally followed by the free initial state y_1 (absent under a hard IC).
 
-    // forward-recover the trajectory: y_1 from z (or the IC), then y_{t+1} = RK step of f + u_t
-    matrix_t forward_recover_(const vector_t& z) const {
+    // Recover the state trajectory at z, with one-slot memoization. Besides the trajectory Y it caches, per
+    // interval, the forward-mode Jacobians flow_t = d y_{t+1}/d y_t and B_t = d y_{t+1}/d u_t -- all from a
+    // SINGLE stage solve per interval (step_with_jacobians reuses one stage factorization for the state and
+    // the control sensitivity blocks). The BFGS/Wolfe optimizer evaluates the reduced objective and its
+    // adjoint gradient at the *same* z (the line search queries obj(z) and grad(z) at each trial), so caching
+    // on z collapses what were three stage passes per point -- objective's forward, gradient's forward, and
+    // the gradient's backward adjoint stage re-solve -- into one. The gradient's backward sweep then needs no
+    // stage solves at all: it contracts the stored flow_t / B_t against the costate (see gradient_). Not const:
+    // it updates the cache (fwd_*), which is reset at the top of each fit_adjoint_ (a new lambda, theta or data
+    // set invalidates the stored pass).
+    const matrix_t& forward_recover_(const vector_t& z) {
+        if (fwd_valid_ && fwd_z_.size() == z.size() && fwd_z_ == z) { return fwd_Y_; }
         const int nu = (m_ - 1) * d_;
-        matrix_t Y(m_, d_);
-        Y.row(0) = (has_ic_ ? y0_ : vector_t(z.segment(nu, d_))).transpose();
+        vector_t y0 = has_ic_ ? y0_ : vector_t(z.segment(nu, d_));
+        fwd_Y_.resize(m_, d_);
+        fwd_Y_.row(0) = y0.transpose();
+        fwd_flow_.resize(m_ - 1);
+        fwd_B_.resize(m_ - 1);
         for (int t = 0; t < m_ - 1; ++t) {
+            vector_t yc = fwd_Y_.row(t).transpose();
             vector_t u_t = z.segment(t * d_, d_);
-            vector_t yc = Y.row(t).transpose();
-            // u_t is the (constant) control on interval t, injected into the dynamics as f + u_t
-            Y.row(t + 1) = engine_.step(time_(t), yc, dt_(t), u_t).transpose();
+            // forward step with its state (flow) and control (B) Jacobians, from one stage solve. On a
+            // divergent control the state turns non-finite and NaN propagates down the trajectory; the
+            // callers guard on fwd_Y_.allFinite() before touching the Jacobians.
+            auto s = engine_.step_with_jacobians(time_(t), yc, dt_(t), u_t);
+            fwd_Y_.row(t + 1) = s.state.transpose();
+            fwd_flow_[t] = s.flow;
+            fwd_B_[t] = s.param;
         }
-        return Y;
+        fwd_z_ = z;
+        fwd_valid_ = true;
+        return fwd_Y_;
     }
 
     // control objective J = SSE(observed) + lambda * sum_t dt_t ||u_t||^2
-    double objective_(const vector_t& z) const {
-        matrix_t Y = forward_recover_(z);
+    // (state is integrated out)
+    double objective_(const vector_t& z) {
+        const matrix_t& Y = forward_recover_(z);
         // a control may drive the (possibly nonlinear) forward integration to blow up: report a
         // large finite cost so the line search backtracks out of the divergent region.
         if (!Y.allFinite()) { return divergent_cost_; }
@@ -350,14 +359,14 @@ class ts_ls_ode {
         return J;
     }
 
-    // control gradient dJ/dz by a backward discrete-adjoint sweep (the reduced gradient: the state
-    // has been eliminated by forward integration, leaving only the control). Node data-source
-    // s_t = 2 * mask_t * (y_t - y^obs_t); the costate satisfies p_t = s_t + (dy_{t+1}/dy_t)^T p_{t+1}
-    // with p_m = s_m, while RKIntegrator::adjoint_step yields dJ_data/du_t per interval.
-    vector_t gradient_(const vector_t& z) const {
+    // control gradient dJ/dz by a backward discrete-adjoint sweep, using the forward-mode Jacobians cached by
+    // forward_recover_ -- no stage system is re-solved here. Node data-source s_t = 2 * mask_t * (y_t - y^obs_t);
+    // the costate satisfies p_t = s_t + flow_t^T p_{t+1} with p_m = s_m, and the per-interval control gradient
+    // is dJ_data/du_t = B_t^T p_{t+1} (the reverse-mode contraction of the forward control Jacobian).
+    vector_t gradient_(const vector_t& z) {
         const int nu = (m_ - 1) * d_;
         const bool free_y1 = !has_ic_;
-        matrix_t Y = forward_recover_(z);
+        const matrix_t& Y = forward_recover_(z);
         // divergent control: return a finite (zero) gradient so the optimizer state stays clean;
         // the matching large objective makes the line search reject the step.
         if (!Y.allFinite()) { return vector_t::Zero(nu + (free_y1 ? d_ : 0)); }
@@ -372,32 +381,65 @@ class ts_ls_ode {
         vector_t p = source(m_ - 1);
         for (int t = m_ - 2; t >= 0; --t) {
             vector_t u_t = z.segment(t * d_, d_);
-            vector_t yc = Y.row(t).transpose();
-            auto [p_prop, grad_contrib] =
-              engine_.adjoint_step(time_(t), yc, dt_(t), p, u_t);
-            g.segment(t * d_, d_) = 2.0 * lambda_ * dt_(t) * u_t + grad_contrib;
-            p = source(t) + p_prop;
+            // p is the costate p_{t+1}: control gradient B_t^T p, then propagate the costate by flow_t^T p
+            g.segment(t * d_, d_) = 2.0 * lambda_ * dt_(t) * u_t + fwd_B_[t].transpose() * p;
+            p = source(t) + fwd_flow_[t].transpose() * p;
         }
         if (free_y1) { g.segment(nu, d_) = p; }   // dJ/dy_1 = costate at the first node
         return g;
     }
-
-    // objective functor over the control z, adapting J and its gradient to the core BFGS interface
+    // objective functor over the control z, adapting J and its gradient to the core BFGS interface. Holds a
+    // non-const solver pointer: objective_ / gradient_ populate the forward-pass cache (forward_recover_).
     struct control_objective {
-        const ts_ls_ode* solver;
+        ts_ls_ode* solver;
         double operator()(const vector_t& z) const { return solver->objective_(z); }
         auto gradient() const {
             return [s = solver](const vector_t& z) { return s->gradient_(z); };
         }
     };
 
-    // --- Full-space Gauss-Newton SQP over z = (Y, u) ------------------
-    // Keep the trajectory Y and the additive control u as decision variables, tie them by the discrete RK
-    // dynamics as equality constraints c_t = y_{t+1} - step(f + u_t)(y_t) = 0, and take constrained
-    // Gauss-Newton steps: each iteration solves the KKT saddle-point QP (exact quadratic objective Hessian
-    // + linearized constraints) and is globalized by an L1-merit backtracking line search. The constraint
-    // linearization uses the forward-mode step Jacobians d step/d y (flow) and d step/d u (control), so no
-    // adjoint sweep is involved.
+    // Optimal control formulation: the decision variable is the
+    // piecewise-constant control u that drives the prior dynamics y' = f(t, y) + u(t); the
+    // trajectory is recovered by forward integration and the gradient of the data misfit w.r.t.
+    // u by the consistent discrete adjoint of the RK scheme.
+    const vector_t& fit_adjoint_(double lambda) {
+        fdapde_assert(lambda > 0 && d_ > 0 && m_ >= 2 && static_cast<bool>(engine_));
+        if (has_ic_) { fdapde_assert(y0_.size() == d_); }
+        lambda_ = lambda;
+        fwd_valid_ = false;   // stale across a new lambda / theta / data set
+        const int nu = (m_ - 1) * d_;
+        const bool free_y1 = !has_ic_;
+        const int nz = nu + (free_y1 ? d_ : 0);
+        // initial decision vector: zero control; initial state from the data-based guess (or the IC)
+        vector_t z = vector_t::Zero(nz);
+        if (free_y1) { z.segment(nu, d_) = initial_guess_().row(0).transpose(); }
+        // minimize the reduced objective over the control with BFGS
+        control_objective problem {this};
+        BFGS<Dynamic> optimizer(max_iter_, tol_, 1.0);
+        // Wolfe line search: its curvature condition keeps the BFGS inverse Hessian positive
+        // definite (descent directions), and its Armijo test rejects the divergent-cost surrogate.
+        vector_t z_opt = optimizer.optimize(problem, z, WolfeLineSearch());
+        // recover trajectory and diagnostics from the optimal control
+        Y_ = forward_recover_(z_opt);
+        if (has_ic_) { Y_.row(0) = y0_.transpose(); }
+        U_.resize(m_ - 1, d_);   // the additive control itself (the decision variable)
+        for (int t = 0; t < m_ - 1; ++t) { U_.row(t) = z_opt.segment(t * d_, d_).transpose(); }
+        bound_mult_.setZero(m_, d_);   // the adjoint policy ignores state bounds
+        objective_value_ = optimizer.value();
+        n_iter_ = optimizer.n_iter();
+        converged_ = (n_iter_ < max_iter_);   // stopped on the gradient tolerance, not the iter cap
+        compute_misfit_();
+        flatten_();
+        return f_;
+    }
+    /* Full-space Gauss-Newton SQP over z = (Y, u)
+    Keep the trajectory Y and the additive control u as decision variables, tie them by the discrete RK
+    dynamics as equality constraints c_t = y_{t+1} - step(f + u_t)(y_t) = 0, and take constrained
+    Gauss-Newton steps: each iteration solves the KKT saddle-point QP (exact quadratic objective Hessian
+    + linearized constraints) and is globalized by an L1-merit backtracking line search. The constraint
+    linearization uses the forward-mode step Jacobians d step/d y (flow) and d step/d u (control), so no
+    adjoint sweep is involved.
+    */
     const vector_t& fit_sqp_(double lambda) {
         fdapde_assert(lambda > 0 && d_ > 0 && m_ >= 2 && static_cast<bool>(engine_));
         if (has_ic_) { fdapde_assert(y0_.size() == d_); }
@@ -423,6 +465,7 @@ class ts_ls_ode {
 
         int it = 0;
         bool converged = false;
+        // init SQP iterations
         for (; it < max_iter_; ++it) {
             // objective gradient (exact; J is quadratic in (Y, u)): data part 2 m (y - yobs), control part
             // 2 lambda dt u
@@ -516,20 +559,21 @@ class ts_ls_ode {
         if (has_ic_) { Y_.row(0) = y0_.transpose(); }
         U_ = U;   // the additive control itself (the decision variable)
         objective_value_ = objective_YU_(Y_, U);
-        compute_control_();
+        compute_misfit_();
         flatten_();
         return f_;
     }
 
-    // Solve one SQP subproblem. 
-    // Without state bounds: the KKT saddle [[H, A^T],[A,0]] [p; mu] = [-g; -c]
-    // (H = the exact, diagonal objective Hessian) -- one sparse solve, identical to the unconstrained SQP.
-    // With state bounds: the same objective/dynamics plus the box  lb - Y <= p_Y <= ub - Y, solved by a
-    // primal-dual active-set loop -- append the active-bound rows e_k^T p = bound - Y_k to the KKT, then
-    // ADD a bound whose step violates it and RELEASE an active bound whose multiplier has the wrong sign
-    // (reduced gradient = -nu: a lower bound stays iff nu <= 0, an upper bound iff nu >= 0). The active set
-    // at convergence is exactly the set of boundary arcs. Sets ok=false on a failed factorization so the
-    // caller bails gracefully instead of asserting.
+    /* Solve one SQP subproblem. 
+    Without state bounds: the KKT saddle [[H, A^T],[A,0]] [p; mu] = [-g; -c]
+    (H = the exact, diagonal objective Hessian) -- one sparse solve, identical to the unconstrained SQP.
+    With state bounds: the same objective/dynamics plus the box  lb - Y <= p_Y <= ub - Y, solved by a
+    primal-dual active-set loop -- append the active-bound rows e_k^T p = bound - Y_k to the KKT, then
+    ADD a bound whose step violates it and RELEASE an active bound whose multiplier has the wrong sign
+    (reduced gradient = -nu: a lower bound stays iff nu <= 0, an upper bound iff nu >= 0). The active set
+    at convergence is exactly the set of boundary arcs. Sets ok=false on a failed factorization so the
+    caller bails gracefully instead of asserting.
+    */
     void sqp_subproblem_(const vector_t& g, const vector_t& c,
                          const std::vector<Eigen::Triplet<double>>& A_trip, int n_primal, int nC,
                          const matrix_t& Y, vector_t& p, vector_t& mu_new, bool& ok) {
@@ -631,13 +675,22 @@ class ts_ls_ode {
         return c;
     }
 
-    // TODO: remove gauss-newton system computation
-    // assemble the Gauss-Newton system H * dY = -g for the current trajectory (used by edf())
-    void assemble_(const matrix_t& Y, sparse_matrix_t& H, vector_t& g) const {
+    // GCV utilities
+    
+    /* Gauss-Newton Hessian of the penalized objective
+    
+    The penalty lambda sum_t dt_t ||u_t||^2 must be expressed as a function of Y,
+    with u_t the actual additive control that was fitted -- i.e. the control implied by consecutive nodes
+    through the FORCED dynamics y_{t+1} = step(f + u_t)(y_t). Differentiating that relation at the solution
+    (implicit function theorem) with the forced step Jacobians flow_t = d y_{t+1}/d y_t and
+    b_t = d y_{t+1}/d u_t gives
+        d u_t/d y_t     = -b_t^{-1} flow_t   (=: G0)
+        d u_t/d y_{t+1} =  b_t^{-1}          (=: G1),
+    so the interval's Gauss-Newton block is cw [G0;G1]^T [G0;G1] with cw = lambda dt_t. 
+    */
+    void assemble_(sparse_matrix_t& H) const {
         const int N = m_ * d_;
-        const matrix_t Id = matrix_t::Identity(d_, d_);
         std::vector<Eigen::Triplet<double>> triplets;
-        g = vector_t::Zero(N);
         auto is_fixed = [&](int node) { return has_ic_ && node == 0; };
         auto add_block = [&](int rn, int cn, const matrix_t& blk) {
             if (is_fixed(rn) || is_fixed(cn)) { return; }
@@ -647,29 +700,27 @@ class ts_ls_ode {
                 }
             }
         };
-        // data term
+        // data term (Hessian of sum mask (y - yobs)^2 in the factor-1 convention: identity on observed dofs)
         for (int t = 0; t < m_; ++t) {
             if (is_fixed(t)) { continue; }
             for (int v = 0; v < d_; ++v) {
-                if (mask_(t, v) != 0.0) {
-                    triplets.emplace_back(t * d_ + v, t * d_ + v, 1.0);
-                    g(t * d_ + v) += Y(t, v) - y_obs_(t, v);
-                }
+                if (mask_(t, v) != 0.0) { triplets.emplace_back(t * d_ + v, t * d_ + v, 1.0); }
             }
         }
-        // penalty term: each interval couples nodes t and t+1
+        // penalty term: each interval couples nodes t and t+1 through the forced control u_t = u_t(y_t, y_{t+1})
         for (int t = 0; t < m_ - 1; ++t) {
-            double dt = dt_(t), w = dt, cw = lambda_ * w;
-            vector_t yc = Y.row(t).transpose();
-            auto [step, flow] = engine_.step_with_flow_jacobian(time_(t), yc, dt);
-            vector_t u = (Y.row(t + 1).transpose() - step) / dt;
-            matrix_t Bc = -flow / dt;   // d u_t/d y_t   (d u_t/d y_{t+1} = I/dt)
-            add_block(t, t, cw * (Bc.transpose() * Bc));
-            add_block(t, t + 1, (cw / dt) * Bc.transpose());
-            add_block(t + 1, t, (cw / dt) * Bc);
-            add_block(t + 1, t + 1, (cw / (dt * dt)) * Id);
-            if (!is_fixed(t)) { g.segment(t * d_, d_) += cw * (Bc.transpose() * u); }
-            if (!is_fixed(t + 1)) { g.segment((t + 1) * d_, d_) += (cw / dt) * u; }
+            const double cw = lambda_ * dt_(t);
+            vector_t yc = Y_.row(t).transpose();
+            vector_t ut = U_.row(t).transpose();
+            // forced step Jacobians at the fitted control: s.flow = d y_{t+1}/d y_t, s.param = d y_{t+1}/d u_t
+            auto s = engine_.step_with_jacobians(time_(t), yc, dt_(t), ut);
+            matrix_t Binv = s.param.inverse();   // b_t^{-1}  (control block is d x d)
+            matrix_t G0 = -Binv * s.flow;        // d u_t/d y_t
+            const matrix_t& G1 = Binv;           // d u_t/d y_{t+1}
+            add_block(t,     t,     cw * (G0.transpose() * G0));
+            add_block(t,     t + 1, cw * (G0.transpose() * G1));
+            add_block(t + 1, t,     cw * (G1.transpose() * G0));
+            add_block(t + 1, t + 1, cw * (G1.transpose() * G1));
         }
         if (has_ic_) {
             for (int v = 0; v < d_; ++v) { triplets.emplace_back(v, v, 1.0); }
@@ -680,24 +731,6 @@ class ts_ls_ode {
         return;
     }
 
-    void compute_control_() {
-        control_.resize(m_ - 1, d_);
-        for (int t = 0; t < m_ - 1; ++t) {
-            double dt = dt_(t);
-            vector_t yc = Y_.row(t).transpose();
-            // prior dynamics only (no control): pass a zero forcing
-            vector_t step = engine_.step(time_(t), yc, dt, vector_t::Zero(d_));
-            control_.row(t) = ((Y_.row(t + 1).transpose() - step) / dt).transpose();
-        }
-        return;
-    }
-    void flatten_() {
-        f_.resize(m_ * d_);
-        for (int t = 0; t < m_; ++t) { f_.segment(t * d_, d_) = Y_.row(t).transpose(); }
-        g_.resize((m_ - 1) * d_);
-        for (int t = 0; t < m_ - 1; ++t) { g_.segment(t * d_, d_) = control_.row(t).transpose(); }
-        return;
-    }
 
     // model and discretization: the type-erased control-aware engine (bundles the prior field and the
     // RK integrator; both the stage count and the system dimension are erased inside it)
@@ -719,12 +752,20 @@ class ts_ls_ode {
     int m_ = 0, d_ = 0, n_obs_ = 0;    // n. time instants, n. components, n. observed scalars
     matrix_t y_obs_, y_fill_, mask_;   // observations, NaN-filled copy, observation mask
 
+    // one-slot cache of the controlled forward pass (see forward_recover_): the recovered trajectory and the
+    // per-interval forward-mode Jacobians at fwd_z_, shared by objective_ / gradient_ across the BFGS solve.
+    vector_t fwd_z_;                     // control at which the cache was built
+    matrix_t fwd_Y_;                     // recovered trajectory (m x d)
+    std::vector<matrix_t> fwd_flow_;     // d y_{t+1}/d y_t per interval
+    std::vector<matrix_t> fwd_B_;        // d y_{t+1}/d u_t per interval
+    bool fwd_valid_ = false;
+
     // results
     double lambda_ = -1;
-    matrix_t Y_, control_;        // fitted trajectory (m x d) and control defects ((m-1) x d)
+    matrix_t Y_, misfit_;         // fitted trajectory (m x d) and ODE-residual misfit ((m-1) x d)
     matrix_t U_;                  // additive control ((m-1) x d), the actual decision variable
     matrix_t bound_mult_;         // state-box dual variables (m x d), zero where inactive
-    vector_t f_, g_, y_, beta_;   // flattened trajectory / control / response
+    vector_t f_, g_, y_;   // flattened trajectory / misfit / response
     double objective_value_ = 0;
     int n_iter_ = 0;
     bool converged_ = false;
