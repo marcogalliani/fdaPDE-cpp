@@ -272,9 +272,9 @@ TEST(ts_ls_ode_tracking, inherits_forward_solver) {
     EXPECT_EQ(solver.n_components(), 2);
     EXPECT_EQ(solver.n_nodes(), static_cast<int>(fx.time.size()));
     EXPECT_TRUE(solver.trajectory().allFinite());
-    // the additive control is the decision variable, distinct from the reported defect for GL2
-    EXPECT_EQ(solver.additive_control().rows(), static_cast<int>(fx.time.size()) - 1);
-    EXPECT_EQ(solver.additive_control().cols(), 2);
+    // the additive control is the decision variable, distinct from the reported misfit for GL2
+    EXPECT_EQ(solver.control().rows(), static_cast<int>(fx.time.size()) - 1);
+    EXPECT_EQ(solver.control().cols(), 2);
 }
 
 // a hard initial condition is honoured by the inner solve driven from the outer loop

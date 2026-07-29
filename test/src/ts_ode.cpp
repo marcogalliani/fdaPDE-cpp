@@ -25,10 +25,10 @@ using vector_t = Eigen::Matrix<double, Dynamic, 1>;
 using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
 
 // f + c: the prior field forced by a constant control c, formed via ode_rhs_field's field-field addition
-// (the production constant_rhs carries d(c)/dy = 0). Dim is deduced from f so the addition type-checks.
+// (the production ode_rhs_control_term carries d(c)/dy = 0). Dim is deduced from f so the addition type-checks.
 template <int Dim, typename F>
 auto operator_plus_c(const ode_rhs_field<Dim, F>& f, const vector_t& c) {
-    return f + ode_rhs_field<Dim, constant_rhs>(constant_rhs {c});
+    return f + ode_rhs_field<Dim, ode_rhs_control_term<Dim>>(ode_rhs_control_term<Dim> {c});
 }
 
 // nonlinear, non-autonomous test field, d = 2:
@@ -109,7 +109,7 @@ TEST(ts_ls_ode, lambda_controls_tradeoff) {
     for (double lambda : {1e-3, 1e0, 1e3}) {
         auto solver = fx.make_solver();
         solver.fit(lambda);
-        double defect = solver.control().cwiseAbs().maxCoeff();
+        double defect = solver.misfit().cwiseAbs().maxCoeff();
         double datafit = rmse(solver.trajectory(), fx.Yobs);
         EXPECT_LT(defect, defect_prev) << "lambda = " << lambda;
         EXPECT_GT(datafit, datafit_prev) << "lambda = " << lambda;   // looser fit as lambda grows
@@ -124,7 +124,7 @@ TEST(ts_ls_ode, large_lambda_enforces_dynamics) {
     auto solver = fx.make_solver();
     solver.fit(1e4);
     EXPECT_TRUE(solver.converged());
-    EXPECT_LT(solver.control().cwiseAbs().maxCoeff(), 1e-3);
+    EXPECT_LT(solver.misfit().cwiseAbs().maxCoeff(), 1e-3);
     EXPECT_LT(rmse(solver.trajectory(), fx.Ytrue), 1e-2);
 }
 
@@ -195,6 +195,80 @@ TEST(ts_ls_ode, model_wrapper_and_gcv) {
     EXPECT_LE(opt, grid.back());
     model.fit(opt);
     EXPECT_LT(rmse(model.trajectory(), fx.Ytrue), rmse(fx.Yobs, fx.Ytrue));   // GCV choice denoises
+}
+
+// GCV picks the *right* lambda: the GCV-optimal lambda tracks the oracle lambda -- the one minimizing the
+// true error against the noise-free trajectory Ytrue (unavailable in practice, known here). The data are
+// built so the bias/variance trade-off has an *interior* optimum: the truth deviates smoothly from any prior
+// ODE solution (so very large lambda over-regularizes and biases) and is corrupted by genuine iid Gaussian
+// noise (so very small lambda over-fits). Over a shared half-decade log grid the GCV choice lands within one
+// grid step of the oracle and attains a true error within a small factor of the oracle minimum. End-to-end
+// correctness check of the edf / GCV machinery (higher-order GL2 scheme -> exercises the forced-control edf).
+TEST(ts_ls_ode, gcv_selects_near_oracle_lambda) {
+    const int m = 41; const double T = 2.0;
+    vector_t time = make_time(m, T);
+    nonlinear_field f;
+    vector_t y0(2); y0 << 0.5, -0.3;
+    // off-manifold truth: a prior ODE solution plus a slow deviation the dynamics cannot represent
+    matrix_t Ytrue = integrate_field(f, time, y0);
+    for (int t = 0; t < m; ++t) {
+        const double s = time[t];
+        Ytrue(t, 0) += 0.12 * std::sin(1.5 * s);
+        Ytrue(t, 1) += 0.08 * std::cos(1.1 * s);
+    }
+    // observations: truth + iid Gaussian noise (seeded, reproducible)
+    std::mt19937 rng(2024u);
+    std::normal_distribution<double> gauss(0.0, 0.03);
+    matrix_t Yobs = Ytrue;
+    for (int t = 0; t < m; ++t) {
+        for (int v = 0; v < 2; ++v) { Yobs(t, v) += gauss(rng); }
+    }
+    const double raw_rmse = rmse(Yobs, Ytrue);
+
+    using Model = NPRODE<internals::ts_ls_ode>;
+    auto build = [&](Model& model) {
+        ts_ls_ode penalty(f, ode_schemes::gauss_legendre_2());
+        model.discretize(penalty.get());
+        model.analyze_data(time, Yobs);
+    };
+    // shared half-decade log grid over the numerically stable range: 10^{-2} ... 10^{3}
+    std::vector<double> grid;
+    for (int e = -4; e <= 6; ++e) { grid.push_back(std::pow(10.0, 0.5 * e)); }
+
+    // oracle: the grid lambda minimizing RMSE against the truth
+    Model oracle_model; build(oracle_model);
+    int oracle_idx = 0; double best_rmse = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < static_cast<int>(grid.size()); ++i) {
+        oracle_model.fit(grid[i]);
+        double e = rmse(oracle_model.trajectory(), Ytrue);
+        if (e < best_rmse) { best_rmse = e; oracle_idx = i; }
+    }
+
+    // GCV pick over the same grid
+    Model model; build(model);
+    auto gcv = model.gcv(200, 42);
+    GridSearch<1> optimizer;
+    optimizer.optimize(gcv, grid);
+    double lambda_gcv = optimizer.optimum()[0];
+
+    // locate the GCV pick on the grid (log-nearest)
+    int gcv_idx = 0; double dmin = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < static_cast<int>(grid.size()); ++i) {
+        double dd = std::abs(std::log10(grid[i]) - std::log10(lambda_gcv));
+        if (dd < dmin) { dmin = dd; gcv_idx = i; }
+    }
+    model.fit(lambda_gcv);
+    double gcv_rmse = rmse(model.trajectory(), Ytrue);
+
+    std::cout << "[gcv] oracle_idx=" << oracle_idx << " (lambda=" << grid[oracle_idx]
+              << ", rmse=" << best_rmse << ")  gcv_idx=" << gcv_idx << " (lambda=" << lambda_gcv
+              << ", rmse=" << gcv_rmse << ")  raw_rmse=" << raw_rmse << std::endl;
+
+    EXPECT_GT(oracle_idx, 0);                                  // interior optimum (not the weakest lambda)
+    EXPECT_LT(oracle_idx, static_cast<int>(grid.size()) - 1);  // ... nor the strongest
+    EXPECT_LE(std::abs(gcv_idx - oracle_idx), 1);              // GCV within one grid step of the oracle
+    EXPECT_LT(gcv_rmse, 1.30 * best_rmse);                     // near-oracle true error
+    EXPECT_LT(gcv_rmse, raw_rmse);                             // and it denoises
 }
 
 // end-to-end through an order-1 (time) GeoFrame and a formula: the multi-column response is

@@ -104,7 +104,7 @@ TEST(ts_ls_ode_sqp, lambda_controls_tradeoff) {
     for (double lambda : {1e-3, 1e0, 1e3}) {
         auto solver = fx.make_solver();
         solver.fit(lambda, sqp_ode_test::SQP);
-        double defect = solver.control().cwiseAbs().maxCoeff();
+        double defect = solver.misfit().cwiseAbs().maxCoeff();
         double datafit = sqp_ode_test::rmse(solver.trajectory(), fx.Yobs);
         EXPECT_LT(defect, defect_prev) << "lambda = " << lambda;
         EXPECT_GT(datafit, datafit_prev) << "lambda = " << lambda;
@@ -119,7 +119,7 @@ TEST(ts_ls_ode_sqp, large_lambda_enforces_dynamics) {
     auto solver = fx.make_solver();
     solver.fit(1e4, sqp_ode_test::SQP);
     EXPECT_TRUE(solver.converged());
-    EXPECT_LT(solver.control().cwiseAbs().maxCoeff(), 1e-3);
+    EXPECT_LT(solver.misfit().cwiseAbs().maxCoeff(), 1e-3);
     EXPECT_LT(sqp_ode_test::rmse(solver.trajectory(), fx.Ytrue), 1e-2);
 }
 

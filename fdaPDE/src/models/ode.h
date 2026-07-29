@@ -62,7 +62,8 @@ class NPRODE {
     vector_t fitted() const { return solver_.fitted(); }
     const vector_t& response() const { return solver_.response(); }
     const matrix_t& trajectory() const { return solver_.trajectory(); }   // m x d
-    const matrix_t& control() const { return solver_.control(); }         // (m-1) x d defects
+    const matrix_t& control() const { return solver_.control(); }         // (m-1) x d additive control u_t
+    const vector_t& misfit() const { return solver_.misfit(); }           // (m-1)*d ODE-residual defect
     double objective() const { return solver_.objective(); }
     bool converged() const { return solver_.converged(); }
     int n_iter() const { return solver_.n_iter(); }
@@ -103,7 +104,11 @@ class NPRODE {
             if (edf_cache_.find(lambda_vec) == edf_cache_.end()) { edf_cache_[lambda_vec] = model_->edf(r_, seed_); }
             double n = model_->n_obs();
             double dor = n - edf_cache_.at(lambda_vec);   // residual degrees of freedom
-            return (n / std::pow(dor, 2)) * model_->rss();
+            // the edf is a noisy Hutchinson estimate: at very small lambda it can exceed n_obs, giving
+            // dor < 0 and an artificially *small* n/dor^2 that would spuriously win the lambda search.
+            // reject such degenerate points so the minimizer never selects them.
+            if (dor <= 0) { return std::numeric_limits<double>::infinity(); }
+            return (n / (dor * dor)) * model_->rss();
         }
         const edf_cache_t& edf_cache() const { return edf_cache_; }
         edf_cache_t& edf_cache() { return edf_cache_; }
