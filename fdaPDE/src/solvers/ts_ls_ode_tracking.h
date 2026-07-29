@@ -200,12 +200,13 @@ class ts_ls_ode_tracking : public ts_ls_ode {
         for (int t = m_ - 2; t >= 0; --t) {
             vector_t yc = Y_.row(t).transpose();
             vector_t ut = U_.row(t).transpose();
-            // d y_{t+1}/d theta on the forced dynamics; p is the costate p_{t+1}
-            matrix_t Theta = engine_.param_jacobian(time_(t), yc, dt_(t), ut);
-            grad.noalias() += Theta.transpose() * p;
-            // Flow_t^T p, from the engine's existing discrete adjoint of one step
-            vector_t p_prop = engine_.adjoint_step(time_(t), yc, dt_(t), p, ut).first;
-            p = source(t) + p_prop;
+            // one stage solve yields both the parameter Jacobian Theta_t = d y_{t+1}/d theta and the flow
+            // Jacobian Flow_t = d y_{t+1}/d y_t on the forced dynamics; p is the costate p_{t+1}. The envelope
+            // gradient contracts Theta_t against p, the costate propagates by Flow_t^T (pure linear algebra --
+            // no second stage solve, cf. the previous param_jacobian + adjoint_step pair).
+            auto s = engine_.step_with_flow_param_jacobians(time_(t), yc, dt_(t), ut);
+            grad.noalias() += s.param.transpose() * p;
+            p = source(t) + s.flow.transpose() * p;
         }
         // first node: only a hard, theta-dependent initial condition contributes (otherwise S_1 = 0)
         if (has_ic_ && ic_jacobian_) { grad.noalias() += ic_jacobian_(theta).transpose() * p; }
