@@ -90,6 +90,20 @@ class ts_ls_ode_tracking : public ts_ls_ode {
     void set_ic_jacobian(std::function<matrix_t(const vector_t&)> ic_jacobian) {
         ic_jacobian_ = std::move(ic_jacobian);
     }
+    // Make the hard initial condition itself a function of theta, so the OUTER solve estimates it. `ic`
+    // maps theta -> the d-vector that pins node 0 before each inner fit (the inner solve then sees the IC
+    // as a fixed constant, NOT a decision variable); `ic_jac` = d(y0)/d(theta) (d x n_theta), contracted
+    // against the first-node costate in the envelope gradient. This wires both halves the estimation needs:
+    // the forward refresh of the pinned IC (set here) and its gradient term (set_ic_jacobian). Requires a
+    // hard-IC discretization -- a free IC makes the initial state an inner variable, which the envelope
+    // theorem freezes, so there is nothing for the outer solve to estimate.
+    void set_ic_parameterization(std::function<vector_t(const vector_t&)> ic,
+                                 std::function<matrix_t(const vector_t&)> ic_jac) {
+        fdapde_assert(has_ic_ && static_cast<bool>(ic) && static_cast<bool>(ic_jac));
+        ic_from_theta_ = std::move(ic);
+        ic_jacobian_ = std::move(ic_jac);
+        invalidate_cache_();
+    }
 
     // --- outer solve ---------------------------------------------------
     // minimize H(theta) = min_u J(u, theta) over theta by BFGS on the envelope gradient. On return the
@@ -147,6 +161,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
     void inner_solve_(const vector_t& theta) {
         if (cache_valid_ && theta_cache_.size() == theta.size() && theta_cache_ == theta) { return; }
         engine_.set_theta(theta);   // rebind the inherited engine to the new parameters, in place
+        if (ic_from_theta_) { y0_ = ic_from_theta_(theta); }   // refresh the theta-dependent hard IC (pinned node 0)
         fit(lambda_outer_, inner_policy());
         theta_cache_ = theta;
         cache_valid_ = true;
@@ -223,6 +238,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
     };
 
     std::function<matrix_t(const vector_t&)> ic_jacobian_;
+    std::function<vector_t(const vector_t&)> ic_from_theta_;   // theta-dependent hard IC, refreshed per inner solve
 
     vector_t theta_;                                  // current / estimated parameters
     double lambda_outer_ = -1;
