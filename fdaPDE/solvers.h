@@ -39,6 +39,7 @@ struct de_solver { };
 #include "src/solvers/fe_ls_parabolic.h"
 #include "src/solvers/ts_ls_ode.h"
 #include "src/solvers/ts_ls_ode_tracking.h"
+#include "src/solvers/ts_ls_ode_nls.h"   // consumes ts_ls_ode_param, declared by the tracking solver
 
 // density estimation solvers
 #include "src/solvers/fe_de_elliptic.h"

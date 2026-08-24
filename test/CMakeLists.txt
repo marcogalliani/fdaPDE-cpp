@@ -8,6 +8,18 @@ set(CMAKE_CXX_FLAGS "-O2 -march=native -std=c++20 ${CMAKE_WARNINGS_FLAGS} -I${CM
 
 find_package (Eigen3 3.4 REQUIRED NO_MODULE)
 
+# optional: autodiff (https://github.com/autodiff/autodiff), header-only. Point AUTODIFF_INC at a checkout
+# (-DAUTODIFF_INC=/path/to/autodiff, or the environment variable of the same name) to build the tests that
+# cover the automatic-differentiation adapter; without it those tests are compiled out and everything else
+# builds unchanged.
+if(NOT DEFINED AUTODIFF_INC AND DEFINED ENV{AUTODIFF_INC})
+  set(AUTODIFF_INC $ENV{AUTODIFF_INC})
+endif()
+if(DEFINED AUTODIFF_INC)
+  message(STATUS "autodiff found at ${AUTODIFF_INC}: the AD tests are enabled")
+  include_directories(${AUTODIFF_INC})
+endif()
+
 include_directories(../src/)
 include_directories(../../fdaPDE/)
 # enable testing functionality using gtest
