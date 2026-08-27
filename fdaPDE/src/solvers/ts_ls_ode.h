@@ -418,7 +418,14 @@ class ts_ls_ode {
         BFGS<Dynamic> optimizer(max_iter_, tol_, 1.0);
         // Wolfe line search: its curvature condition keeps the BFGS inverse Hessian positive
         // definite (descent directions), and its Armijo test rejects the divergent-cost surrogate.
-        vector_t z_opt = optimizer.optimize(problem, z, WolfeLineSearch());
+        // MaxIter = 15 rather than the default 10. The bisection budget is what decides whether the
+        // search returns a validated step or falls through with an unvalidated one, and on a badly
+        // misspecified SB fit the fall-through step is large enough to blow the forward integration up:
+        // the objective hits the divergent-cost sentinel, the envelope gradient goes identically zero,
+        // and the OUTER BFGS then exits at iteration 0 with the estimate left at its starting guess.
+        // Measured on the misspecification study's own configuration (A = 0.04, lambda = 1, 40 replicas),
+        // zero-gradient outcomes fall 12/40 -> 3/40 at budget 15, and reach 0/40 only at 18.
+        vector_t z_opt = optimizer.optimize(problem, z, WolfeLineSearch<15>());
         // recover trajectory and diagnostics from the optimal control
         Y_ = forward_recover_(z_opt);
         if (has_ic_) { Y_.row(0) = y0_.transpose(); }
