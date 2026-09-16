@@ -272,6 +272,7 @@ struct bs_ls_ode_param {
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     struct penalty_packet {
         any_controlled_ode_solver engine_;
+        std::vector<std::string> names_;   // component names of the rhs form; empty for a plain functor
         vector_t theta0_, ic_;
         bool has_ic_ = false;
         int degree_ = 1;   // degree of the declared trajectory space == stage count of the scheme
@@ -299,6 +300,8 @@ struct bs_ls_ode_param {
         int degree() const { return degree_; }
         const BsSpace<Triangulation<1, 1>>* space() const { return space_; }
         const any_controlled_ode_solver& engine() const { return engine_; }
+        const std::vector<std::string>& component_names() const { return names_; }
+        void set_component_names(std::vector<std::string> names) { names_ = std::move(names); }
         const vector_t& ic() const { return ic_; }
         bool has_ic() const { return has_ic_; }
         int max_iter() const { return max_iter_; }
@@ -333,7 +336,7 @@ struct bs_ls_ode_param {
     }
    public:
     template <typename Field>
-        requires(is_parameterized_ode_rhs<Field>)
+        requires(is_parameterized_ode_rhs<Field> && !is_ode_system_v<Field>)
     bs_ls_ode_param(
       const Field& field, const BsSpace<Triangulation<1, 1>>& Vh, const vector_t& theta0, int max_iter = 500,
       double tol = 1e-10) :
@@ -341,13 +344,32 @@ struct bs_ls_ode_param {
           engine_from_degree_(field, Vh.order(), theta0), Vh.order(), std::addressof(Vh), theta0, max_iter,
           tol) { }
     template <typename Field>
-        requires(is_parameterized_ode_rhs<Field>)
+        requires(is_parameterized_ode_rhs<Field> && !is_ode_system_v<Field>)
     bs_ls_ode_param(
       const Field& field, const BsSpace<Triangulation<1, 1>>& Vh, const vector_t& theta0, const vector_t& ic,
       int max_iter = 500, double tol = 1e-10) :
         penalty_(
           engine_from_degree_(field, Vh.order(), theta0), Vh.order(), std::addressof(Vh), theta0, ic, max_iter,
           tol) { }
+    // from a system in strong form: the space comes from its unknowns, theta0 follows with_parameters' order
+    template <typename... Eqs>
+    bs_ls_ode_param(const ode_system<Eqs...>& sys, const vector_t& theta0, int max_iter = 500, double tol = 1e-10) :
+        penalty_(
+          engine_from_degree_(sys, sys.function_space().order(), theta0), sys.function_space().order(),
+          std::addressof(sys.function_space()), theta0, max_iter, tol) {
+        fdapde_assert(theta0.size() == sys.n_params() && "theta0 must have one entry per declared parameter");
+        penalty_.set_component_names(sys.component_names());
+    }
+    template <typename... Eqs>
+    bs_ls_ode_param(
+      const ode_system<Eqs...>& sys, const vector_t& theta0, const vector_t& ic, int max_iter = 500,
+      double tol = 1e-10) :
+        penalty_(
+          engine_from_degree_(sys, sys.function_space().order(), theta0), sys.function_space().order(),
+          std::addressof(sys.function_space()), theta0, ic, max_iter, tol) {
+        fdapde_assert(theta0.size() == sys.n_params() && "theta0 must have one entry per declared parameter");
+        penalty_.set_component_names(sys.component_names());
+    }
     const penalty_packet& get() const { return penalty_; }
    private:
     penalty_packet penalty_;

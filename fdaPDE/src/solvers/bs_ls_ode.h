@@ -318,6 +318,8 @@ class bs_ls_ode {
                 y0_ = penalty.ic();
             }
         }
+        // component names, when the rhs form supplied them: they bind the response by name (analyze_data)
+        component_names_ = penalty.component_names();
         fdapde_assert(penalty.space() && "bs_ls_ode requires a trajectory space");
         const space_t& Vh = *penalty.space();
         check_trajectory_space_(Vh);
@@ -367,7 +369,24 @@ class bs_ls_ode {
         // response: a single column (named by the formula lhs) whose block holds the d system
         // components, read as an m x d matrix (mirrors the multivariate fpca convention)
         Formula formula_(formula);
-        matrix_t y_obs = gf[0].data().template col<double>(formula_.lhs()).as_matrix();
+        /* Binding the response to the state. By NAME when the rhs form named its components and the frame
+        carries any of them: each component reads its own column, and one the frame does not mention is left
+        NaN, i.e. unobserved. By POSITION otherwise: one column whose block holds the d components. */
+        bool any_named = false;
+        for (const std::string& name : component_names_) { any_named = any_named || gf[0].contains(name); }
+        matrix_t y_obs;
+        if (any_named) {
+            const int d = static_cast<int>(component_names_.size());
+            y_obs = matrix_t::Constant(m_, d, std::numeric_limits<double>::quiet_NaN());
+            for (int v = 0; v < d; ++v) {
+                if (!gf[0].contains(component_names_[v])) { continue; }   // this component is unobserved
+                const matrix_t col = gf[0].data().template col<double>(component_names_[v]).as_matrix();
+                fdapde_assert(col.rows() == m_ && col.cols() == 1);
+                y_obs.col(v) = col.col(0);
+            }
+        } else {
+            y_obs = gf[0].data().template col<double>(formula_.lhs()).as_matrix();
+        }
         fdapde_assert(y_obs.rows() == m_);
         set_response_(y_obs);
         return;
@@ -608,6 +627,7 @@ class bs_ls_ode {
     void build_coefficients_() const {
         if (coeff_valid_) { return; }
         fdapde_assert(Y_.rows() == m_ && U_.rows() == m_ - 1 && U_.cols() == sd_());
+        fdapde_assert(static_cast<int>(stage_values_.size()) == m_ - 1 && "no fit has captured its dynamics");
         const int p = degree_;
         f_ = vector_t::Zero(n_dofs_ * d_);
         for (int k = 0; k < m_ - 1; ++k) {
@@ -617,7 +637,7 @@ class bs_ls_ode {
             f_.segment(cell.dofs[0] * d_, d_) = yk;
             f_.segment(cell.dofs[p] * d_, d_) = yk1;
             if (p < 2) { continue; }
-            const matrix_t Ys = engine_.step_with_stage_values(time_(k), yk, dt_(k), stage_block_(U_, k)).values;
+            const matrix_t& Ys = stage_values_[k];   // captured by the fit (see capture_dynamics_)
             // p x d right-hand side: the stage values less the contribution of the two node dofs
             const matrix_t R =
               Ys.transpose() - cell.values.col(0) * yk.transpose() - cell.values.col(p) * yk1.transpose();
@@ -715,6 +735,11 @@ class bs_ls_ode {
         y_.resize(m_ * d_);
         for (int t = 0; t < m_; ++t) { y_.segment(t * d_, d_) = y_fill_.row(t).transpose(); }
         check_mesh_();
+        // any capture belongs to the previous data set (see capture_dynamics_)
+        stage_values_.clear();
+        jac_flow_.clear();
+        jac_B_.clear();
+        coeff_valid_ = false;
         return;
     }
     /* Check the trajectory space: it must be the C0 spline space of degree p (its mesh is checked against
@@ -787,6 +812,24 @@ class bs_ls_ode {
             // prior dynamics only (no control): pass a zero forcing
             vector_t step = engine_.step(time_(t), yc, dt_(t), matrix_t::Zero(d_, s_));
             misfit_.row(t) = ((Y_.row(t + 1).transpose() - step) / dt).transpose();
+        }
+        return;
+    }
+    /* Capture, from the fitted (Y_, U_), the per-interval dynamics the post-fit consumers need: the stage
+    values the trajectory's expansion is built from (build_coefficients_) and the forced step Jacobians the
+    linearized hat matrix is built from (assemble_). One pass at the end of every fit, so that neither an
+    observer nor the GCV path re-runs the dynamics. */
+    void capture_dynamics_() {
+        stage_values_.resize(m_ - 1);
+        jac_flow_.resize(m_ - 1);
+        jac_B_.resize(m_ - 1);
+        for (int t = 0; t < m_ - 1; ++t) {
+            const vector_t yc = Y_.row(t).transpose();
+            const matrix_t ut = stage_block_(U_, t);
+            stage_values_[t] = engine_.step_with_stage_values(time_(t), yc, dt_(t), ut).values;
+            auto s = engine_.step_with_jacobians(time_(t), yc, dt_(t), ut);
+            jac_flow_[t] = s.flow;
+            jac_B_[t] = s.param;
         }
         return;
     }
@@ -1001,6 +1044,7 @@ class bs_ls_ode {
         // criterion, re-tested here at the returned point). An iteration count below the cap is on its
         // own evidence of neither.
         converged_ = Y_.allFinite() && gradient_(z_opt).norm() <= tol_;
+        capture_dynamics_();
         compute_misfit_();
         flatten_();
         return f();
@@ -1137,6 +1181,7 @@ class bs_ls_ode {
         if (has_ic_) { Y_.row(0) = y0_.transpose(); }
         U_ = U;   // the additive control itself (the decision variable)
         objective_value_ = objective_YU_(Y_, U);
+        capture_dynamics_();
         compute_misfit_();
         flatten_();
         return f();
@@ -1303,19 +1348,20 @@ class bs_ls_ode {
             }
         }
         // penalty term: each interval couples nodes t and t+1 through the forced control u_t = u_t(y_t, y_{t+1})
+        fdapde_assert(static_cast<int>(jac_B_.size()) == m_ - 1 && "no fit has captured its dynamics");
         for (int t = 0; t < m_ - 1; ++t) {
             const double cw = lambda_ * dt_(t);
-            vector_t yc = Y_.row(t).transpose();
-            const matrix_t ut = stage_block_(U_, t);
-            // forced step Jacobians at the fitted control: s.flow = d y_{t+1}/d y_t, s.param = d y_{t+1}/d u_t
-            auto s = engine_.step_with_jacobians(time_(t), yc, dt_(t), ut);
-            // W-weighted pseudoinverse of the (d x s*d) control Jacobian; for s = 1 this is s.param^{-1}
+            // forced step Jacobians at the fitted control, captured by the fit (see capture_dynamics_):
+            // jac_flow_ = d y_{t+1}/d y_t, jac_B_ = d y_{t+1}/d u_t
+            const matrix_t& flow_t = jac_flow_[t];
+            const matrix_t& B_t = jac_B_[t];
+            // W-weighted pseudoinverse of the (d x s*d) control Jacobian; for s = 1 this is B_t^{-1}
             vector_t winv(sd_());
             for (int i = 0; i < s_; ++i) { winv.segment(i * d_, d_).setConstant(1.0 / b_quad[i]); }
-            const matrix_t BWi = s.param * winv.asDiagonal();            // b_t W^{-1}      (d x s*d)
-            const matrix_t P = winv.asDiagonal() * s.param.transpose() *
-                               (BWi * s.param.transpose()).inverse();    // P               (s*d x d)
-            const matrix_t G0 = -P * s.flow;                             // d u_t/d y_t
+            const matrix_t BWi = B_t * winv.asDiagonal();                // b_t W^{-1}      (d x s*d)
+            const matrix_t P = winv.asDiagonal() * B_t.transpose() *
+                               (BWi * B_t.transpose()).inverse();        // P               (s*d x d)
+            const matrix_t G0 = -P * flow_t;                             // d u_t/d y_t
             const matrix_t& G1 = P;                                      // d u_t/d y_{t+1}
             // the blocks carry the W metric of the penalty: [G0;G1]^T W [G0;G1]
             const matrix_t WG0 = winv.asDiagonal().inverse() * G0, WG1 = winv.asDiagonal().inverse() * G1;
@@ -1364,6 +1410,8 @@ class bs_ls_ode {
     vector_t mesh_nodes_;
     std::vector<cell_basis_t> stage_basis_, ctrl_stage_basis_;   // per cell (see sample_at_stages_)
     std::function<sparse_matrix_t(const matrix_t& locs)> point_eval_, ctrl_point_eval_;
+    // names of the state components, when the rhs form supplied them; empty means a positional response
+    std::vector<std::string> component_names_;
     matrix_t y_obs_, y_fill_, mask_;   // observations, NaN-filled copy, observation mask
 
     // one-slot cache of the controlled forward pass (see forward_recover_): the recovered trajectory and the
@@ -1380,6 +1428,8 @@ class bs_ls_ode {
 
     // whether f_ holds the expansion of the current fit (see build_coefficients_)
     mutable bool coeff_valid_ = false;
+    // per-interval dynamics of the current fit (see capture_dynamics_): stage values, d y_{t+1}/d y_t, d y_{t+1}/d u_t
+    std::vector<matrix_t> stage_values_, jac_flow_, jac_B_;
 
     vector_t fwd_z_;                     // control at which the cache was built
     matrix_t fwd_Y_;                     // recovered trajectory (m x d)
@@ -1416,6 +1466,7 @@ struct bs_ls_ode {
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     struct penalty_packet {
         any_controlled_ode_solver engine_;
+        std::vector<std::string> names_;   // component names of the rhs form; empty for a plain functor
         vector_t ic_;
         bool has_ic_ = false;
         int degree_ = 1;   // degree of the declared trajectory space == stage count of the scheme
@@ -1436,6 +1487,8 @@ struct bs_ls_ode {
         int degree() const { return degree_; }
         const BsSpace<Triangulation<1, 1>>* space() const { return space_; }
         const any_controlled_ode_solver& engine() const { return engine_; }
+        const std::vector<std::string>& component_names() const { return names_; }
+        void set_component_names(std::vector<std::string> names) { names_ = std::move(names); }
         const vector_t& ic() const { return ic_; }
         bool has_ic() const { return has_ic_; }
         int max_iter() const { return max_iter_; }
@@ -1480,13 +1533,31 @@ struct bs_ls_ode {
     in check_mesh_). Building the GeoFrame and the space over one Triangulation, as sr.cpp does on the FE
     side, satisfies both at once. */
     template <typename Field>
+        requires(!is_ode_system_v<Field>)
     bs_ls_ode(const Field& field, const BsSpace<Triangulation<1, 1>>& Vh, int max_iter = 500, double tol = 1e-8) :
         penalty_(engine_from_degree_(field, Vh.order()), Vh.order(), std::addressof(Vh), max_iter, tol) { }
     template <typename Field>
+        requires(!is_ode_system_v<Field>)
     bs_ls_ode(
       const Field& field, const BsSpace<Triangulation<1, 1>>& Vh, const vector_t& ic, int max_iter = 500,
       double tol = 1e-8) :
         penalty_(engine_from_degree_(field, Vh.order()), Vh.order(), std::addressof(Vh), ic, max_iter, tol) { }
+    /* Construct from a system in strong form. Its unknowns are declared over the trajectory space, so the space
+    is not passed again, and their names bind the response by name. The space must be alive at discretize. */
+    template <typename... Eqs>
+    explicit bs_ls_ode(const ode_system<Eqs...>& sys, int max_iter = 500, double tol = 1e-8) :
+        penalty_(
+          engine_from_degree_(sys, sys.function_space().order()), sys.function_space().order(),
+          std::addressof(sys.function_space()), max_iter, tol) {
+        penalty_.set_component_names(sys.component_names());
+    }
+    template <typename... Eqs>
+    bs_ls_ode(const ode_system<Eqs...>& sys, const vector_t& ic, int max_iter = 500, double tol = 1e-8) :
+        penalty_(
+          engine_from_degree_(sys, sys.function_space().order()), sys.function_space().order(),
+          std::addressof(sys.function_space()), ic, max_iter, tol) {
+        penalty_.set_component_names(sys.component_names());
+    }
     const penalty_packet& get() const { return penalty_; }
    private:
     penalty_packet penalty_;

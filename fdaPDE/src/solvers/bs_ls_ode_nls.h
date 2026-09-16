@@ -366,6 +366,7 @@ class bs_ls_ode_nls : public bs_ls_ode {
         Y_ = forward_(z);
         U_ = matrix_t::Zero(m_ - 1, sd_());   // NLS stays on the model manifold: no control
         bound_mult_.setZero(m_, d_);
+        capture_dynamics_();   // this solver bypasses both base fit paths, so it captures its own
         compute_misfit_();
         flatten_();
         objective_value_ = S_(z);
