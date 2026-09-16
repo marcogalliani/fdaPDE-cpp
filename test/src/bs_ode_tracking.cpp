@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-// Exercises the tracking inverse solver (internals::ts_ls_ode_tracking): ODE parameter estimation with
+// Exercises the tracking inverse solver (internals::bs_ls_ode_tracking): ODE parameter estimation with
 // H(theta) = min_u J(u, theta) and the envelope (adjoint) outer gradient.
 
 #include <cmath>
@@ -86,10 +86,12 @@ matrix_t integrate_param(const vector_t& theta, const vector_t& time, const vect
 
 struct fixture {
     vector_t theta_true, time, y0;
+    Triangulation<1, 1> mesh;   // outlives every solver built here (the space need not: see make_solver)
     matrix_t Ytrue, Yobs;
     fixture(int m = 31, double T = 2.0, double noise = 0.0) {
         theta_true = theta_of(1.0, 1.0, 1.0);
         time = make_time(m, T);
+        mesh = Triangulation<1, 1>(time);
         y0.resize(2);
         y0 << 0.5, -0.3;
         Ytrue = integrate_param(theta_true, time, y0);
@@ -100,16 +102,16 @@ struct fixture {
         }
     }
     // solver ready to estimate theta, starting from theta0
-    template <int Stages>
-    internals::ts_ls_ode_tracking make_solver(const ButcherTableau<Stages>& tab, const vector_t& theta0) {
-        ts_ls_ode_param penalty(param_field {}, tab, theta0, /*max_iter=*/200, /*tol=*/1e-10);
-        internals::ts_ls_ode_tracking solver;
+    internals::bs_ls_ode_tracking make_solver(int degree, const vector_t& theta0) {
+        BsSpace<Triangulation<1, 1>> Vh(mesh, degree, std::vector<int>(time.size(), degree));   // C0 at every node
+        bs_ls_ode_param penalty(param_field {}, Vh, theta0, /*max_iter=*/200, /*tol=*/1e-10);
+        internals::bs_ls_ode_tracking solver;
         solver.discretize(penalty.get());
         solver.analyze_data(time, Yobs);
         return solver;
     }
-    internals::ts_ls_ode_tracking make_solver(const vector_t& theta0) {
-        return make_solver(ode_schemes::gauss_legendre_2(), theta0);
+    internals::bs_ls_ode_tracking make_solver(const vector_t& theta0) {
+        return make_solver(2, theta0);
     }
 };
 
@@ -117,7 +119,7 @@ struct fixture {
 
 // the finite-difference df/dtheta fallback agrees with the analytic parameter Jacobian. A field wrapping
 // a functor WITHOUT an analytic param_jacobian routes ode_rhs_field::param_jacobian through central differences.
-TEST(ts_ls_ode_tracking, param_jacobian_fd_matches_analytic) {
+TEST(bs_ls_ode_tracking, param_jacobian_fd_matches_analytic) {
     tracking_ode_test::param_field f;
     vector_t y(2);
     y << 0.4, -0.2;
@@ -132,7 +134,7 @@ TEST(ts_ls_ode_tracking, param_jacobian_fd_matches_analytic) {
 
 // wrapping a parameterized functor with a bound theta yields a plain ODE rhs whose analytic state_jacobian is
 // preserved through the binding (the merged ode_rhs_field is the theta-bound rhs)
-TEST(ts_ls_ode_tracking, theta_binding_preserves_jacobian) {
+TEST(bs_ls_ode_tracking, theta_binding_preserves_jacobian) {
     vector_t th = tracking_ode_test::theta_of(0.8, 1.2, 0.9);
     ode_rhs_field bound {tracking_ode_test::param_field {}, th};
     static_assert(is_ode_rhs<decltype(bound)>, "the theta-bound field must be a plain ODE rhs");
@@ -146,13 +148,13 @@ TEST(ts_ls_ode_tracking, theta_binding_preserves_jacobian) {
 
 // THE key correctness test: the envelope (adjoint) outer gradient reproduces central finite differences
 // of H(theta) = min_u J(u, theta), for every Butcher tableau.
-TEST(ts_ls_ode_tracking, outer_gradient_matches_finite_differences) {
+TEST(bs_ls_ode_tracking, outer_gradient_matches_finite_differences) {
     tracking_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t th = tracking_ode_test::theta_of(0.85, 1.15, 0.9);   // away from the optimum
     const double lambda = 10.0, fd = 1e-5;
-    auto check = [&](auto tab, const char* name) {
-        auto solver = fx.make_solver(tab, th);
-        solver.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
+    auto check = [&](int degree, const std::string& name) {
+        auto solver = fx.make_solver(degree, th);
+        solver.set_inner_policy(internals::bs_ls_ode::fit_policy::sqp);
         vector_t g = solver.outer_gradient_at(lambda, th);
         ASSERT_EQ(g.size(), 3);
         for (int k = 0; k < 3; ++k) {
@@ -171,19 +173,16 @@ TEST(ts_ls_ode_tracking, outer_gradient_matches_finite_differences) {
         // the meaningful statement: the residual is still far below the gradient scale, so the envelope
         // identity holds to ~1e-4 relative regardless. See n_inner_failures() as a diagnostic.
     };
-    check(ode_schemes::forward_euler(), "forward_euler");
-    check(ode_schemes::crank_nicolson(), "crank_nicolson");
-    check(ode_schemes::implicit_midpoint(), "implicit_midpoint");
-    check(ode_schemes::gauss_legendre_2(), "gauss_legendre_2");
+    for (int degree = 1; degree <= 4; ++degree) { check(degree, "trajectory degree " + std::to_string(degree)); }
 }
 
 // the envelope gradient is also consistent when the inner solve runs the adjoint (BFGS) policy
-TEST(ts_ls_ode_tracking, outer_gradient_consistent_under_adjoint_inner_policy) {
+TEST(bs_ls_ode_tracking, outer_gradient_consistent_under_adjoint_inner_policy) {
     tracking_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t th = tracking_ode_test::theta_of(0.85, 1.15, 0.9);
     const double lambda = 10.0, fd = 1e-5;
     auto solver = fx.make_solver(th);
-    solver.set_inner_policy(internals::ts_ls_ode::fit_policy::adjoint);
+    solver.set_inner_policy(internals::bs_ls_ode::fit_policy::adjoint);
     vector_t g = solver.outer_gradient_at(lambda, th);
     for (int k = 0; k < 3; ++k) {
         vector_t thp = th, thm = th;
@@ -195,31 +194,32 @@ TEST(ts_ls_ode_tracking, outer_gradient_consistent_under_adjoint_inner_policy) {
 }
 
 // the parameter sensitivity path also works when df/dtheta comes from finite differences
-TEST(ts_ls_ode_tracking, outer_gradient_with_fd_param_jacobian) {
+TEST(bs_ls_ode_tracking, outer_gradient_with_fd_param_jacobian) {
     tracking_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t th = tracking_ode_test::theta_of(0.85, 1.15, 0.9);
     const double lambda = 10.0;
     // analytic-param_jacobian solver
     auto solver_a = fx.make_solver(th);
-    solver_a.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
+    solver_a.set_inner_policy(internals::bs_ls_ode::fit_policy::sqp);
     vector_t g_analytic = solver_a.outer_gradient_at(lambda, th);
     // finite-difference-param_jacobian solver on the same dynamics
-    ts_ls_ode_param penalty(
-      tracking_ode_test::param_field_no_dtheta {}, ode_schemes::gauss_legendre_2(), th, 200, 1e-10);
-    internals::ts_ls_ode_tracking solver_b;
+    Triangulation<1, 1> T(fx.time);
+    BsSpace Vh(T, 2, std::vector<int>(T.n_nodes(), 2));   // C0 at every node
+    bs_ls_ode_param penalty(tracking_ode_test::param_field_no_dtheta {}, Vh, th, 200, 1e-10);
+    internals::bs_ls_ode_tracking solver_b;
     solver_b.discretize(penalty.get());
     solver_b.analyze_data(fx.time, fx.Yobs);
-    solver_b.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
+    solver_b.set_inner_policy(internals::bs_ls_ode::fit_policy::sqp);
     vector_t g_fd = solver_b.outer_gradient_at(lambda, th);
     EXPECT_LT((g_analytic - g_fd).cwiseAbs().maxCoeff(), 1e-5 * (1.0 + g_analytic.cwiseAbs().maxCoeff()));
 }
 
 // end-to-end: recover the true parameters from (noiseless) data generated by the ODE itself
-TEST(ts_ls_ode_tracking, recovers_true_parameters) {
+TEST(bs_ls_ode_tracking, recovers_true_parameters) {
     tracking_ode_test::fixture fx(31, 2.0, /*noise=*/0.0);
     vector_t theta0 = tracking_ode_test::theta_of(0.7, 1.3, 0.8);
     auto solver = fx.make_solver(theta0);
-    solver.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
+    solver.set_inner_policy(internals::bs_ls_ode::fit_policy::sqp);
     solver.set_outer_options(100, 1e-8);
     solver.solve(1e2, theta0);
     EXPECT_TRUE(solver.outer_converged());
@@ -229,13 +229,13 @@ TEST(ts_ls_ode_tracking, recovers_true_parameters) {
 }
 
 // noise degrades the estimate gracefully: less noise -> closer to the truth
-TEST(ts_ls_ode_tracking, estimate_improves_as_noise_vanishes) {
+TEST(bs_ls_ode_tracking, estimate_improves_as_noise_vanishes) {
     vector_t theta0 = tracking_ode_test::theta_of(0.8, 1.2, 0.9);
     double err_prev = std::numeric_limits<double>::infinity();
     for (double noise : {2e-2, 2e-3, 0.0}) {
         tracking_ode_test::fixture fx(31, 2.0, noise);
         auto solver = fx.make_solver(theta0);
-        solver.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
+        solver.set_inner_policy(internals::bs_ls_ode::fit_policy::sqp);
         solver.solve(1e2, theta0);
         double err = (solver.theta() - fx.theta_true).cwiseAbs().maxCoeff();
         EXPECT_LT(err, err_prev) << "noise = " << noise;
@@ -244,16 +244,16 @@ TEST(ts_ls_ode_tracking, estimate_improves_as_noise_vanishes) {
 }
 
 // the two inner fit policies reach the same inner minimizer, so they must give the same estimate
-TEST(ts_ls_ode_tracking, inner_policy_agreement) {
+TEST(bs_ls_ode_tracking, inner_policy_agreement) {
     tracking_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t theta0 = tracking_ode_test::theta_of(0.8, 1.2, 0.9);
 
     auto solver_adj = fx.make_solver(theta0);
-    solver_adj.set_inner_policy(internals::ts_ls_ode::fit_policy::adjoint);
+    solver_adj.set_inner_policy(internals::bs_ls_ode::fit_policy::adjoint);
     solver_adj.solve(1e2, theta0);
 
     auto solver_sqp = fx.make_solver(theta0);
-    solver_sqp.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
+    solver_sqp.set_inner_policy(internals::bs_ls_ode::fit_policy::sqp);
     solver_sqp.solve(1e2, theta0);
 
     EXPECT_LT((solver_adj.theta() - solver_sqp.theta()).cwiseAbs().maxCoeff(), 1e-4);
@@ -263,7 +263,7 @@ TEST(ts_ls_ode_tracking, inner_policy_agreement) {
 }
 
 // the tracking solver IS-A forward solver: the inherited fit() still smooths at the current theta
-TEST(ts_ls_ode_tracking, inherits_forward_solver) {
+TEST(bs_ls_ode_tracking, inherits_forward_solver) {
     tracking_ode_test::fixture fx(31, 2.0, /*noise=*/0.02);
     vector_t theta0 = tracking_ode_test::theta_of(1.0, 1.0, 1.0);
     auto solver = fx.make_solver(theta0);
@@ -274,19 +274,21 @@ TEST(ts_ls_ode_tracking, inherits_forward_solver) {
     EXPECT_TRUE(solver.trajectory().allFinite());
     // the additive control is the decision variable, distinct from the reported misfit for GL2
     EXPECT_EQ(solver.control().rows(), static_cast<int>(fx.time.size()) - 1);
-    EXPECT_EQ(solver.control().cols(), 2);
+    // the control is stage-wise: one block of d per collocation node (GL2 -> s = 2, so 2 * d columns)
+    EXPECT_EQ(solver.control().cols(), 2 * 2);
 }
 
 // a hard initial condition is honoured by the inner solve driven from the outer loop
-TEST(ts_ls_ode_tracking, hard_initial_condition) {
+TEST(bs_ls_ode_tracking, hard_initial_condition) {
     tracking_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t theta0 = tracking_ode_test::theta_of(0.9, 1.1, 0.95);
-    ts_ls_ode_param penalty(
-      tracking_ode_test::param_field {}, ode_schemes::gauss_legendre_2(), theta0, fx.y0, 200, 1e-10);
-    internals::ts_ls_ode_tracking solver;
+    Triangulation<1, 1> T(fx.time);
+    BsSpace Vh(T, 2, std::vector<int>(T.n_nodes(), 2));   // C0 at every node
+    bs_ls_ode_param penalty(tracking_ode_test::param_field {}, Vh, theta0, fx.y0, 200, 1e-10);
+    internals::bs_ls_ode_tracking solver;
     solver.discretize(penalty.get());
     solver.analyze_data(fx.time, fx.Yobs);
-    solver.set_inner_policy(internals::ts_ls_ode::fit_policy::sqp);
+    solver.set_inner_policy(internals::bs_ls_ode::fit_policy::sqp);
     solver.solve(1e2, theta0);
     EXPECT_NEAR(solver.trajectory()(0, 0), fx.y0[0], 1e-9);
     EXPECT_NEAR(solver.trajectory()(0, 1), fx.y0[1], 1e-9);

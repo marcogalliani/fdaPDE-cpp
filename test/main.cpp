@@ -64,10 +64,10 @@
 // #include "src/gsr.cpp"
 // #include "src/qsr.cpp"
 // #include "src/de.cpp"
-#include "src/ts_ode.cpp"
-#include "src/ts_ode_sqp.cpp"
-#include "src/ts_ode_tracking.cpp"
-#include "src/ts_ode_nls.cpp"
+#include "src/bs_ode.cpp"
+#include "src/bs_ode_sqp.cpp"
+#include "src/bs_ode_tracking.cpp"
+#include "src/bs_ode_nls.cpp"
 #include "src/npr.cpp"
 
 int main(int argc, char** argv) {

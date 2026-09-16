@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-// Exercises the full-space Gauss-Newton SQP policy of internals::ts_ls_ode (fit_policy::sqp), the
+// Exercises the full-space Gauss-Newton SQP policy of internals::bs_ls_ode (fit_policy::sqp), the
 // alternative to the default reduced adjoint-gradient BFGS policy.
 
 #include <cmath>
@@ -22,15 +22,15 @@
 
 using namespace fdapde;
 
-// distinct named namespace: this file is #included into the same translation unit as ts_ode.cpp, so its
+// distinct named namespace: this file is #included into the same translation unit as bs_ode.cpp, so its
 // fixtures must not collide with that file's anonymous-namespace helpers.
 namespace sqp_ode_test {
 
 using vector_t = Eigen::Matrix<double, Dynamic, 1>;
 using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
 
-constexpr auto SQP = internals::ts_ls_ode::fit_policy::sqp;
-constexpr auto ADJ = internals::ts_ls_ode::fit_policy::adjoint;
+constexpr auto SQP = internals::bs_ls_ode::fit_policy::sqp;
+constexpr auto ADJ = internals::bs_ls_ode::fit_policy::adjoint;
 
 // nonlinear, non-autonomous test field, d = 2 (same dynamics as the adjoint-solver tests):
 //   f(t, y) = [ y0*y1 + sin(t) ; y0 - y1^2 ],   state_jacobian = [ [y1, y0] ; [1, -2*y1] ]
@@ -62,9 +62,11 @@ double rmse(const matrix_t& A, const matrix_t& B) { return std::sqrt((A - B).squ
 struct fixture {
     nonlinear_field f;
     vector_t time;
+    Triangulation<1, 1> mesh;   // outlives every solver built here
     matrix_t Ytrue, Yobs;
     fixture(int m = 41, double T = 2.0, double noise = 0.02) {
         time = make_time(m, T);
+        mesh = Triangulation<1, 1>(time);
         vector_t y0(2);
         y0 << 0.5, -0.3;
         Ytrue = integrate_field(f, time, y0);
@@ -74,21 +76,23 @@ struct fixture {
             Yobs(t, 1) += noise * std::cos(5.0 * t);
         }
     }
-    template <int Stages>
-    internals::ts_ls_ode make_solver(const ButcherTableau<Stages>& tab) {
-        ts_ls_ode penalty(f, tab);
-        internals::ts_ls_ode solver;
+    // the trajectory space is the only discretization choice: its degree p selects the p-stage Gauss scheme,
+    // and it is C0 at every node. The solver reads it in discretize and keeps nothing of it; the mesh outlives it
+    internals::bs_ls_ode make_solver(int degree) {
+        BsSpace<Triangulation<1, 1>> Vh(mesh, degree, std::vector<int>(time.size(), degree));
+        bs_ls_ode penalty(f, Vh);
+        internals::bs_ls_ode solver;
         solver.discretize(penalty.get());
         solver.analyze_data(time, Yobs);
         return solver;
     }
-    internals::ts_ls_ode make_solver() { return make_solver(ode_schemes::gauss_legendre_2()); }
+    internals::bs_ls_ode make_solver() { return make_solver(2); }
 };
 
 }   // namespace sqp_ode_test
 
 // the SQP-policy solve converges within the iteration budget and the fit denoises.
-TEST(ts_ls_ode_sqp, fit_denoises_and_converges) {
+TEST(bs_ls_ode_sqp, fit_denoises_and_converges) {
     sqp_ode_test::fixture fx;
     auto solver = fx.make_solver();
     solver.fit(1.0, sqp_ode_test::SQP);
@@ -97,7 +101,7 @@ TEST(ts_ls_ode_sqp, fit_denoises_and_converges) {
 }
 
 // lambda spans the data-fit / dynamics trade-off.
-TEST(ts_ls_ode_sqp, lambda_controls_tradeoff) {
+TEST(bs_ls_ode_sqp, lambda_controls_tradeoff) {
     sqp_ode_test::fixture fx;
     double defect_prev = std::numeric_limits<double>::infinity();
     double datafit_prev = 0.0;
@@ -114,7 +118,7 @@ TEST(ts_ls_ode_sqp, lambda_controls_tradeoff) {
 }
 
 // with noiseless data and large lambda the trajectory is driven onto a discrete ODE solution.
-TEST(ts_ls_ode_sqp, large_lambda_enforces_dynamics) {
+TEST(bs_ls_ode_sqp, large_lambda_enforces_dynamics) {
     sqp_ode_test::fixture fx(41, 2.0, /*noise=*/0.0);
     auto solver = fx.make_solver();
     solver.fit(1e4, sqp_ode_test::SQP);
@@ -124,12 +128,14 @@ TEST(ts_ls_ode_sqp, large_lambda_enforces_dynamics) {
 }
 
 // a hard initial condition pins the first node exactly.
-TEST(ts_ls_ode_sqp, hard_initial_condition) {
+TEST(bs_ls_ode_sqp, hard_initial_condition) {
     sqp_ode_test::fixture fx;
     vector_t y0(2);
     y0 << 1.234, -0.777;
-    ts_ls_ode penalty(fx.f, ode_schemes::gauss_legendre_2(), y0);
-    internals::ts_ls_ode solver;
+    Triangulation<1, 1> T(fx.time);
+    BsSpace Vh(T, 2, std::vector<int>(T.n_nodes(), 2));   // C0 at every node
+    bs_ls_ode penalty(fx.f, Vh, y0);
+    internals::bs_ls_ode solver;
     solver.discretize(penalty.get());
     solver.analyze_data(fx.time, fx.Yobs);
     solver.fit(1.0, sqp_ode_test::SQP);
@@ -138,7 +144,7 @@ TEST(ts_ls_ode_sqp, hard_initial_condition) {
 }
 
 // missing observations (NaN) are interpolated through; the fit stays finite and converges.
-TEST(ts_ls_ode_sqp, handles_missing_observations) {
+TEST(bs_ls_ode_sqp, handles_missing_observations) {
     sqp_ode_test::fixture fx;
     for (int t = 10; t < 20; ++t) { fx.Yobs(t, 0) = std::numeric_limits<double>::quiet_NaN(); }
     auto solver = fx.make_solver();
@@ -149,25 +155,23 @@ TEST(ts_ls_ode_sqp, handles_missing_observations) {
 }
 
 // every time-stepping scheme produces a valid, converged fit under the SQP policy.
-TEST(ts_ls_ode_sqp, scheme_variants_converge) {
+TEST(bs_ls_ode_sqp, scheme_variants_converge) {
     sqp_ode_test::fixture fx;
-    auto run = [&](auto tab) {
-        auto solver = fx.make_solver(tab);
+    for (int degree = 1; degree <= 4; ++degree) {
+        auto solver = fx.make_solver(degree);
         solver.fit(1.0, sqp_ode_test::SQP);
-        EXPECT_TRUE(solver.trajectory().allFinite());
-        EXPECT_TRUE(solver.converged());
-    };
-    run(ode_schemes::forward_euler());
-    run(ode_schemes::crank_nicolson());
-    run(ode_schemes::implicit_midpoint());
-    run(ode_schemes::gauss_legendre_2());
+        EXPECT_TRUE(solver.trajectory().allFinite()) << "degree " << degree;
+        EXPECT_TRUE(solver.converged()) << "degree " << degree;
+    }
 }
 
 // the NPRODE model wrapper drives the SQP-policy fit and still supports GCV.
-TEST(ts_ls_ode_sqp, model_wrapper_and_gcv) {
+TEST(bs_ls_ode_sqp, model_wrapper_and_gcv) {
     sqp_ode_test::fixture fx;
-    using Model = NPRODE<internals::ts_ls_ode>;
-    ts_ls_ode penalty(fx.f, ode_schemes::gauss_legendre_2());
+    using Model = NPRODE<internals::bs_ls_ode>;
+    Triangulation<1, 1> T(fx.time);
+    BsSpace Vh(T, 2, std::vector<int>(T.n_nodes(), 2));   // C0 at every node
+    bs_ls_ode penalty(fx.f, Vh);
     Model model;
     model.discretize(penalty.get());
     model.analyze_data(fx.time, fx.Yobs);
@@ -192,16 +196,18 @@ TEST(ts_ls_ode_sqp, model_wrapper_and_gcv) {
 }
 
 // end-to-end through an order-1 (time) GeoFrame and a formula, fit with the SQP policy on both paths.
-TEST(ts_ls_ode_sqp, geoframe_formula_path) {
+TEST(bs_ls_ode_sqp, geoframe_formula_path) {
     sqp_ode_test::fixture fx;
     const int m = fx.time.size();
-    Triangulation<1, 1> T = Triangulation<1, 1>::Interval(fx.time[0], fx.time[m - 1], m);
-    GeoFrame data(T);
+    Triangulation<1, 1> Tg = Triangulation<1, 1>::Interval(fx.time[0], fx.time[m - 1], m);
+    GeoFrame data(Tg);
     auto& layer = data.insert_scalar_layer<POINT>("layer", MESH_NODES);
     layer.load_blk("y", fx.Yobs);
 
-    ts_ls_ode penalty(fx.f, ode_schemes::gauss_legendre_2());
-    NPRODE<internals::ts_ls_ode> model("y ~ f", data, penalty);
+    Triangulation<1, 1> T(fx.time);
+    BsSpace Vh(T, 2, std::vector<int>(T.n_nodes(), 2));   // C0 at every node
+    bs_ls_ode penalty(fx.f, Vh);
+    NPRODE<internals::bs_ls_ode> model("y ~ f", data, penalty);
     model.fit(1.0, sqp_ode_test::SQP);
     EXPECT_TRUE(model.converged());
     EXPECT_EQ(model.n_nodes(), m);
@@ -213,7 +219,7 @@ TEST(ts_ls_ode_sqp, geoframe_formula_path) {
 }
 
 // effective degrees of freedom lie within the admissible range and decrease with lambda.
-TEST(ts_ls_ode_sqp, edf_in_range_and_monotone) {
+TEST(bs_ls_ode_sqp, edf_in_range_and_monotone) {
     sqp_ode_test::fixture fx;
     auto solver = fx.make_solver();
     solver.fit(1e-2, sqp_ode_test::SQP);
@@ -229,16 +235,16 @@ TEST(ts_ls_ode_sqp, edf_in_range_and_monotone) {
 
 // the "equal results" guarantee: for every Butcher tableau the two fit policies of the same solver reach
 // the same minimizer -- same trajectory, same control, same objective.
-TEST(ts_ls_ode_sqp, sqp_policy_matches_adjoint_policy) {
+TEST(bs_ls_ode_sqp, sqp_policy_matches_adjoint_policy) {
     sqp_ode_test::fixture fx;
-    auto check = [&](auto tab) {
-        auto adjoint = fx.make_solver(tab);
+    auto check = [&](int degree) {
+        auto adjoint = fx.make_solver(degree);
         adjoint.fit(1.0, sqp_ode_test::ADJ);
         matrix_t Y_adj = adjoint.trajectory();
         matrix_t U_adj = adjoint.control();
         double obj_adj = adjoint.objective();
 
-        auto sqp = fx.make_solver(tab);
+        auto sqp = fx.make_solver(degree);
         sqp.fit(1.0, sqp_ode_test::SQP);
 
         EXPECT_TRUE(sqp.converged());
@@ -247,8 +253,5 @@ TEST(ts_ls_ode_sqp, sqp_policy_matches_adjoint_policy) {
         EXPECT_LT((sqp.control() - U_adj).cwiseAbs().maxCoeff(), 1e-6);
         EXPECT_NEAR(sqp.objective(), obj_adj, 1e-6 * (1.0 + std::abs(obj_adj)));
     };
-    check(ode_schemes::forward_euler());
-    check(ode_schemes::crank_nicolson());
-    check(ode_schemes::implicit_midpoint());
-    check(ode_schemes::gauss_legendre_2());
+    for (int degree = 1; degree <= 4; ++degree) { check(degree); }
 }

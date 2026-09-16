@@ -14,8 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#ifndef __TS_LS_ODE_NLS_SOLVER_H__
-#define __TS_LS_ODE_NLS_SOLVER_H__
+#ifndef __BS_LS_ODE_NLS_SOLVER_H__
+#define __BS_LS_ODE_NLS_SOLVER_H__
 
 #include "header_check.h"
 
@@ -30,14 +30,14 @@ namespace internals {
 //
 // minimized over theta (and, unless the initial state is pinned, over y0 as well).
 //
-// WHY IT EXISTS. It is the reference estimator the tracking solver (ts_ls_ode_tracking) is to be measured
+// WHY IT EXISTS. It is the reference estimator the tracking solver (bs_ls_ode_tracking) is to be measured
 // against. The tracking criterion H_lambda(theta) = min_u J(u, theta) admits a control u that lets the
 // trajectory leave the model manifold, and the claim motivating it (Ramsay & Hooker's generalized
 // profiling) is precisely that H_lambda is a SMOOTHED version of S, approaching it as lambda -> infinity.
 // Testing that claim requires S itself, computed on the SAME model, the SAME time grid and the SAME
 // Butcher tableau -- otherwise a comparison of estimators is partly a comparison of discretizations.
-// Hence this solver consumes the same ts_ls_ode_param descriptor and the same erased engine as the
-// tracking solver, and derives from the same ts_ls_ode base so data ingestion, the observation mask and
+// Hence this solver consumes the same bs_ls_ode_param descriptor and the same erased engine as the
+// tracking solver, and derives from the same bs_ls_ode base so data ingestion, the observation mask and
 // the result observers are literally the same code.
 //
 // RELATION TO THE TRACKING SOLVER. NLS is the u == 0 corner of the same machinery: there is no inner
@@ -57,9 +57,9 @@ namespace internals {
 // The outer minimization is BFGS with a Wolfe line search from the core optimization module, as in the
 // tracking solver's outer loop -- the difference in behaviour between the two estimators is then a
 // property of the criteria, not of the optimizer.
-class ts_ls_ode_nls : public ts_ls_ode {
+class bs_ls_ode_nls : public bs_ls_ode {
    public:
-    using Base = ts_ls_ode;
+    using Base = bs_ls_ode;
     /* Line search for the outer BFGS
         - backtracking: Armijo backtracking from a fixed initial step, halving without a floor.
         - wolfe:        the weak Wolfe (Armijo + curvature) bisection used by the tracking solver.
@@ -73,14 +73,14 @@ class ts_ls_ode_nls : public ts_ls_ode {
        the *same* line search is sometimes the point. */
     enum class line_search { backtracking, wolfe };
 
-    ts_ls_ode_nls() noexcept = default;
+    bs_ls_ode_nls() noexcept = default;
     template <typename GeoFrame, typename Penalty>
-    ts_ls_ode_nls(const std::string& formula, const GeoFrame& gf, Penalty&& penalty) {
+    bs_ls_ode_nls(const std::string& formula, const GeoFrame& gf, Penalty&& penalty) {
         discretize(penalty);
         analyze_data(formula, gf);
     }
 
-    // discretize a parametric descriptor (ts_ls_ode_param): the base stores the erased engine at theta0
+    // discretize a parametric descriptor (bs_ls_ode_param): the base stores the erased engine at theta0
     // and the optional hard initial condition, this solve rebinds theta on that engine per iterate. The
     // control machinery the base sets up is simply never exercised: NLS integrates at u = 0.
     template <typename Penalty> void discretize(Penalty&& penalty) {
@@ -194,7 +194,7 @@ class ts_ls_ode_nls : public ts_ls_ode {
     const vector_t& solve() { return solve(theta_); }
 
     // --- observers -----------------------------------------------------
-    // named as in ts_ls_ode_tracking, so a driver reports both estimators through the same calls. There
+    // named as in bs_ls_ode_tracking, so a driver reports both estimators through the same calls. There
     // is no inner solve here, so "outer" reads simply as "the estimation problem".
     const vector_t& theta() const { return theta_; }              // parameter estimate
     const vector_t& initial_state() const { return y0_; }         // the (possibly estimated) y_0
@@ -273,7 +273,7 @@ class ts_ls_ode_nls : public ts_ls_ode {
         vector_t theta = theta_of_(z);
         engine_.set_theta(theta);
         // u == 0 on every interval: the NLS trajectory is the *unforced* solution of the ODE
-        Yz_ = engine_.solve(time_, y0_of_(z, theta), matrix_t::Zero(m_ - 1, d_));
+        Yz_ = engine_.solve(time_, y0_of_(z, theta));
         // how far the integration stayed finite (== m_ when it completed): everything below works on this
         // prefix, so an unstable parameter still yields a usable criterion and gradient
         n_finite_ = m_;
@@ -299,9 +299,9 @@ class ts_ls_ode_nls : public ts_ls_ode {
     // So a blown-up integration is scored on WHAT IT MANAGED TO INTEGRATE: the residuals over the finite
     // prefix, plus a sentinel proportional to the fraction of the horizon that was lost,
     //
-    //     S = sum_{t < k} m_t (y_t - y^obs_t)^2 + divergent_cost_ * (m - k)/m,     k = finite prefix length.
+    //     S = sum_{t < k} m_t (y_t - y^obs_t)^2 + divergent_prefix_cost_ * (m - k)/m,   k = finite prefix length.
     //
-    // Two properties matter. (i) Any divergent point costs at least divergent_cost_/m, which dominates any
+    // Two properties matter. (i) Any divergent point costs at least divergent_prefix_cost_/m, which dominates any
     // attainable finite value, so the Armijo test still rejects every step out of the stable region.
     // (ii) Among divergent points, integrating FURTHER is better, and the prefix residuals give a genuine
     // descent direction back towards the data -- so a solve *started* at an unstable guess can recover
@@ -317,8 +317,8 @@ class ts_ls_ode_nls : public ts_ls_ode {
                 }
             }
         }
-        if (!std::isfinite(s)) { return divergent_cost_; }
-        if (n_finite_ < m_) { return s + divergent_cost_ * double(m_ - n_finite_) / m_; }
+        if (!std::isfinite(s)) { return divergent_prefix_cost_; }
+        if (n_finite_ < m_) { return s + divergent_prefix_cost_ * double(m_ - n_finite_) / m_; }
         if (s < best_value_ && z.allFinite()) {   // the safeguard's running best (see solve())
             best_value_ = s;
             best_z_ = z;
@@ -340,7 +340,7 @@ class ts_ls_ode_nls : public ts_ls_ode {
             }
             return s;
         };
-        const vector_t no_control = vector_t::Zero(d_);
+        const matrix_t no_control = matrix_t::Zero(d_, s_);   // one zero column per stage: NLS forces nothing
         vector_t p = source(k - 1);
         for (int t = k - 2; t >= 0; --t) {
             vector_t yc = Y.row(t).transpose();
@@ -364,7 +364,7 @@ class ts_ls_ode_nls : public ts_ls_ode {
     // rest of the forward-solver observers describe the fitted model
     void write_state_(const vector_t& z) {
         Y_ = forward_(z);
-        U_ = matrix_t::Zero(m_ - 1, d_);   // NLS stays on the model manifold: no control
+        U_ = matrix_t::Zero(m_ - 1, sd_());   // NLS stays on the model manifold: no control
         bound_mult_.setZero(m_, d_);
         compute_misfit_();
         flatten_();
@@ -377,7 +377,7 @@ class ts_ls_ode_nls : public ts_ls_ode {
     // objective functor over the decision vector, adapting S and its adjoint gradient to the core BFGS
     // interface (the same shape the tracking solver's outer criterion presents)
     struct nls_objective {
-        ts_ls_ode_nls* solver;
+        bs_ls_ode_nls* solver;
         double operator()(const vector_t& z) const { return solver->S_(z); }
         auto gradient() const {
             return [s = solver](const vector_t& z) { return s->grad_S_(z); };
@@ -391,6 +391,12 @@ class ts_ls_ode_nls : public ts_ls_ode {
     bool estimate_ic_ = false;       // is the initial state a decision variable?
     int outer_max_iter_ = 100;
     double outer_tol_ = 1e-6;
+    // Magnitude of the horizon-loss term in the partial-prefix cost S_ scores a blown-up shooting solve
+    // with. Unlike the base solver's flat sentinel (bs_ls_ode::divergent_cost_, which is infinity) this
+    // one enters an ARITHMETIC expression -- s + divergent_prefix_cost_ * (m - k)/m -- whose whole point
+    // is to stay finite so that reaching further before blowing up scores strictly better. Infinity here
+    // would collapse every divergent point onto the same value and destroy that ordering.
+    static constexpr double divergent_prefix_cost_ = 1e20;
     line_search line_search_ = line_search::backtracking;
 
     // one-slot forward cache
@@ -414,4 +420,4 @@ class ts_ls_ode_nls : public ts_ls_ode {
 }   // namespace internals
 }   // namespace fdapde
 
-#endif   // __TS_LS_ODE_NLS_SOLVER_H__
+#endif   // __BS_LS_ODE_NLS_SOLVER_H__

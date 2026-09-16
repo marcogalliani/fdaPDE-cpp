@@ -24,6 +24,8 @@ using vector_t = Eigen::Matrix<double, Dynamic, 1>;
 using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
 
 
+// TODO: bind the rhs to the functions space
+
 // ODE rhs functor returning a dynamic VectorXd -> ode_rhs_field deduces the dynamic-Dim path
 struct field_2d {
     vector_t operator()(double t, const vector_t& y) const {
@@ -55,9 +57,10 @@ TEST(npr, test1) {
     layer.load_blk("y", Y);
     
     // solver
-    ts_ls_ode penalty(f, ode_schemes::gauss_legendre_2());
+    BsSpace Vh(T, 2, std::vector<int>(T.n_nodes(), 2));   // C0 at every node
+    bs_ls_ode penalty(f, Vh);
 
-    NPRODE<internals::ts_ls_ode> model("y ~ f", data, penalty);
+    NPRODE<internals::bs_ls_ode> model("y ~ f", data, penalty);
     model.fit(1.0);
     EXPECT_TRUE(model.converged());
     EXPECT_EQ(model.n_nodes(), m);

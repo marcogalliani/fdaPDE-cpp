@@ -23,7 +23,7 @@ namespace fdapde {
 
 // Physics-informed smoothing with an ODE-residual (control) penalty: fits a d-dimensional
 // trajectory to time-series observations while penalizing departures from a prior dynamics
-// y' = f(t, y). Thin model wrapper around a time-stepping least-squares solver (ts_ls_ode),
+// y' = f(t, y). Thin model wrapper around a time-stepping least-squares solver (bs_ls_ode),
 // adding penalty-parameter selection via GCV, in the same spirit as SRPDE wraps its solvers.
 template <typename VariationalSolver>
     requires(std::is_same_v<typename VariationalSolver::solver_category, ls_solver>)
@@ -58,8 +58,8 @@ class NPRODE {
     template <typename... Args> auto fit(Args&&... args) { return solver_.fit(std::forward<Args>(args)...); }
 
     // observers
-    const vector_t& f() const { return solver_.f(); }                 // flattened trajectory
-    vector_t fitted() const { return solver_.fitted(); }
+    const vector_t& f() const { return solver_.f(); }                 // coefficients in the trajectory space
+    vector_t fitted() const { return solver_.fitted(); }              // nodal values (m*d)
     const vector_t& response() const { return solver_.response(); }
     const matrix_t& trajectory() const { return solver_.trajectory(); }   // m x d
     const matrix_t& control() const { return solver_.control(); }         // (m-1) x d additive control u_t

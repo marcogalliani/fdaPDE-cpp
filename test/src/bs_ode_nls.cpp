@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-// Exercises the nonlinear least squares (single shooting) inverse solver (internals::ts_ls_ode_nls):
+// Exercises the nonlinear least squares (single shooting) inverse solver (internals::bs_ls_ode_nls):
 // ODE parameter estimation with S(theta, y0) = || y(theta, y0) - y_obs ||^2 and the exact discrete
 // adjoint gradient of the shooting map. The AD-guarded block at the bottom additionally checks the
 // autodiff adapter (fdaPDE/autodiff.h): the same model written once, generic in the scalar type, must
@@ -29,7 +29,7 @@ namespace nls_ode_test {
 
 using vector_t = Eigen::Matrix<double, Dynamic, 1>;
 using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
-using nls_solver = internals::ts_ls_ode_nls;
+using nls_solver = internals::bs_ls_ode_nls;
 
 // the same theta-parameterized field the tracking-solver tests use, so the two estimators are exercised
 // on identical dynamics: f(t, y, th) = [ th0*y0*y1 + sin(t) ; th1*y0 - th2*y1^2 ], d = 2, n_theta = 3
@@ -71,10 +71,12 @@ matrix_t integrate_param(const vector_t& theta, const vector_t& time, const vect
 
 struct fixture {
     vector_t theta_true, time, y0;
+    Triangulation<1, 1> mesh;   // outlives every solver built here (the space need not: see make_solver)
     matrix_t Ytrue, Yobs;
     fixture(int m = 31, double T = 2.0, double noise = 0.0) {
         theta_true = theta_of(1.0, 1.0, 1.0);
         time = make_time(m, T);
+        mesh = Triangulation<1, 1>(time);
         y0.resize(2);
         y0 << 0.5, -0.3;
         Ytrue = integrate_param(theta_true, time, y0);
@@ -85,20 +87,22 @@ struct fixture {
         }
     }
     // solver with the initial state PINNED at the truth (theta is then the only unknown)
-    template <typename Field, int Stages>
-    nls_solver make_solver(Field field, const ButcherTableau<Stages>& tab, const vector_t& theta0) {
-        ts_ls_ode_param descriptor(field, tab, theta0, y0, /*max_iter=*/200, /*tol=*/1e-10);
+    template <typename Field>
+    nls_solver make_solver(Field field, int degree, const vector_t& theta0) {
+        BsSpace<Triangulation<1, 1>> Vh(mesh, degree, std::vector<int>(time.size(), degree));   // C0 at every node
+        bs_ls_ode_param descriptor(field, Vh, theta0, y0, /*max_iter=*/200, /*tol=*/1e-10);
         nls_solver solver;
         solver.discretize(descriptor.get());
         solver.analyze_data(time, Yobs);
         return solver;
     }
     nls_solver make_solver(const vector_t& theta0) {
-        return make_solver(param_field {}, ode_schemes::gauss_legendre_2(), theta0);
+        return make_solver(param_field {}, 2, theta0);
     }
     // solver with a FREE initial state (estimated jointly with theta)
     nls_solver make_free_ic_solver(const vector_t& theta0) {
-        ts_ls_ode_param descriptor(param_field {}, ode_schemes::gauss_legendre_2(), theta0, 200, 1e-10);
+        BsSpace<Triangulation<1, 1>> Vh(mesh, 2, std::vector<int>(time.size(), 2));   // C0 at every node
+        bs_ls_ode_param descriptor(param_field {}, Vh, theta0, 200, 1e-10);
         nls_solver solver;
         solver.discretize(descriptor.get());
         solver.analyze_data(time, Yobs);
@@ -125,22 +129,19 @@ void expect_gradient_matches_fd(nls_solver& solver, const vector_t& z, double to
 // THE key correctness test: the discrete adjoint gradient of the shooting map reproduces central
 // finite differences of S(theta), for every Butcher tableau (an implicit tableau must differentiate
 // through the Newton stage solve, which is where a wrong sensitivity would hide).
-TEST(ts_ls_ode_nls, gradient_matches_finite_differences) {
+TEST(bs_ls_ode_nls, gradient_matches_finite_differences) {
     nls_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t th = nls_ode_test::theta_of(0.85, 1.15, 0.9);   // away from the optimum
-    auto check = [&](auto tab, const char* name) {
-        auto solver = fx.make_solver(nls_ode_test::param_field {}, tab, th);
-        nls_ode_test::expect_gradient_matches_fd(solver, th, 1e-5, name);
-    };
-    check(ode_schemes::forward_euler(), "forward_euler");
-    check(ode_schemes::crank_nicolson(), "crank_nicolson");
-    check(ode_schemes::implicit_midpoint(), "implicit_midpoint");
-    check(ode_schemes::gauss_legendre_2(), "gauss_legendre_2");
+    for (int degree = 1; degree <= 4; ++degree) {
+        auto solver = fx.make_solver(nls_ode_test::param_field {}, degree, th);
+        nls_ode_test::expect_gradient_matches_fd(
+          solver, th, 1e-5, ("trajectory degree " + std::to_string(degree)).c_str());
+    }
 }
 
 // the parameter sensitivity path also works when df/dtheta is not analytic: ode_rhs_field's central
 // differences feed the same adjoint sweep
-TEST(ts_ls_ode_nls, gradient_with_fd_param_jacobian) {
+TEST(bs_ls_ode_nls, gradient_with_fd_param_jacobian) {
     struct field_no_dtheta {   // same dynamics, no param_jacobian
         vector_t operator()(double t, const vector_t& y, const vector_t& th) const {
             return nls_ode_test::param_field {}(t, y, th);
@@ -152,13 +153,13 @@ TEST(ts_ls_ode_nls, gradient_with_fd_param_jacobian) {
     nls_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t th = nls_ode_test::theta_of(0.85, 1.15, 0.9);
     auto solver_a = fx.make_solver(th);
-    auto solver_b = fx.make_solver(field_no_dtheta {}, ode_schemes::gauss_legendre_2(), th);
+    auto solver_b = fx.make_solver(field_no_dtheta {}, 2, th);
     vector_t g_analytic = solver_a.gradient_at(th), g_fd = solver_b.gradient_at(th);
     EXPECT_LT((g_analytic - g_fd).cwiseAbs().maxCoeff(), 1e-5 * (1.0 + g_analytic.cwiseAbs().maxCoeff()));
 }
 
 // end-to-end: recover the true parameters from (noiseless) data generated by the ODE itself
-TEST(ts_ls_ode_nls, recovers_true_parameters) {
+TEST(bs_ls_ode_nls, recovers_true_parameters) {
     nls_ode_test::fixture fx(31, 2.0, /*noise=*/0.0);
     vector_t theta0 = nls_ode_test::theta_of(0.7, 1.3, 0.8);
     auto solver = fx.make_solver(theta0);
@@ -173,7 +174,7 @@ TEST(ts_ls_ode_nls, recovers_true_parameters) {
 }
 
 // noise degrades the estimate gracefully: less noise -> closer to the truth
-TEST(ts_ls_ode_nls, estimate_improves_as_noise_vanishes) {
+TEST(bs_ls_ode_nls, estimate_improves_as_noise_vanishes) {
     vector_t theta0 = nls_ode_test::theta_of(0.8, 1.2, 0.9);
     double err_prev = std::numeric_limits<double>::infinity();
     for (double noise : {2e-2, 2e-3, 0.0}) {
@@ -189,7 +190,7 @@ TEST(ts_ls_ode_nls, estimate_improves_as_noise_vanishes) {
 
 // a free initial state becomes a decision variable: the gradient block is the node-0 costate, and both
 // theta and y0 are recovered from noiseless data
-TEST(ts_ls_ode_nls, free_initial_state_is_estimated_jointly) {
+TEST(bs_ls_ode_nls, free_initial_state_is_estimated_jointly) {
     nls_ode_test::fixture fx(31, 2.0, /*noise=*/0.0);
     vector_t theta0 = nls_ode_test::theta_of(0.8, 1.2, 0.9);
     auto solver = fx.make_free_ic_solver(theta0);
@@ -205,7 +206,7 @@ TEST(ts_ls_ode_nls, free_initial_state_is_estimated_jointly) {
 }
 
 // a hard initial condition pins the first node and is not estimated
-TEST(ts_ls_ode_nls, hard_initial_condition) {
+TEST(bs_ls_ode_nls, hard_initial_condition) {
     nls_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t theta0 = nls_ode_test::theta_of(0.9, 1.1, 0.95);
     auto solver = fx.make_solver(theta0);
@@ -217,7 +218,7 @@ TEST(ts_ls_ode_nls, hard_initial_condition) {
 }
 
 // an initial condition that is itself a function of theta contributes through d(y0)/d(theta)
-TEST(ts_ls_ode_nls, ic_parameterization) {
+TEST(bs_ls_ode_nls, ic_parameterization) {
     nls_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t theta0 = nls_ode_test::theta_of(0.9, 1.1, 0.95);
     auto solver = fx.make_free_ic_solver(theta0);
@@ -245,14 +246,16 @@ TEST(ts_ls_ode_nls, ic_parameterization) {
 }
 
 // missing observations (NaN) are excluded from the criterion and from its gradient
-TEST(ts_ls_ode_nls, missing_observations) {
+TEST(bs_ls_ode_nls, missing_observations) {
     nls_ode_test::fixture fx(21, 2.0, /*noise=*/0.01);
     vector_t theta0 = nls_ode_test::theta_of(0.9, 1.1, 0.95);
     matrix_t Y = fx.Yobs;
     const double nan = std::numeric_limits<double>::quiet_NaN();
     for (int t = 3; t < 8; ++t) { Y(t, 1) = nan; }   // a gap in the second component
-    ts_ls_ode_param descriptor(nls_ode_test::param_field {}, ode_schemes::gauss_legendre_2(), theta0, fx.y0, 200, 1e-10);
-    internals::ts_ls_ode_nls solver;
+    Triangulation<1, 1> T(fx.time);
+    BsSpace Vh(T, 2, std::vector<int>(T.n_nodes(), 2));   // C0 at every node
+    bs_ls_ode_param descriptor(nls_ode_test::param_field {}, Vh, theta0, fx.y0, 200, 1e-10);
+    internals::bs_ls_ode_nls solver;
     solver.discretize(descriptor.get());
     solver.analyze_data(fx.time, Y);
     EXPECT_EQ(solver.n_obs(), 21 * 2 - 5);
@@ -266,10 +269,16 @@ TEST(ts_ls_ode_nls, missing_observations) {
 // a parameter whose forward integration blows up must yield a large but FINITE cost, and a gradient that
 // still points somewhere: the criterion is scored on the finite prefix of the trajectory, so the search
 // can walk back into the stable region instead of dying on a NaN
-TEST(ts_ls_ode_nls, divergent_parameters_do_not_break_the_solve) {
+TEST(bs_ls_ode_nls, divergent_parameters_do_not_break_the_solve) {
     nls_ode_test::fixture fx(21, 2.0, /*noise=*/0.0);
-    vector_t wild = nls_ode_test::theta_of(1e3, 1e3, 1e3);   // explosive dynamics
-    auto solver = fx.make_solver(nls_ode_test::param_field {}, ode_schemes::forward_euler(), wild);
+    /* A parameter far enough out to overflow the forward integration. It has to be this extreme: every
+    scheme the solver can be given is a Gauss collocation method, hence A-stable, and its Newton stage
+    solve returns a bounded root for any finite theta -- theta = 1e12 still integrates to a perfectly
+    finite S. Reaching the divergence path therefore needs the overflow regime, which is what this is.
+    (Before the trajectory-space API this test used forward_euler, whose explicit instability blew up at
+    theta = 1e3; explicit schemes are no longer reachable.) */
+    vector_t wild = nls_ode_test::theta_of(1e150, 1e150, 1e150);
+    auto solver = fx.make_solver(nls_ode_test::param_field {}, 1, wild);
     double S = solver.objective_at(wild);
     EXPECT_TRUE(std::isfinite(S));
     EXPECT_GT(S, 1e12);                              // dominates any attainable finite value
@@ -281,9 +290,9 @@ TEST(ts_ls_ode_nls, divergent_parameters_do_not_break_the_solve) {
     EXPECT_TRUE(solver.theta().allFinite());
 }
 
-// the NLS solver is a ts_ls_ode: data ingestion, the observation mask and the forward-state observers are
+// the NLS solver is a bs_ls_ode: data ingestion, the observation mask and the forward-state observers are
 // the base's, so the estimate is reported through the same API as the tracking solver's
-TEST(ts_ls_ode_nls, mirrors_the_forward_solver_api) {
+TEST(bs_ls_ode_nls, mirrors_the_forward_solver_api) {
     nls_ode_test::fixture fx(31, 2.0, /*noise=*/0.01);
     vector_t theta0 = nls_ode_test::theta_of(0.9, 1.1, 0.95);
     auto solver = fx.make_solver(theta0);
@@ -301,15 +310,15 @@ TEST(ts_ls_ode_nls, mirrors_the_forward_solver_api) {
 
 // the two line-search policies solve the same problem; both must land on the same optimum from a start
 // close enough that neither struggles
-TEST(ts_ls_ode_nls, line_search_agreement) {
+TEST(bs_ls_ode_nls, line_search_agreement) {
     nls_ode_test::fixture fx(31, 2.0, /*noise=*/0.01);
     vector_t theta0 = nls_ode_test::theta_of(0.95, 1.05, 0.98);
     auto solver_b = fx.make_solver(theta0);
-    solver_b.set_line_search(internals::ts_ls_ode_nls::line_search::backtracking);
+    solver_b.set_line_search(internals::bs_ls_ode_nls::line_search::backtracking);
     solver_b.set_options(300, 1e-10);
     solver_b.solve(theta0);
     auto solver_w = fx.make_solver(theta0);
-    solver_w.set_line_search(internals::ts_ls_ode_nls::line_search::wolfe);
+    solver_w.set_line_search(internals::bs_ls_ode_nls::line_search::wolfe);
     solver_w.set_options(300, 1e-10);
     solver_w.solve(theta0);
     EXPECT_LT((solver_b.theta() - solver_w.theta()).cwiseAbs().maxCoeff(), 1e-3);
@@ -361,7 +370,7 @@ TEST(ad_ode_rhs, jacobians_match_the_analytic_field) {
 
 // end-to-end: an AD-differentiated field and a hand-differentiated one are the same estimator -- same
 // gradient, same estimate
-TEST(ts_ls_ode_nls, autodiff_field_matches_analytic_field) {
+TEST(bs_ls_ode_nls, autodiff_field_matches_analytic_field) {
     nls_ode_test::fixture fx(31, 2.0, /*noise=*/0.01);
     vector_t theta0 = nls_ode_test::theta_of(0.8, 1.2, 0.9);
     auto solver_ad = fx.make_solver(

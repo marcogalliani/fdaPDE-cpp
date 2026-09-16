@@ -14,8 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#ifndef __TS_LS_ODE_TRACKING_SOLVER_H__
-#define __TS_LS_ODE_TRACKING_SOLVER_H__
+#ifndef __BS_LS_ODE_TRACKING_SOLVER_H__
+#define __BS_LS_ODE_TRACKING_SOLVER_H__
 
 
 #include "header_check.h"
@@ -32,7 +32,7 @@ namespace internals {
 //   H(theta) = min_u J(u, theta),        theta* = argmin_theta H(theta),
 //
 // so the whole problem is the joint minimization min_{u, theta} J(u, theta) organized as
-// min_theta min_u J(u, theta). It derives from ts_ls_ode and uses the inherited fit() as its inner
+// min_theta min_u J(u, theta). It derives from bs_ls_ode and uses the inherited fit() as its inner
 // solver: the state and the control never leave the forward solver.
 //
 // Because the outer criterion coincides with the inner one, the inner optimality condition dJ/du = 0
@@ -50,14 +50,14 @@ namespace internals {
 // adjoint_step, and Theta_t = d step / d theta the one new quantity (RKIntegrator::step_param_jacobian).
 // When state bounds are active the node source is augmented by their dual variables, which is what the
 // constrained envelope theorem prescribes (the box constrains Y, and Y depends on theta).
-class ts_ls_ode_tracking : public ts_ls_ode {
+class bs_ls_ode_tracking : public bs_ls_ode {
    public:
-    using ts_ls_ode::fit;   // the inner solver, inherited unchanged
-    using Base = ts_ls_ode;
+    using bs_ls_ode::fit;   // the inner solver, inherited unchanged
+    using Base = bs_ls_ode;
 
-    ts_ls_ode_tracking() noexcept = default;
+    bs_ls_ode_tracking() noexcept = default;
     template <typename GeoFrame, typename Penalty>
-    ts_ls_ode_tracking(const std::string& formula, const GeoFrame& gf, Penalty&& penalty) {
+    bs_ls_ode_tracking(const std::string& formula, const GeoFrame& gf, Penalty&& penalty) {
         discretize(penalty);
         analyze_data(formula, gf);
     }
@@ -214,7 +214,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
         vector_t p = source(m_ - 1);
         for (int t = m_ - 2; t >= 0; --t) {
             vector_t yc = Y_.row(t).transpose();
-            vector_t ut = U_.row(t).transpose();
+            const matrix_t ut = stage_block_(U_, t);
             // one stage solve yields both the parameter Jacobian Theta_t = d y_{t+1}/d theta and the flow
             // Jacobian Flow_t = d y_{t+1}/d y_t on the forced dynamics; p is the costate p_{t+1}. The envelope
             // gradient contracts Theta_t against p, the costate propagates by Flow_t^T (pure linear algebra --
@@ -230,7 +230,7 @@ class ts_ls_ode_tracking : public ts_ls_ode {
 
     // outer objective functor over theta, adapting H and its envelope gradient to the core BFGS interface
     struct tracking_objective {
-        ts_ls_ode_tracking* solver;
+        bs_ls_ode_tracking* solver;
         double operator()(const vector_t& theta) const { return solver->H_(theta); }
         auto gradient() const {
             return [s = solver](const vector_t& theta) { return s->grad_H_(theta); };
@@ -262,32 +262,42 @@ class ts_ls_ode_tracking : public ts_ls_ode {
 }   // namespace internals
 
 // Parametric ODE-penalty descriptor: the theta-parameterized field, the time-integration scheme, an
-// initial guess for theta and an optional initial condition. Mirrors the ts_ls_ode descriptor -- the stage
+// initial guess for theta and an optional initial condition. Mirrors the bs_ls_ode descriptor -- the stage
 // count and the system dimension are deduced here and erased away -- the only difference being that the
 // erased engine wraps a parametric field (theta bound to theta0), so the tracking solver rebinds theta
 // directly on the inherited any_controlled_ode_solver.
-struct ts_ls_ode_param {
-    using solver_t = internals::ts_ls_ode_tracking;
+struct bs_ls_ode_param {
+    using solver_t = internals::bs_ls_ode_tracking;
    private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     struct penalty_packet {
         any_controlled_ode_solver engine_;
         vector_t theta0_, ic_;
         bool has_ic_ = false;
-        int max_iter_ = 50;
+        int degree_ = 1;   // degree of the declared trajectory space == stage count of the scheme
+        const BsSpace<Triangulation<1, 1>>* space_ = nullptr;   // the trajectory space, read by discretize
+        int max_iter_ = 500;
         double tol_ = 1e-10;   // tighter than the forward default: the envelope gradient needs dJ/du ~ 0
        public:
-        penalty_packet(any_controlled_ode_solver engine, vector_t theta0, int max_iter, double tol) :
-            engine_(std::move(engine)), theta0_(std::move(theta0)), max_iter_(max_iter), tol_(tol) { }
         penalty_packet(
-          any_controlled_ode_solver engine, vector_t theta0, vector_t ic, int max_iter, double tol) :
+          any_controlled_ode_solver engine, int degree, const BsSpace<Triangulation<1, 1>>* space, vector_t theta0,
+          int max_iter, double tol) :
+            engine_(std::move(engine)), theta0_(std::move(theta0)), degree_(degree), space_(space),
+            max_iter_(max_iter), tol_(tol) { }
+        penalty_packet(
+          any_controlled_ode_solver engine, int degree, const BsSpace<Triangulation<1, 1>>* space, vector_t theta0,
+          vector_t ic, int max_iter, double tol) :
             engine_(std::move(engine)),
             theta0_(std::move(theta0)),
             ic_(std::move(ic)),
             has_ic_(true),
+            degree_(degree),
+            space_(space),
             max_iter_(max_iter),
             tol_(tol) { }
-        // observers (the first five are what ts_ls_ode::discretize consumes)
+        // observers (the first seven are what bs_ls_ode::discretize consumes)
+        int degree() const { return degree_; }
+        const BsSpace<Triangulation<1, 1>>* space() const { return space_; }
         const any_controlled_ode_solver& engine() const { return engine_; }
         const vector_t& ic() const { return ic_; }
         bool has_ic() const { return has_ic_; }
@@ -299,7 +309,7 @@ struct ts_ls_ode_param {
     // static dimension (fixed-size return -> static, VectorXd -> Dynamic), deduced here and used only to
     // build the typed controlled_ode_solver; it never escapes this function.
     template <typename Field, int Stages>
-    static any_controlled_ode_solver make_engine_(
+    static any_controlled_ode_solver engine_from_tableau_(
       const Field& field, const ButcherTableau<Stages>& tableau, const vector_t& theta0) {
         constexpr int Dim = ode_rhs_dim_v<Field>;
         ode_rhs_field<Dim, Field> f(field);
@@ -307,19 +317,37 @@ struct ts_ls_ode_param {
         return any_controlled_ode_solver(
           controlled_ode_solver<Stages, Dim, Field>(std::move(f), RKIntegrator(tableau)));
     }
+    // the trajectory space's degree selects the p-stage Gauss scheme; see bs_ls_ode::engine_from_degree_
+    template <typename Field>
+    static any_controlled_ode_solver
+    engine_from_degree_(const Field& field, int degree, const vector_t& theta0) {
+        switch (degree) {
+        case 1: return engine_from_tableau_(field, ode_schemes::implicit_midpoint(), theta0);
+        case 2: return engine_from_tableau_(field, ode_schemes::gauss_legendre_2(), theta0);
+        case 3: return engine_from_tableau_(field, ode_schemes::gauss_legendre_3(), theta0);
+        case 4: return engine_from_tableau_(field, ode_schemes::gauss_legendre_4(), theta0);
+        }
+        fdapde_assert(
+          false && "trajectory space degree must be 1, 2, 3 or 4 (the Gauss-Legendre schemes available)");
+        return any_controlled_ode_solver();
+    }
    public:
-    template <typename Field, int Stages>
+    template <typename Field>
         requires(is_parameterized_ode_rhs<Field>)
-    ts_ls_ode_param(
-      const Field& field, const ButcherTableau<Stages>& tableau, const vector_t& theta0, int max_iter = 50,
+    bs_ls_ode_param(
+      const Field& field, const BsSpace<Triangulation<1, 1>>& Vh, const vector_t& theta0, int max_iter = 500,
       double tol = 1e-10) :
-        penalty_(make_engine_(field, tableau, theta0), theta0, max_iter, tol) { }
-    template <typename Field, int Stages>
+        penalty_(
+          engine_from_degree_(field, Vh.order(), theta0), Vh.order(), std::addressof(Vh), theta0, max_iter,
+          tol) { }
+    template <typename Field>
         requires(is_parameterized_ode_rhs<Field>)
-    ts_ls_ode_param(
-      const Field& field, const ButcherTableau<Stages>& tableau, const vector_t& theta0, const vector_t& ic,
-      int max_iter = 50, double tol = 1e-10) :
-        penalty_(make_engine_(field, tableau, theta0), theta0, ic, max_iter, tol) { }
+    bs_ls_ode_param(
+      const Field& field, const BsSpace<Triangulation<1, 1>>& Vh, const vector_t& theta0, const vector_t& ic,
+      int max_iter = 500, double tol = 1e-10) :
+        penalty_(
+          engine_from_degree_(field, Vh.order(), theta0), Vh.order(), std::addressof(Vh), theta0, ic, max_iter,
+          tol) { }
     const penalty_packet& get() const { return penalty_; }
    private:
     penalty_packet penalty_;
@@ -327,4 +355,4 @@ struct ts_ls_ode_param {
 
 }   // namespace fdapde
 
-#endif   // __TS_LS_ODE_TRACKING_SOLVER_H__
+#endif   // __BS_LS_ODE_TRACKING_SOLVER_H__
