@@ -37,7 +37,7 @@ constexpr double adaptive_simpson_integrate(FunctorT&& f, double a, double b, do
     double fb = f(b);
     double fm = f(m);
     double S = (b - a) / 6.0 * (fa + 4 * fm + fb);   // simpson approximation for \int_a^b f(t) dt
-    intervals.emplace(a, b, fa, fb, fm, S);
+    intervals.push({a, b, fa, fb, fm, S});
 
     while (!intervals.empty()) {
         interval_t i = intervals.top();
@@ -60,8 +60,8 @@ constexpr double adaptive_simpson_integrate(FunctorT&& f, double a, double b, do
             value += S_ + (S_ - S) / 15.0;   // Richardson extrapolation
         } else {
             // error too high, recurse
-            intervals.emplace(m, b, fm, fb, frm, Sr);   // left  subinterval
-            intervals.emplace(a, m, fa, fm, flm, Sl);   // right subinterval
+            intervals.push({m, b, fm, fb, frm, Sr});   // left  subinterval
+            intervals.push({a, m, fa, fm, flm, Sl});   // right subinterval
         }
     }
     return value;
