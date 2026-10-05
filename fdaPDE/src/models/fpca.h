@@ -31,6 +31,10 @@ namespace fdapde {
   
 namespace internals {
 
+// the fits used to evaluate the GCV index only need to rank the candidate smoothing levels: they are solved at a
+// looser tolerance, while the final fit at the selected smoothing levels uses the solver tolerance
+[[maybe_unused]] constexpr double fpca_calibration_tol = 1e-5;
+
 // power iteration based fPCA
 // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f)
 template <typename VariationalSolver> class fpca_power_iteration_impl {
@@ -78,6 +82,8 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
         monotone_.assign(rank, true);
 
         int calibration = (flag & 0b11110);   // detect calibration strategy
+        n_iter_.clear();
+        converged_ = true;
         for (int i = 0; i < rank; ++i) {
             // select optimal smoothing level for i-th component
             Eigen::Matrix<double, n_lambda, 1> opt_lambda;
@@ -99,7 +105,9 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
             }
             }
             // fit with optimal lambda
-            auto result = solve_(X, opt_lambda, V.col(i));
+            auto result = solve_(X, opt_lambda, V.col(i), tol_);
+            n_iter_.push_back(n_iter_last_);
+            converged_ = converged_ && converged_last_;
             for (int j = 0; j < n_lambda; ++j) { lambda_(i, j) = opt_lambda[j]; }
             // store results
             f_norm_[i] = std::sqrt(result.f.dot(smoother_->mass() * result.f));
@@ -122,55 +130,68 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     const std::vector<std::vector<double>>& objective_history() const { return objective_history_; }
     const std::vector<int>& iterations() const { return iterations_; }
     const std::vector<bool>& monotone() const { return monotone_; }
+    const std::vector<int>& n_iter() const { return n_iter_; }   // iterations of the final fit(s)
+    bool converged() const { return converged_; }                // whether the final fit(s) met the tolerance
    private:
-    // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f)
+    // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f). Stops when the relative gradient norm
+    // of the objective drops below tol; the objective J is recorded at each iteration, and flagged if it increases
     template <typename LambdaT, typename InitT>
         requires(internals::is_subscriptable<LambdaT, int>)
-    auto solve_(const matrix_t& X, const LambdaT& lambda, const InitT& f0) {
+    auto solve_(const matrix_t& X, const LambdaT& lambda, const InitT& f0, double tol) {
         // initialization
         vector_t fn = f0;
+        vector_t y = X * fn;
         vector_t s(n_units_);
-        double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
-        int n_iter = 0;
+        const double X_norm2 = X.squaredNorm();
+        double Jold = std::numeric_limits<double>::max();
         fit_result result;
         result.objective_history.reserve(max_iter_);
-        while (!almost_equal(Jnew, Jold, tol_) && n_iter < max_iter_) {
+        n_iter_last_ = 0;
+        converged_last_ = false;
+        while (n_iter_last_ < max_iter_) {
             // s = X * fn / \norm(X * fn)
-            s = X * fn;
-            s = s / s.norm();
+            s = y / y.norm();
             // f = \argmin_f \sum_i (y_i - f(p_i))^2 + \int_D (\Delta f)^2, with y = X^\top * s
             smoother_->update_response(X.transpose() * s);
             smoother_->fit(lambda);
-            // prepare for next iteration
-            n_iter++;
             fn = smoother_->Psi() * smoother_->f();
-            Jold = Jnew;
-            Jnew = (X - s * fn.transpose()).squaredNorm() + smoother_->ftPf(lambda);
+            y = X * fn;
+            n_iter_last_++;
+            // J = \norm{X - s * fn^\top}_F^2 + P_{\lambda}(f), expanded using \norm{s} = 1 and y = X * fn
+            double Jnew = X_norm2 - 2 * s.dot(y) + fn.squaredNorm() + smoother_->ftPf(lambda);
             result.objective_history.push_back(Jnew);
-            result.iterations = n_iter;
-            if (!std::isfinite(Jnew) ||
-                (n_iter > 1 && (Jnew - Jold) / (1.0 + std::abs(Jold)) > tol_)) {
+            if (!std::isfinite(Jnew) || (n_iter_last_ > 1 && (Jnew - Jold) / (1.0 + std::abs(Jold)) > tol)) {
                 result.monotone = false;
             }
+            Jold = Jnew;
+            // relative gradient norm of the objective (profiled in f) at s, i.e. the sine of the angle between s and y
+            if ((y - s * s.dot(y)).norm() <= tol * y.norm()) {
+                converged_last_ = true;
+                break;
+            }
         }
+        result.iterations = n_iter_last_;
         result.f = smoother_->f();
         result.s = std::move(s);
         return result;
     }
-    // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f) and returns the GCV index
+    // fits the rank-1 model at \lambda (on the, possibly deflated, data X) and returns the GCV approximation of its
+    // leave-one-location-out prediction error (up to the constant \norm{X}_F^2), with z = X^\top s:
+    //   CV(\lambda) = n_locs^2 \norm{z - \Psi f}^2 / (n_locs - Tr[S_\lambda])^2 - \norm{z}^2
+    // s depends on \lambda, hence the energy term -\norm{z}^2 cannot be dropped: without it, a large \lambda is
+    // rewarded for aligning s with a smooth low-energy direction (GCV collapse on later components)
     template <typename LambdaT, typename InitT>
         requires(internals::is_subscriptable<LambdaT, int>)
     double gcv_(const matrix_t& X, const LambdaT lambda, const InitT& f0) {
-        const auto result = solve_(X, lambda, f0);
-        // evaluate GCV index at convergence
+        const auto result = solve_(X, lambda, f0, std::max(tol_, internals::fpca_calibration_tol));
         std::array<double, n_lambda> lambda_vec;
         for (int i = 0; i < n_lambda; ++i) { lambda_vec[i] = lambda[i]; }
         if (edf_map_.find(lambda_vec) == edf_map_.end()) {   // cache Tr[S]
             edf_map_[lambda_vec] = smoother_->edf();
         }
-        int dor = n_locs_ - edf_map_.at(lambda_vec);
-        return (n_locs_ / std::pow(dor, 2)) *
-               ((smoother_->Psi() * result.f) - smoother_->response()).squaredNorm();
+        vector_t z = X.transpose() * result.s;
+        double m = n_locs_, dor = m - edf_map_.at(lambda_vec);
+        return m * m * (z - smoother_->Psi() * result.f).squaredNorm() / (dor * dor) - z.squaredNorm();
     }
     std::unordered_map<std::array<double, n_lambda>, double, internals::std_array_hash<double, n_lambda>> edf_map_;
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
@@ -184,8 +205,12 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     std::vector<bool> monotone_;
   
     // power iteration algorithm parameters
-    double tol_ = 1e-6;
-    int max_iter_ = 20;
+    double tol_ = 1e-8;     // on the relative gradient norm of the objective
+    int max_iter_ = 1000;
+    int n_iter_last_ = 0;   // iterations and convergence of the last call to solve_
+    bool converged_last_ = true;
+    std::vector<int> n_iter_;
+    bool converged_ = true;
 };
 
 template <typename VariationalSolver> class fpca_subspace_iteration_impl {
@@ -243,10 +268,14 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
         }
         }
         // fit with optimal lambda
-        const auto& [F, S] = solve_(X, rank, opt_lambda, V);
-	// store results
+        auto [F, S] = solve_(X, rank, opt_lambda, V, tol_);
+        n_iter_ = {n_iter_last_};
+        converged_ = converged_last_;
         for (int i = 0; i < rank; ++i) {
             for (int j = 0; j < n_lambda; ++j) { lambda_(i, j) = opt_lambda[j]; }
+        }
+	// store results
+        for (int i = 0; i < rank; ++i) {
             f_norm_[i] = std::sqrt(F.col(i).dot(smoother_->mass() * F.col(i)));   // L^2 norm
             f_.col(i) = F.col(i) / f_norm_[i];
 	    s_.col(i) = S.col(i) * f_norm_[i];
@@ -259,50 +288,58 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     const std::vector<double>& loadings_norm() const { return f_norm_; }
     const matrix_t& lambda() const { return lambda_; }
     const smoother_t* smoother() const { return smoother_; }
+    const std::vector<int>& n_iter() const { return n_iter_; }   // iterations of the final fit(s)
+    bool converged() const { return converged_; }                // whether the final fit(s) met the tolerance
   private:
     // finds matrices S, F minimizing \norm{X - S * F^\top}_F^2 + \sum_{i=1}^rank P_{\lambda_i}(f_i)
     template <typename LambdaT, typename InitT>
         requires(internals::is_subscriptable<LambdaT, int>)
-    auto solve_(const matrix_t& X, int rank, const LambdaT& lambda, const InitT& F0) {
+    auto solve_(const matrix_t& X, int rank, const LambdaT& lambda, const InitT& F0, double tol) {
         // initialization
         matrix_t Fn = F0;
 	matrix_t F(n_dofs_, rank);
         matrix_t S(n_units_, rank);
-        double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
-        int n_iter = 0;
-        while (!almost_equal(Jnew, Jold, tol_) && n_iter < max_iter_) {
-            // solve the orthogonal procrustes problem
-            // S = \argmin \| X - S * F^\top \|_F^2 subject to S^\top * S = I
-            S = X * Fn;
-	    svd_t svd(S, Eigen::ComputeThinU | Eigen::ComputeThinV);
+        matrix_t Y = X * Fn;
+        n_iter_last_ = 0;
+        converged_last_ = false;
+        while (n_iter_last_ < max_iter_) {
+            // S = left singular vectors of Y. Spans the same subspace as the orthogonal procrustes solution of
+            // \argmin \| X - S * F^\top \|_F^2 subject to S^\top * S = I, and converges to the principal directions,
+            // resolving the rotational ambiguity of the common-\lambda solution
+            svd_t svd(Y, Eigen::ComputeThinU);
             S = svd.matrixU();
             // f_j = \argmin_f \sum_i (y_i - f_j(p_i))^2 + \int_D (\Delta f_j)^2, with y = X^\top * S_j,
 	    // j = 1, ..., rank
-            double pen = 0;
             for (int j = 0; j < rank; ++j) {
                 smoother_->update_response(X.transpose() * S.col(j));
                 smoother_->fit(lambda);
 		F .col(j) = smoother_->f();
 		Fn.col(j) = smoother_->Psi() * smoother_->f();
-		pen = pen + smoother_->ftPf(lambda);
             }
-            // prepare for next iteration
-            n_iter++;
-            Jold = Jnew;
-            Jnew = (X - S * Fn.transpose()).squaredNorm() + pen;
+            Y = X * Fn;
+            n_iter_last_++;
+            // relative gradient norm of the objective (profiled in F) at S, on the Stiefel manifold (S^\top Y symmetric)
+            if ((Y - S * (S.transpose() * Y)).norm() <= tol * Y.norm()) {
+                converged_last_ = true;
+                break;
+            }
         }
         return std::make_pair(F, S);
     }
-    // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f) and returns the GCV index
+    // fits the rank-K model at \lambda and returns the GCV approximation of its leave-one-location-out prediction
+    // error (up to the constant \norm{X}_F^2), with Z = X^\top S:
+    //   CV(\lambda) = n_locs^2 \norm{Z - \Psi F}_F^2 / (n_locs - Tr[S_\lambda])^2 - \norm{Z}_F^2
+    // the energy term -\norm{Z}_F^2 depends on \lambda through S, and penalizes scores drifting toward low-energy
+    // directions. CV is invariant to rotations of (S, F)
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
     double gcv_(const matrix_t& X, int rank, const LambdaT lambda, const matrix_t F0) {
-        const auto& [F, S] = solve_(X, rank, lambda, F0);
-        // evaluate GCV index at convergence
-        int dor = n_locs_ - smoother_->edf(lambda);
-        return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
+        const auto& [F, S] = solve_(X, rank, lambda, F0, std::max(tol_, internals::fpca_calibration_tol));
+        matrix_t Z = X.transpose() * S;
+        double m = n_locs_, dor = m - smoother_->edf(lambda);
+        return m * m * (Z - smoother_->Psi() * F).squaredNorm() / (dor * dor) - Z.squaredNorm();
     }
-  
+
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
     smoother_t* smoother_;         // smoothing variational solver
     matrix_t f_;                   // PCs expansion coefficient vector
@@ -311,8 +348,290 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
     matrix_t lambda_;              // selected PCs smoothing level
 
     // subspace iteration algorithm parameters
-    double tol_ = 1e-6;
-    int max_iter_ = 20;
+    double tol_ = 1e-8;     // on the relative gradient norm of the objective
+    int max_iter_ = 1000;
+    int n_iter_last_ = 0;   // iterations and convergence of the last call to solve_
+    bool converged_last_ = true;
+    std::vector<int> n_iter_;
+    bool converged_ = true;
+};
+
+// subspace iteration with per-component smoothing level (\lambda_i) selection.
+// Behaves like fpca_subspace_iteration_impl but assigns an independent \lambda to each component.
+//
+// Calibration. The \lambda-vector minimizes the GCV approximation of the leave-one-location-out prediction error of the
+// rank-K fit (S, F) = (S(\lambda), F(\lambda)),
+//   CV(\lambda) = \sum_k [ n_locs^2 \norm{z_k - \Psi f_k}^2 / (n_locs - Tr[S_{\lambda_k}])^2 - \norm{z_k}^2 ] + \norm{X}_F^2,
+// with z_k = X^\top s_k. The energy terms -\norm{z_k}^2 penalize solutions whose scores drift toward
+// low-energy directions (as a weak component smoothed with a very large \lambda_k).
+// For fixed S (S^\top S = I) the energy terms are constant and CV is separable: \lambda_k only enters the
+// smoothing of z_k. The search exploits this:
+//  (0) start from the best common \lambda;
+//  (1) propose, for the current S, the per-component minimizers of the separable GCV
+//        GCV_k(\lambda) = n_locs * \norm{z_k - \Psi f_k(\lambda)}^2 / (n_locs - Tr[S_\lambda])^2;
+//  (2) re-estimate (S, F) at the proposal, and accept it only if CV decreases; otherwise try to move one
+//      component at a time. Stop when no move decreases CV.
+// CV decreases monotonically, so the result is never worse (in CV) than the best common \lambda.
+template <typename VariationalSolver> class fpca_subspace_experimental_impl {
+   private:
+    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
+    using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
+    struct level_t {        // operators at a smoothing level
+        matrix_t B, G;      // \Psi C^{-1} \Psi^\top X^\top and X B
+        double edf;         // Tr[S_\lambda]
+    };
+   public:
+    using smoother_t = std::decay_t<VariationalSolver>;
+    static constexpr int n_lambda = smoother_t::n_lambda;
+
+    fpca_subspace_experimental_impl() noexcept = default;
+    fpca_subspace_experimental_impl(VariationalSolver& smoother) noexcept :
+        smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()) { }
+    fpca_subspace_experimental_impl(VariationalSolver& smoother, int max_iter, double tol) noexcept :
+        smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()), max_iter_(max_iter), tol_(tol) { }
+
+    template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
+        fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
+        X_ = data.transpose();
+        n_locs_ = X_.cols(), n_units_ = X_.rows();
+        levels_.clear();
+        // first guess of the scores set to a multivariate PCA (SVD)
+        matrix_t S0;
+        if (flag & ComputeRandSVD) {
+            RSI<matrix_t> svd(X_, rank);
+            S0 = svd.matrixU();
+        } else {
+            Eigen::JacobiSVD<matrix_t> svd(X_, Eigen::ComputeThinU);
+            S0 = svd.matrixU().leftCols(rank);
+        }
+        // allocate memory
+        f_.resize(n_dofs_, rank);
+        s_.resize(n_units_, rank);
+        f_norm_.resize(rank);
+        lambda_.resize(rank, n_lambda);
+        const int n_points = static_cast<int>(lambda_grid.size()) / n_lambda;
+        // smoothing levels of a selection (one grid point index per component)
+        auto lambdas_of = [&](const std::vector<int>& sel) {
+            matrix_t lambdas(sel.size(), n_lambda);
+            for (std::size_t k = 0; k < sel.size(); ++k) {
+                for (int j = 0; j < n_lambda; ++j) { lambdas(k, j) = lambda_grid[sel[k] * n_lambda + j]; }
+            }
+            return lambdas;
+        };
+
+        int calibration = (flag & 0b11110);   // detect calibration strategy
+        matrix_t opt_lambdas(rank, n_lambda);   // selected \lambda, one row per component
+        switch (calibration) {
+        case 0: {   // no calibration: the single provided \lambda row is shared by all components
+            fdapde_assert(lambda_grid.size() == n_lambda);
+            opt_lambdas = lambdas_of(std::vector<int>(rank, 0));
+        } break;
+        case OptimizeGCV: {
+            const double m = n_locs_;
+            // fit at a selection, rotated to principal directions within groups sharing the same \lambda (as the
+            // common \lambda start, whose scores are then used to propose component-specific \lambdas), and its CV
+            // score (up to the constant \norm{X}_F^2)
+            struct fit_state {
+                std::vector<int> sel;
+                matrix_t S;
+                double cv = std::numeric_limits<double>::max();
+            };
+            auto evaluate = [&](const std::vector<int>& sel, const matrix_t& S_init) {
+                matrix_t lambdas = lambdas_of(sel);
+                fit_state state {sel, solve_(lambdas, S_init, std::max(tol_, internals::fpca_calibration_tol)), 0};
+                matrix_t Fn = loadings_(lambdas, state.S);
+                rotate_(lambdas, state.S, Fn);
+                for (int k = 0; k < rank; ++k) {
+                    vector_t z = X_.transpose() * state.S.col(k);
+                    double dor = m - level_(lambdas.row(k)).edf;
+                    state.cv += m * m * (z - Fn.col(k)).squaredNorm() / (dor * dor) - z.squaredNorm();
+                }
+                return state;
+            };
+            // (0) best common \lambda
+            fit_state best;
+            for (int g = 0; g < n_points; ++g) {
+                fit_state state = evaluate(std::vector<int>(rank, g), S0);
+                if (state.cv < best.cv) { best = std::move(state); }
+            }
+            const int max_rounds = 10;
+            for (int round = 0; round < max_rounds; ++round) {
+                // (1) separable proposal for the current scores
+                matrix_t Z = X_.transpose() * best.S;
+                std::vector<int> proposal(rank, 0);
+                std::vector<double> gcv_min(rank, std::numeric_limits<double>::max());
+                for (int g = 0; g < n_points; ++g) {
+                    const level_t& level = level_(lambdas_of(std::vector<int>(1, g)).row(0));
+                    double dor = m - level.edf;
+                    for (int k = 0; k < rank; ++k) {
+                        double gcv = m * (Z.col(k) - level.B * best.S.col(k)).squaredNorm() / (dor * dor);
+                        if (gcv < gcv_min[k]) {
+                            gcv_min[k] = gcv;
+                            proposal[k] = g;
+                        }
+                    }
+                }
+                if (proposal == best.sel) { break; }
+                // (2) accept the proposal only if CV decreases at the re-estimated (S, F)
+                fit_state state = evaluate(proposal, best.S);
+                if (state.cv < best.cv) {
+                    best = std::move(state);
+                    continue;
+                }
+                // otherwise, move the single component that decreases CV the most
+                fit_state best_move;
+                for (int k = 0; k < rank; ++k) {
+                    if (proposal[k] == best.sel[k]) { continue; }
+                    std::vector<int> sel = best.sel;
+                    sel[k] = proposal[k];
+                    fit_state move = evaluate(sel, best.S);
+                    if (move.cv < best_move.cv) { best_move = std::move(move); }
+                }
+                if (best_move.cv >= best.cv) { break; }
+                best = std::move(best_move);
+            }
+            opt_lambdas = lambdas_of(best.sel);
+            S0 = best.S;
+        } break;
+        case OptimizeMSRE: {
+        } break;
+        default: {
+            throw std::runtime_error("Unrecognized calibration option.");
+        }
+        }
+        // fit with optimal lambda (warm-started from the selected fit, or from the SVD guess)
+        matrix_t S = solve_(opt_lambdas, S0, tol_);
+        n_iter_ = {n_iter_last_};
+        converged_ = converged_last_;
+        matrix_t Fn = loadings_(opt_lambdas, S);
+        rotate_(opt_lambdas, S, Fn);
+        // expansion coefficients of the loadings: f_k = C_{\lambda_k}^{-1} \Psi^\top X^\top s_k
+        matrix_t F(n_dofs_, rank);
+        for (int k = 0; k < rank; ++k) {
+            smoother_->update_response(X_.transpose() * S.col(k));
+            smoother_->fit(opt_lambdas.row(k));
+            F.col(k) = smoother_->f();
+        }
+        // store results
+        lambda_ = opt_lambdas;
+        for (int i = 0; i < rank; ++i) {
+            f_norm_[i] = std::sqrt(F.col(i).dot(smoother_->mass() * F.col(i)));   // L^2 norm
+            f_.col(i) = F.col(i) / f_norm_[i];
+            s_.col(i) = S.col(i) * f_norm_[i];
+        }
+        levels_.clear();   // release memory
+        return std::tie(f_, s_);
+    }
+    // observers
+    const matrix_t& scores() const { return s_; }
+    const matrix_t& loading() const { return f_; }
+    const std::vector<double>& loadings_norm() const { return f_norm_; }
+    const matrix_t& lambda() const { return lambda_; }
+    const smoother_t* smoother() const { return smoother_; }
+    const std::vector<int>& n_iter() const { return n_iter_; }   // iterations of the final fit(s)
+    bool converged() const { return converged_; }                // whether the final fit(s) met the tolerance
+   private:
+    // operators at smoothing level lambda (computed on first use: one factorization and n_units solves)
+    template <typename LambdaT> const level_t& level_(const LambdaT& lambda) {
+        std::array<double, n_lambda> key;
+        for (int j = 0; j < n_lambda; ++j) { key[j] = lambda(0, j); }
+        auto it = levels_.find(key);
+        if (it != levels_.end()) { return it->second; }
+        matrix_t lambda_row = lambda;
+        level_t level;
+        level.B.resize(n_locs_, n_units_);
+        for (int i = 0; i < n_units_; ++i) {
+            smoother_->update_response(X_.row(i).transpose());
+            smoother_->fit(lambda_row.row(0));
+            level.B.col(i) = smoother_->Psi() * smoother_->f();
+        }
+        level.G = X_ * level.B;
+        level.edf = smoother_->edf(lambda_row.row(0));   // system already factorized at lambda
+        return levels_.emplace(key, std::move(level)).first->second;
+    }
+    // loadings at locations fitted to the scores: \Psi f_k = B_{\lambda_k} s_k
+    matrix_t loadings_(const matrix_t& lambdas, const matrix_t& S) {
+        matrix_t Fn(n_locs_, S.cols());
+        for (int k = 0; k < S.cols(); ++k) { Fn.col(k) = level_(lambdas.row(k)).B * S.col(k); }
+        return Fn;
+    }
+    // components sharing the same \lambda are identified only up to a rotation. Each such group is rotated so that its
+    // block of M = S^\top X \Psi F (symmetric at convergence) is diagonal, with decreasing diagonal (Rayleigh-Ritz step)
+    void rotate_(const matrix_t& lambdas, matrix_t& S, matrix_t& Fn) {
+        const int rank = S.cols();
+        matrix_t M = S.transpose() * X_ * Fn;
+        std::vector<bool> done(rank, false);
+        for (int i = 0; i < rank; ++i) {
+            if (done[i]) { continue; }
+            std::vector<int> group;
+            for (int j = i; j < rank; ++j) {
+                if (!done[j] && lambdas.row(j) == lambdas.row(i)) {
+                    group.push_back(j);
+                    done[j] = true;
+                }
+            }
+            const int g = group.size();
+            if (g == 1) { continue; }
+            matrix_t Mg(g, g), Sg(S.rows(), g), Fg(Fn.rows(), g);
+            for (int a = 0; a < g; ++a) {
+                for (int b = 0; b < g; ++b) { Mg(a, b) = 0.5 * (M(group[a], group[b]) + M(group[b], group[a])); }
+                Sg.col(a) = S.col(group[a]);
+                Fg.col(a) = Fn.col(group[a]);
+            }
+            Eigen::SelfAdjointEigenSolver<matrix_t> eig(Mg);
+            matrix_t Q = eig.eigenvectors().rowwise().reverse();   // decreasing eigenvalues
+            Sg = Sg * Q;
+            Fg = Fg * Q;
+            for (int a = 0; a < g; ++a) {
+                S.col(group[a]) = Sg.col(a);
+                Fn.col(group[a]) = Fg.col(a);
+            }
+        }
+    }
+    // finds the scores S minimizing \norm{X - S * F^\top}_F^2 + \sum_{j=1}^rank P_{\lambda_j}(f_j) (F profiled out),
+    // with an independent \lambda_j (row j of lambdas) for every component
+    matrix_t solve_(const matrix_t& lambdas, const matrix_t& S0, double tol) {
+        const int rank = S0.cols();
+        std::vector<const matrix_t*> G(rank);
+        for (int k = 0; k < rank; ++k) { G[k] = &level_(lambdas.row(k)).G; }
+        matrix_t S = S0, Y(n_units_, rank);
+        n_iter_last_ = 0;
+        converged_last_ = false;
+        while (true) {
+            for (int k = 0; k < rank; ++k) { Y.col(k) = (*G[k]) * S.col(k); }   // X \Psi f_k, with f_k fitted to s_k
+            // relative gradient norm of the objective (profiled in F) at S, on the Stiefel manifold
+            matrix_t SY = S.transpose() * Y;
+            if ((Y - S * (0.5 * (SY + SY.transpose()))).norm() <= tol * Y.norm()) {
+                converged_last_ = true;
+                break;
+            }
+            if (n_iter_last_ == max_iter_) { break; }
+            // S = \argmin \| X - S * F^\top \|_F^2 subject to S^\top * S = I (orthogonal procrustes problem): S = U * V^\top,
+            // being Y = U \Sigma V^\top the thin SVD of Y
+            Eigen::JacobiSVD<matrix_t> svd(Y, Eigen::ComputeThinU | Eigen::ComputeThinV);
+            S = svd.matrixU() * svd.matrixV().transpose();
+            n_iter_last_++;
+        }
+        return S;
+    }
+    using key_t = std::array<double, n_lambda>;
+    std::unordered_map<key_t, level_t, internals::std_array_hash<double, n_lambda>> levels_;
+    matrix_t X_;                   // data (n_units x n_locs)
+    int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
+    smoother_t* smoother_;         // smoothing variational solver
+    matrix_t f_;                   // PCs expansion coefficient vector
+    matrix_t s_;                   // PCs scores
+    std::vector<double> f_norm_;   // L^2 norm of estimated PCs
+    matrix_t lambda_;              // selected PCs smoothing level (one row per component)
+
+    // subspace iteration algorithm parameters: iterations are cheap (n_units x n_units products), while the relative
+    // rotation of components with distinct \lambda converges slowly, hence the larger default iteration budget
+    double tol_ = 1e-8;     // on the relative gradient norm of the objective
+    int max_iter_ = 20000;
+    int n_iter_last_ = 0;   // iterations and convergence of the last call to solve_
+    bool converged_last_ = true;
+    std::vector<int> n_iter_;
+    bool converged_ = true;
 };
 
 // direct fPCA
@@ -406,9 +725,12 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     double gcv_(const matrix_t& X, int rank, const LambdaT lambda, int flag) {
         const auto& [F, S] = solve_(X, rank, lambda, flag);
-        // evaluate GCV index at convergence (note that Tr[S] = \|D^(-1)\|_F^2)
-        int dor = n_locs_ - invD_.squaredNorm();
-        return (n_locs_ / std::pow(dor, 2)) * (X.transpose() * S - (smoother_->Psi() * F)).squaredNorm();
+        // GCV approximation of the leave-one-location-out prediction error (up to \norm{X}_F^2), as in the subspace
+        // solver. Tr[S] = Tr[\Psi C^{-1} \Psi^\top] = \|\Psi D^{-\top}\|_F^2, with C = D D^\top (\|D^{-1}\|_F^2 = Tr[C^{-1}]
+        // only when \Psi = I, and diverges when \Psi^\top \Psi is rank deficient)
+        matrix_t Z = X.transpose() * S;
+        double m = n_locs_, dor = m - (smoother_->Psi() * invD_.transpose()).squaredNorm();
+        return m * m * (Z - smoother_->Psi() * F).squaredNorm() / (dor * dor) - Z.squaredNorm();
     }
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
     matrix_t invD_;                // inverse of the cholesky factor of \Psi^\top * \Psi + P_{\lambda}
@@ -522,7 +844,7 @@ template <typename fPCASolver> class fpca_na_impl {
 class fpca_power_solver {
     template <typename Smoother> using impl_t = internals::fpca_power_iteration_impl<Smoother>;
    public:
-    fpca_power_solver() noexcept : max_iter_(20), tol_(1e-6) { }
+    fpca_power_solver() noexcept : max_iter_(1000), tol_(1e-8) { }
     fpca_power_solver(int max_iter, double tol) noexcept : max_iter_(max_iter), tol_(tol) { }
     template <typename Solver> [[nodiscard]] auto get(Solver&& solver) const {
         return impl_t<Solver>(solver, max_iter_, tol_);
@@ -534,8 +856,20 @@ class fpca_power_solver {
 class fpca_subspace_solver {
     template <typename Smoother> using impl_t = internals::fpca_subspace_iteration_impl<Smoother>;
    public:
-    fpca_subspace_solver() noexcept : max_iter_(20), tol_(1e-6) { }
+    fpca_subspace_solver() noexcept : max_iter_(1000), tol_(1e-8) { }
     fpca_subspace_solver(int max_iter, double tol) noexcept : max_iter_(max_iter), tol_(tol) { }
+    template <typename Solver> [[nodiscard]] auto get(Solver&& solver) const {
+        return impl_t<Solver>(solver, max_iter_, tol_);
+    }
+   private:
+    int max_iter_;
+    double tol_;
+};
+class fpca_subspace_experimental_solver {
+    template <typename Smoother> using impl_t = internals::fpca_subspace_experimental_impl<Smoother>;
+   public:
+    fpca_subspace_experimental_solver() noexcept : max_iter_(20000), tol_(1e-8) { }
+    fpca_subspace_experimental_solver(int max_iter, double tol) noexcept : max_iter_(max_iter), tol_(tol) { }
     template <typename Solver> [[nodiscard]] auto get(Solver&& solver) const {
         return impl_t<Solver>(solver, max_iter_, tol_);
     }
@@ -629,6 +963,13 @@ template <typename VariationalSolver> class fPCA {
             iterations_.assign(rank, 0);
             monotone_.assign(rank, true);
         }
+        // convergence of the iterative solvers (the direct solver is exact)
+        if constexpr (requires { solver_.converged(); }) {
+            if (!has_nan_) {
+                n_iter_ = solver_.n_iter();
+                converged_ = solver_.converged();
+            }
+        }
         return std::tie(f_, s_);
     }
     // observers
@@ -640,6 +981,8 @@ template <typename VariationalSolver> class fPCA {
     const std::vector<std::vector<double>>& objective_history() const { return objective_history_; }
     const std::vector<int>& iterations() const { return iterations_; }
     const std::vector<bool>& monotone() const { return monotone_; }
+    const std::vector<int>& n_iter() const { return n_iter_; }
+    bool converged() const { return converged_; }
    private:
     matrix_t data_;         // mapped geoframe data
     smoother_t smoother_;   // variational solver used in the smoothing step
@@ -653,6 +996,8 @@ template <typename VariationalSolver> class fPCA {
     std::vector<std::vector<double>> objective_history_;
     std::vector<int> iterations_;
     std::vector<bool> monotone_;
+    std::vector<int> n_iter_;      // iterations of the final fit(s) of iterative solvers
+    bool converged_ = true;
 };
 
 // deduction guide
