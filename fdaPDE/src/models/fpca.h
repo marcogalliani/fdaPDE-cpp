@@ -639,6 +639,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
    private:
     using vector_t = Eigen::Matrix<double, Dynamic, 1>;
     using matrix_t = Eigen::Matrix<double, Dynamic, Dynamic>;
+    using sparse_matrix_t = Eigen::SparseMatrix<double>;
    public:
     using smoother_t = std::decay_t<VariationalSolver>;
     static constexpr int n_lambda = smoother_t::n_lambda;
@@ -646,6 +647,8 @@ template <typename VariationalSolver> class fpca_direct_impl {
     fpca_direct_impl() noexcept = default;
     fpca_direct_impl(VariationalSolver& smoother) noexcept :
         smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()) { }
+    fpca_direct_impl(VariationalSolver& smoother, bool lumped_mass) noexcept :
+        smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()), lumped_mass_(lumped_mass) { }
 
     template <typename DataT> auto fit(const DataT& data, int rank, const std::vector<double>& lambda_grid, int flag) {
         fdapde_assert(lambda_grid.size() > 0 && lambda_grid.size() % n_lambda == 0);
@@ -699,10 +702,22 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, int rank, const LambdaT& lambda, int flag) {
         for (int i = 0; i < lambda.size(); ++i) { fdapde_assert(lambda[i] > 0); }
-        matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_->P(lambda);
-        // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
-        Eigen::LLT<matrix_t> chol(C);
-        invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_));
+        // given the cholesky decomposition of C = \Psi^\top * \Psi + P_{\lambda} as C = D * D^\top, compute D^{-1}
+        if (lumped_mass_) {
+            // P_{\lambda} = \lambda * R1^\top * R0^{-1} * R1 with R0 replaced by its lumped (diagonal) version: C stays
+            // sparse and is factorized as P * C * P^\top = L * L^\top, so that D = P^\top * L and D^{-1} = L^{-1} * P
+            fdapde_assert(n_lambda == 1);
+            vector_t inv_lumped_mass = lump(smoother_->mass()).diagonal().cwiseInverse();
+            sparse_matrix_t C = smoother_->Psi().transpose() * smoother_->Psi();
+            C += lambda[0] * sparse_matrix_t(smoother_->stiff().transpose() * inv_lumped_mass.asDiagonal() * smoother_->stiff());
+            Eigen::SimplicialLLT<sparse_matrix_t> chol(C);
+            fdapde_assert(chol.info() == Eigen::Success);
+            invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_)) * chol.permutationP();
+        } else {
+            matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_->P(lambda);
+            Eigen::LLT<matrix_t> chol(C);
+            invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_));
+        }
         // compute SVD of X * \Psi * (D^{-1})^\top
         matrix_t V, s;
 	vector_t singularValues;
@@ -734,6 +749,7 @@ template <typename VariationalSolver> class fpca_direct_impl {
     }
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
     matrix_t invD_;                // inverse of the cholesky factor of \Psi^\top * \Psi + P_{\lambda}
+    bool lumped_mass_ = false;     // approximate R0 by its lumped version in P_{\lambda}
     smoother_t* smoother_;         // smoothing variational solver
     matrix_t f_;                   // PCs expansion coefficient vector
     matrix_t s_;                   // PCs scores
@@ -881,7 +897,12 @@ class fpca_direct_solver {
     template <typename Smoother> using impl_t = internals::fpca_direct_impl<Smoother>;
    public:
     fpca_direct_solver() noexcept = default;
-    template <typename Smoother> [[nodiscard]] auto get(Smoother&& solver) const { return impl_t<Smoother>(solver); }
+    explicit fpca_direct_solver(bool lumped_mass) noexcept : lumped_mass_(lumped_mass) { }
+    template <typename Smoother> [[nodiscard]] auto get(Smoother&& solver) const {
+        return impl_t<Smoother>(solver, lumped_mass_);
+    }
+   private:
+    bool lumped_mass_ = false;
 };
   
 template <typename VariationalSolver> class fPCA {
