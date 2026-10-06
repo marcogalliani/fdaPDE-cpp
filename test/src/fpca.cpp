@@ -275,3 +275,38 @@ TEST(fpca, reconstruction_recovers_signal) {
         EXPECT_LT(rel, 0.5);
     }
 }
+
+// direct solver with lumped mass matrix: same components as the dense version, at a fraction of the cost
+TEST(fpca, direct_lumped_matches_dense) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    std::vector<double> lambda {1e-3};
+
+    auto dense  = run_fpca(D, Y, 3, lambda, fpca_direct_solver());
+    auto lumped = run_fpca(D, Y, 3, lambda, fpca_direct_solver(/* lumped_mass = */ true));
+    // the lumping error grows with the frequency of the component and decreases with the mesh size: on this mesh
+    // 1 - |cos| is about 4e-4 for the third (highest frequency) component
+    for (int k = 0; k < 3; ++k) {
+        double cos = std::abs(dense.Fn.col(k).normalized().dot(lumped.Fn.col(k).normalized()));
+        EXPECT_GT(cos, 0.999);
+    }
+    double err_dense  = (signal - dense.Fn * dense.S.transpose()).squaredNorm() / signal.squaredNorm();
+    double err_lumped = (signal - lumped.Fn * lumped.S.transpose()).squaredNorm() / signal.squaredNorm();
+    EXPECT_LT(err_lumped, 1.1 * err_dense);
+}
+
+// GCV calibration of the lumped direct solver selects a smoothing level on the grid and recovers the signal
+TEST(fpca, direct_lumped_gcv) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    std::vector<double> grid = log_grid(-6, -1, 1);
+
+    auto fit = run_fpca(D, Y, 3, grid, fpca_direct_solver(/* lumped_mass = */ true));
+    for (double l : selected_lambdas(fit.lambda)) {
+        EXPECT_TRUE(std::find(grid.begin(), grid.end(), l) != grid.end());
+    }
+    matrix_t Yhat = fit.Fn * fit.S.transpose();
+    EXPECT_LT((signal - Yhat).squaredNorm() / signal.squaredNorm(), 0.05);
+}
