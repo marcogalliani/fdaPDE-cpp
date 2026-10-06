@@ -25,6 +25,8 @@
 #include "solvers.h"
 #include "src/models/fpca.h"
 #include "src/models/fpls.h"
+#include "src/models/fsvt.h"
+#include "src/models/fr.h"
 
 // clang-format on
 
