@@ -275,3 +275,105 @@ TEST(fpca, reconstruction_recovers_signal) {
         EXPECT_LT(rel, 0.5);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// k-fold cross-validation over the units (OptimizeMSRE) on complete data
+// ---------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+// fits a simple-Laplacian-penalized fPCA with an explicit calibration flag and returns the extracted quantities
+template <typename Policy>
+fpca_fit run_fpca_flag(Triangulation<2, 2>& D, const matrix_t& Y, int rank, const std::vector<double>& grid, int flag,
+                       Policy policy) {
+    FeSpace Vh(D, P1<1>);
+    TrialFunction f(Vh);
+    TestFunction  v(Vh);
+    auto a = integral(D)(dot(grad(f), grad(v)));
+    ZeroField<2> u;
+    auto L = integral(D)(u * v);
+    GeoFrame data(D);
+    auto& layer = data.template insert_scalar_layer<POINT>("layer", MESH_NODES);
+    layer.load_blk("y", Y);
+    fPCA<internals::fe_ls_elliptic> model;
+    model.discretize(fe_ls_elliptic{a, L}.get());
+    model.analyze_data("y", data);
+    model.fit(rank, grid, flag, policy);
+    return fpca_fit{model.lambda(), model.S(), model.F(), model.Fn()};
+}
+
+double signal_error(const fpca_fit& fit, const matrix_t& signal) {
+    matrix_t Yhat = fit.Fn * fit.S.transpose();
+    return (signal - Yhat).squaredNorm() / signal.squaredNorm();
+}
+
+}   // namespace
+
+// the units are dealt to the folds at random but evenly: every unit in exactly one fold, sizes differing by at most one
+TEST(fpca, kcv_folds_are_balanced) {
+    std::vector<int> fold = internals::fpca_kcv_assign_folds(53, 10, internals::fpca_kcv_seed);
+    std::vector<int> size(10, 0);
+    for (int f : fold) {
+        ASSERT_TRUE(f >= 0 && f < 10);
+        size[f]++;
+    }
+    EXPECT_EQ(*std::min_element(size.begin(), size.end()), 5);
+    EXPECT_EQ(*std::max_element(size.begin(), size.end()), 6);
+}
+
+// power solver: k-fold cross-validation selects one level per component on the grid, away from the over-smoothing
+// end, and recovers the signal (measured error 0.0026, GCV 0.0031)
+TEST(fpca, kcv_power_selects_per_component) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    std::vector<double> grid = log_grid(-4, 2, 0.5);
+
+    auto fit = run_fpca_flag(D, Y, 3, grid, ComputeXactSVD | OptimizeMSRE, fpca_power_solver {});
+    for (double l : selected_lambdas(fit.lambda)) {
+        EXPECT_TRUE(std::find(grid.begin(), grid.end(), l) != grid.end());
+        EXPECT_LT(l, grid.back());
+    }
+    EXPECT_LT(signal_error(fit, signal), 0.01);
+}
+
+// direct solver: k-fold cross-validation of the rank-K fit (measured error 0.0028, same level as GCV)
+TEST(fpca, kcv_direct_recovers_signal) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    std::vector<double> grid = log_grid(-4, 2, 0.5);
+
+    auto fit = run_fpca_flag(D, Y, 3, grid, ComputeXactSVD | OptimizeMSRE, fpca_direct_solver {});
+    for (double l : selected_lambdas(fit.lambda)) {
+        EXPECT_TRUE(std::find(grid.begin(), grid.end(), l) != grid.end());
+        EXPECT_LT(l, grid.back());
+    }
+    EXPECT_LT(signal_error(fit, signal), 0.01);
+}
+
+// the folds use a fixed seed: the selection is reproducible
+TEST(fpca, kcv_is_reproducible) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    std::vector<double> grid = log_grid(-4, 2, 0.5);
+
+    auto fit1 = run_fpca_flag(D, Y, 3, grid, ComputeXactSVD | OptimizeMSRE, fpca_power_solver {});
+    auto fit2 = run_fpca_flag(D, Y, 3, grid, ComputeXactSVD | OptimizeMSRE, fpca_power_solver {});
+    EXPECT_EQ(fit1.lambda, fit2.lambda);
+}
+
+// the subspace solvers do not implement it on complete data: an explicit error instead of an unset smoothing level
+TEST(fpca, kcv_subspace_not_available) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    std::vector<double> grid = log_grid(-4, 2, 0.5);
+
+    EXPECT_THROW(
+      run_fpca_flag(D, Y, 3, grid, ComputeXactSVD | OptimizeMSRE, fpca_subspace_solver {}), std::runtime_error);
+    EXPECT_THROW(
+      run_fpca_flag(D, Y, 3, grid, ComputeXactSVD | OptimizeMSRE, fpca_subspace_experimental_solver {}),
+      std::runtime_error);
+}
