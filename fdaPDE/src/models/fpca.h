@@ -17,6 +17,10 @@
 #ifndef __FPCA_H__
 #define __FPCA_H__
 
+#include <numeric>
+#include <optional>
+#include <random>
+
 #include "header_check.h"
 
 namespace fdapde {
@@ -34,6 +38,33 @@ namespace internals {
 // the fits used to evaluate the GCV index only need to rank the candidate smoothing levels: they are solved at a
 // looser tolerance, while the final fit at the selected smoothing levels uses the solver tolerance
 [[maybe_unused]] constexpr double fpca_calibration_tol = 1e-5;
+
+// k-fold cross-validation over the statistical units (OptimizeMSRE on complete data): number of folds and the fixed
+// seed of the random assignment of the units to the folds, so that the selection is reproducible
+[[maybe_unused]] constexpr int fpca_kcv_folds = 10;
+[[maybe_unused]] constexpr unsigned fpca_kcv_seed = 476813;
+
+// assigns each of n units to one of K folds, at random and as evenly as possible (fold sizes differ by at most one)
+inline std::vector<int> fpca_kcv_assign_folds(int n, int K, unsigned seed) {
+    fdapde_assert(K >= 2 && n >= K);
+    std::vector<int> perm(n);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::shuffle(perm.begin(), perm.end(), std::mt19937(seed));
+    std::vector<int> fold(n);
+    for (int i = 0; i < n; ++i) { fold[perm[i]] = i % K; }
+    return fold;
+}
+// rows of X whose fold is (test = true) or is not (test = false) k
+template <typename MatrixT>
+Eigen::Matrix<double, Dynamic, Dynamic> fpca_kcv_rows(const MatrixT& X, const std::vector<int>& fold, int k, bool test) {
+    int n = 0;
+    for (int f : fold) { n += (f == k) == test; }
+    Eigen::Matrix<double, Dynamic, Dynamic> rows(n, X.cols());
+    for (int i = 0, j = 0; i < X.rows(); ++i) {
+        if ((fold[i] == k) == test) { rows.row(j++) = X.row(i); }
+    }
+    return rows;
+}
 
 // power iteration based fPCA
 // finds vectors s, f minimizing \norm{X - s * f^\top}_F^2 + P_{\lambda}(f)
@@ -98,7 +129,12 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
                 auto opt_ = optimizer.optimize(gcv_functor, lambda_grid);
                 for (int i = 0; i < n_lambda; ++i) { opt_lambda[i] = opt_[i]; }
             } break;
-            case OptimizeMSRE: {
+            case OptimizeMSRE: {   // k-fold cross-validation over the units, on the (deflated) data
+                if (i == 0) { kcv_fold_ = fpca_kcv_assign_folds(n_units_, fpca_kcv_folds, fpca_kcv_seed); }
+                auto kcv_functor = [&](auto lambda) { return kcv_(X, lambda, V.col(i)); };
+                GridSearch<n_lambda> optimizer;
+                auto opt_ = optimizer.optimize(kcv_functor, lambda_grid);
+                for (int i = 0; i < n_lambda; ++i) { opt_lambda[i] = opt_[i]; }
             } break;
             default: {
                 throw std::runtime_error("Unrecognized calibration option.");
@@ -193,6 +229,23 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
         double m = n_locs_, dor = m - edf_map_.at(lambda_vec);
         return m * m * (z - smoother_->Psi() * result.f).squaredNorm() / (dor * dor) - z.squaredNorm();
     }
+    // k-fold cross-validation error of the rank-1 model at \lambda: fitted on the training units, each test unit x is
+    // reconstructed by its penalized least-squares score on the fitted component, s = x^\top fn / (\norm{fn}^2 +
+    // f^\top P_{\lambda} f), and the error is the mean squared reconstruction error over the test units
+    template <typename LambdaT, typename InitT>
+        requires(internals::is_subscriptable<LambdaT, int>)
+    double kcv_(const matrix_t& X, const LambdaT lambda, const InitT& f0) {
+        double err = 0;
+        for (int k = 0; k < fpca_kcv_folds; ++k) {
+            matrix_t X_train = fpca_kcv_rows(X, kcv_fold_, k, false);
+            matrix_t X_test = fpca_kcv_rows(X, kcv_fold_, k, true);
+            const auto result = solve_(X_train, lambda, f0, std::max(tol_, internals::fpca_calibration_tol));
+            vector_t fn = smoother_->Psi() * result.f;
+            double J = fn.squaredNorm() + smoother_->ftPf(lambda);
+            err += (X_test - (X_test * fn / J) * fn.transpose()).squaredNorm() / X_test.size();
+        }
+        return err / fpca_kcv_folds;
+    }
     std::unordered_map<std::array<double, n_lambda>, double, internals::std_array_hash<double, n_lambda>> edf_map_;
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
     smoother_t* smoother_;         // smoothing variational solver
@@ -211,6 +264,7 @@ template <typename VariationalSolver> class fpca_power_iteration_impl {
     bool converged_last_ = true;
     std::vector<int> n_iter_;
     bool converged_ = true;
+    std::vector<int> kcv_fold_;   // fold of each unit, for k-fold cross-validation
 };
 
 template <typename VariationalSolver> class fpca_subspace_iteration_impl {
@@ -262,6 +316,9 @@ template <typename VariationalSolver> class fpca_subspace_iteration_impl {
             for (int i = 0; i < n_lambda; ++i) { opt_lambda[i] = opt_[i]; }
         } break;
         case OptimizeMSRE: {
+            throw std::runtime_error(
+              "OptimizeMSRE (k-fold cross-validation) is not available for the subspace solvers on complete data: use "
+              "OptimizeGCV, fpca_power_solver or fpca_direct_solver.");
         } break;
         default: {
             throw std::runtime_error("Unrecognized calibration option.");
@@ -494,6 +551,9 @@ template <typename VariationalSolver> class fpca_subspace_experimental_impl {
             S0 = best.S;
         } break;
         case OptimizeMSRE: {
+            throw std::runtime_error(
+              "OptimizeMSRE (k-fold cross-validation) is not available for the subspace solvers on complete data: use "
+              "OptimizeGCV, fpca_power_solver or fpca_direct_solver.");
         } break;
         default: {
             throw std::runtime_error("Unrecognized calibration option.");
@@ -670,7 +730,12 @@ template <typename VariationalSolver> class fpca_direct_impl {
             auto opt_ = optimizer.optimize(gcv_functor, lambda_grid);
             for (int i = 0; i < n_lambda; ++i) { opt_lambda[i] = opt_[i]; }
         } break;
-        case OptimizeMSRE: {
+        case OptimizeMSRE: {   // k-fold cross-validation over the units
+            kcv_fold_ = fpca_kcv_assign_folds(n_units_, fpca_kcv_folds, fpca_kcv_seed);
+            auto kcv_functor = [&](auto lambda) { return kcv_(X, rank, lambda, flag); };
+            GridSearch<n_lambda> optimizer;
+            auto opt_ = optimizer.optimize(kcv_functor, lambda_grid);
+            for (int i = 0; i < n_lambda; ++i) { opt_lambda[i] = opt_[i]; }
         } break;
         default: {
             throw std::runtime_error("Unrecognized calibration option.");
@@ -699,10 +764,17 @@ template <typename VariationalSolver> class fpca_direct_impl {
         requires(internals::is_subscriptable<LambdaT, int>)
     auto solve_(const matrix_t& X, int rank, const LambdaT& lambda, int flag) {
         for (int i = 0; i < lambda.size(); ++i) { fdapde_assert(lambda[i] > 0); }
-        matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_->P(lambda);
-        // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
-        Eigen::LLT<matrix_t> chol(C);
-        invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_));
+        // C depends only on \lambda: refactorize only when \lambda changes (k-fold cross-validation fits each fold
+        // at the same \lambda)
+        std::array<double, n_lambda> lambda_vec;
+        for (int i = 0; i < n_lambda; ++i) { lambda_vec[i] = lambda[i]; }
+        if (!invD_lambda_.has_value() || *invD_lambda_ != lambda_vec) {
+            matrix_t C = smoother_->Psi().transpose() * smoother_->Psi() + smoother_->P(lambda);
+            // given the cholesky decomposition of C as C = D * D^\top, compute D^{-1}
+            Eigen::LLT<matrix_t> chol(C);
+            invD_ = chol.matrixL().solve(matrix_t::Identity(n_dofs_, n_dofs_));
+            invD_lambda_ = lambda_vec;
+        }
         // compute SVD of X * \Psi * (D^{-1})^\top
         matrix_t V, s;
 	vector_t singularValues;
@@ -732,8 +804,29 @@ template <typename VariationalSolver> class fpca_direct_impl {
         double m = n_locs_, dor = m - (smoother_->Psi() * invD_.transpose()).squaredNorm();
         return m * m * (Z - smoother_->Psi() * F).squaredNorm() / (dor * dor) - Z.squaredNorm();
     }
+    // k-fold cross-validation error of the rank-K fit at \lambda: fitted on the training units, the test units are
+    // reconstructed by their projection X_test * \Psi L * (\Psi L)^\top, with L = D^{-\top} V_K the regularized
+    // right singular vectors of the training fit; the error is the mean squared reconstruction error. Since
+    // F = L \Sigma and S = U, \Sigma^2 = diag(S^\top X_train \Psi F) and \Psi L = \Psi F \Sigma^{-1}
+    template <typename LambdaT>
+        requires(internals::is_subscriptable<LambdaT, int>)
+    double kcv_(const matrix_t& X, int rank, const LambdaT lambda, int flag) {
+        double err = 0;
+        for (int k = 0; k < fpca_kcv_folds; ++k) {
+            matrix_t X_train = fpca_kcv_rows(X, kcv_fold_, k, false);
+            matrix_t X_test = fpca_kcv_rows(X, kcv_fold_, k, true);
+            const auto& [F, S] = solve_(X_train, rank, lambda, flag);
+            matrix_t PsiL = smoother_->Psi() * F;
+            vector_t sigma = (S.transpose() * X_train * PsiL).diagonal().cwiseSqrt();
+            PsiL = PsiL * sigma.cwiseInverse().asDiagonal();
+            err += (X_test - X_test * PsiL * PsiL.transpose()).squaredNorm() / X_test.size();
+        }
+        return err / fpca_kcv_folds;
+    }
     int n_locs_ = 0, n_units_ = 0, n_dofs_ = 0;
+    std::vector<int> kcv_fold_;    // fold of each unit, for k-fold cross-validation
     matrix_t invD_;                // inverse of the cholesky factor of \Psi^\top * \Psi + P_{\lambda}
+    std::optional<std::array<double, n_lambda>> invD_lambda_;   // \lambda at which invD_ was computed
     smoother_t* smoother_;         // smoothing variational solver
     matrix_t f_;                   // PCs expansion coefficient vector
     matrix_t s_;                   // PCs scores
