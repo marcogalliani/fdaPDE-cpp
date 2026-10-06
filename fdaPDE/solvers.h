@@ -39,6 +39,9 @@ enum class TraceMode { Exact, Hutchinson };
 #include "src/solvers/fe_ls_separable.h"
 #include "src/solvers/fe_ls_parabolic.h"
 #include "src/solvers/bs_ls_elliptic.h"
+#include "src/solvers/bs_ls_ode.h"
+#include "src/solvers/bs_ls_ode_tracking.h"
+#include "src/solvers/bs_ls_ode_nls.h"   // consumes bs_ls_ode_param, declared by the tracking solver
 
 // density estimation solvers
 #include "src/solvers/fe_de_elliptic.h"
