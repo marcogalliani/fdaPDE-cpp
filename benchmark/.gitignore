@@ -1,0 +1,5 @@
+# the repository root ignores *.txt, which would swallow this folder's build definition and leave the
+# benchmarks unbuildable from a fresh clone (test/CMakeLists.txt is tracked only because it was force-added)
+!CMakeLists.txt
+build/
+fdapde_benchmark
