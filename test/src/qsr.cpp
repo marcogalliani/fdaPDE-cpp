@@ -117,7 +117,7 @@ TEST(qsr, test_01) {
 //     // calibration
 //     std::vector<double> lambda_grid(13);
 //     for (int i = 0; i < 13; ++i) { lambda_grid[i] = std::pow(10, -8.0 + 0.25 * i); }
-//     GridOptimizer<1> optimizer;
+//     GridSearch<1> optimizer;
 //     optimizer.optimize(m.gcv(1000, 438172), lambda_grid);
 
 //     EXPECT_TRUE(almost_equal<double>(optimizer.values(), "../data/qsr/04/gcvs.mtx"));
