@@ -275,3 +275,190 @@ TEST(fpca, reconstruction_recovers_signal) {
         EXPECT_LT(rel, 0.5);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// partially observed data
+// ---------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+// sets a fraction of the entries of Y to NaN, uniformly at random
+matrix_t remove_entries(const matrix_t& Y, double frac, unsigned seed) {
+    matrix_t Yna = Y;
+    std::mt19937 rng(seed);
+    std::bernoulli_distribution missing(frac);
+    for (int i = 0; i < Y.rows(); ++i) {
+        for (int j = 0; j < Y.cols(); ++j) {
+            if (missing(rng)) { Yna(i, j) = std::numeric_limits<double>::quiet_NaN(); }
+        }
+    }
+    return Yna;
+}
+
+// builds a simple-Laplacian-penalized fPCA over `D` on the (n_nodes x n_units) data Y and calls f(model)
+template <typename F> void with_fpca(Triangulation<2, 2>& D, const matrix_t& Y, F&& f) {
+    FeSpace Vh(D, P1<1>);
+    TrialFunction u(Vh);
+    TestFunction  v(Vh);
+    auto a = integral(D)(dot(grad(u), grad(v)));
+    ZeroField<2> zero;
+    auto L = integral(D)(zero * v);
+    GeoFrame data(D);
+    auto& layer = data.template insert_scalar_layer<POINT>("layer", MESH_NODES);
+    layer.load_blk("y", Y);
+    fPCA<internals::fe_ls_elliptic> model;
+    model.discretize(fe_ls_elliptic{a, L}.get());
+    model.analyze_data("y", data);
+    f(model);
+}
+
+// relative error of the reconstruction mean + Fn * S^T with respect to the noise-free signal
+template <typename Model> double reconstruction_error(const Model& model, const matrix_t& signal) {
+    matrix_t Yhat = model.Fn() * model.S().transpose();
+    Yhat.colwise() += model.center_locs();
+    return (signal - Yhat).squaredNorm() / signal.squaredNorm();
+}
+
+}   // namespace
+
+// MM scheme at a fixed smoothing level: 20% missing entries, the rank-3 fit recovers the signal
+TEST(fpca, missing_data_fixed_lambda) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    const int rank = 3;
+    matrix_t signal;
+    matrix_t Y = remove_entries(make_fpca_data(D, 50, 0.1, signal), 0.2, 2711);
+    with_fpca(D, Y, [&](auto& model) {
+        model.fit(rank, std::vector<double> {1e-2}, ComputeXactSVD);
+        EXPECT_EQ(model.F().cols(), rank);
+        EXPECT_EQ(model.S().rows(), 50);
+        EXPECT_EQ(model.lambda().rows(), rank + 1);   // row 0 is the smoothing level of the mean
+        EXPECT_TRUE(model.F().array().isFinite().all() && model.S().array().isFinite().all());
+        EXPECT_TRUE(model.converged());
+        EXPECT_EQ(static_cast<int>(model.n_iter().size()), rank);
+        EXPECT_LT(reconstruction_error(model, signal), 0.1);
+    });
+}
+
+// the loadings returned for missing data are L^2-normalised and loadings_norm() refers to them
+TEST(fpca, missing_data_loadings_normalised) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = remove_entries(make_fpca_data(D, 50, 0.1, signal), 0.2, 2711);
+    FeSpace Vh(D, P1<1>);
+    TrialFunction u(Vh);
+    TestFunction  v(Vh);
+    auto M = integral(D)(u * v).assemble();   // mass matrix
+    with_fpca(D, Y, [&](auto& model) {
+        model.fit(2, std::vector<double> {1e-2}, ComputeXactSVD);
+        for (int i = 0; i < 2; ++i) {
+            EXPECT_NEAR(model.F().col(i).dot(M * model.F().col(i)), 1.0, 1e-8);
+            // scores * norm = unnormalised scores: the stored norm is the one of the final fit
+            EXPECT_GT(model.loadings_norm()[i], 0.0);
+        }
+        EXPECT_EQ(static_cast<int>(model.loadings_norm().size()), 2);
+    });
+}
+
+// joint selection of smoothing level and rank by GCV: the selection lies on the grids and recovers the signal
+TEST(fpca, missing_data_gcv_selection) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = remove_entries(make_fpca_data(D, 50, 0.1, signal), 0.2, 2711);
+    std::vector<double> grid = log_grid(-4, 0, 1);
+    with_fpca(D, Y, [&](auto& model) {
+        model.fit(4, grid, ComputeXactSVD | OptimizeGCV);
+        EXPECT_EQ(model.gcv_scores().rows(), static_cast<int>(grid.size()));
+        EXPECT_EQ(model.gcv_scores().cols(), 4);   // one column per rank
+        EXPECT_TRUE(model.gcv_scores().array().isFinite().all());
+        EXPECT_GE(model.F().cols(), 1);
+        EXPECT_LE(model.F().cols(), 4);
+        EXPECT_TRUE(std::find(grid.begin(), grid.end(), model.lambda()(0, 0)) != grid.end());
+        EXPECT_LT(reconstruction_error(model, signal), 0.05);
+    });
+}
+
+// k-fold cross-validation is the default calibration of missing-data fits when a grid is given
+TEST(fpca, missing_data_kfold_default) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = remove_entries(make_fpca_data(D, 50, 0.1, signal), 0.2, 2711);
+    std::vector<double> grid = log_grid(-4, 0, 1);
+    with_fpca(D, Y, [&](auto& model) {
+        model.fit(4, grid, ComputeXactSVD);   // no calibration flag
+        EXPECT_EQ(model.gcv_scores().rows(), static_cast<int>(grid.size()));
+        EXPECT_EQ(model.gcv_scores().cols(), 1);   // CV error along the grid, at the selected rank
+        EXPECT_TRUE(model.gcv_scores().array().isFinite().all());
+        EXPECT_LE(model.F().cols(), 4);
+        EXPECT_LT(reconstruction_error(model, signal), 0.05);
+    });
+}
+
+// complete data: no mean unless ComputeMean is set; with ComputeMean the smooth mean is recovered
+TEST(fpca, compute_mean_flag) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    const matrix_t& nodes = D.nodes();
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    vector_t mean_field(nodes.rows());
+    for (int i = 0; i < nodes.rows(); ++i) { mean_field[i] = 2.0 + nodes(i, 0) * nodes(i, 1); }
+    Y.colwise() += mean_field;
+    std::vector<double> grid = log_grid(-4, 0, 1);
+    with_fpca(D, Y, [&](auto& model) {
+        model.fit(3, grid, ComputeXactSVD);
+        EXPECT_EQ(model.center().norm(), 0.0);   // default: no centering
+    });
+    with_fpca(D, Y, [&](auto& model) {
+        model.fit(3, grid, ComputeXactSVD | ComputeMean);
+        EXPECT_LT((model.center_locs() - mean_field).norm() / mean_field.norm(), 0.05);
+        const matrix_t& centred_signal = signal;   // the scores have zero mean
+        matrix_t Yhat = model.Fn() * model.S().transpose();
+        EXPECT_LT((centred_signal - Yhat).squaredNorm() / centred_signal.squaredNorm(), 0.1);
+    });
+}
+
+// functional singular value thresholding on partially observed data (smoke test)
+TEST(fpca, fsvt_missing_data) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = remove_entries(make_fpca_data(D, 50, 0.1, signal), 0.2, 2711);
+    FeSpace Vh(D, P1<1>);
+    TrialFunction u(Vh);
+    TestFunction  v(Vh);
+    auto a = integral(D)(dot(grad(u), grad(v)));
+    ZeroField<2> zero;
+    auto L = integral(D)(zero * v);
+    GeoFrame data(D);
+    auto& layer = data.insert_scalar_layer<POINT>("layer", MESH_NODES);
+    layer.load_blk("y", Y);
+    fSVT model("y", data, fe_ls_elliptic(a, L));
+    model.fit(/* threshold = */ 1.0, /* max_rank = */ 6, std::vector<double> {1e-2}, ComputeXactSVD);
+    EXPECT_GE(model.rank(), 1);
+    EXPECT_LE(model.rank(), 6);
+    EXPECT_TRUE(model.U().array().isFinite().all() && model.V().array().isFinite().all());
+}
+
+// smooth mean of partially observed curves (smoke test)
+TEST(fpca, frpde_missing_data) {
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    const matrix_t& nodes = D.nodes();
+    matrix_t signal;
+    matrix_t Y = make_fpca_data(D, 50, 0.1, signal);
+    vector_t mean_field(nodes.rows());
+    for (int i = 0; i < nodes.rows(); ++i) { mean_field[i] = 2.0 + nodes(i, 0) * nodes(i, 1); }
+    Y.colwise() += mean_field;
+    Y = remove_entries(Y, 0.2, 2711);
+    FeSpace Vh(D, P1<1>);
+    TrialFunction u(Vh);
+    TestFunction  v(Vh);
+    auto a = integral(D)(dot(grad(u), grad(v)));
+    ZeroField<2> zero;
+    auto L = integral(D)(zero * v);
+    GeoFrame data(D);
+    auto& layer = data.insert_scalar_layer<POINT>("layer", MESH_NODES);
+    layer.load_blk("Y", Y);
+    FRPDE model("Y ~ f", data, fe_ls_elliptic(a, L));
+    model.fit(1e-2);
+    vector_t fitted = model.fitted();
+    EXPECT_TRUE(fitted.array().isFinite().all());
+    EXPECT_LT((fitted - mean_field).norm() / mean_field.norm(), 0.1);
+}
