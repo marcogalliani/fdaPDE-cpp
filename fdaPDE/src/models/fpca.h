@@ -790,7 +790,10 @@ class k_fold_missing_cv_impl {
 // smooth mean and rank-k components on the completed data, repeat until the objective converges. Ranks are fitted
 // recursively (k = 1, ..., K, each one warm-started from the previous reconstruction). With a grid of smoothing levels,
 // the smoothing level (shared by mean and components) and the rank are selected jointly by GCV or by k-fold
-// cross-validation on the observed entries
+// cross-validation on the observed entries. The k-fold cross-validation runs its (lambda, fold) pairs in parallel (fdaPDE
+// execution module, parallel_set_num_threads() threads) when a factory of inner fPCA solvers is given and the smoother
+// can detach the factorizations of a copy: each pair on its own copy of the smoother, with its own inner solver. The
+// pairs are independent, so the result does not depend on the number of threads
 template <typename fPCASolver> class fpca_na_impl {
    private:
     using fpca_t = std::decay_t<fPCASolver>;
@@ -802,9 +805,15 @@ template <typename fPCASolver> class fpca_na_impl {
     using smoother_t = typename fPCASolver::smoother_t;
     static constexpr int n_lambda = smoother_t::n_lambda;
 
+    // makes an inner fPCA solver working on the given smoother (a copy of the smoother of the model)
+    using fpca_factory_t = std::function<fpca_t(smoother_t&)>;
+
     fpca_na_impl() noexcept = default;
     fpca_na_impl(fPCASolver& fpca, smoother_t& smoother) noexcept :
         fpca_(std::addressof(fpca)), smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()) { }
+    fpca_na_impl(fPCASolver& fpca, smoother_t& smoother, fpca_factory_t make_fpca) noexcept :
+        fpca_(std::addressof(fpca)), smoother_(std::addressof(smoother)), n_dofs_(smoother.n_dofs()),
+        make_fpca_(std::move(make_fpca)) { }
 
     // data is the (n_units x n_locs) data matrix, missing entries are NaN. Returns the mean, loadings and scores
     template <typename DataT>
@@ -836,7 +845,8 @@ template <typename fPCASolver> class fpca_na_impl {
             for (std::size_t i = 0; i < lambda_grid.size(); ++i) {
                 std::vector<double> lambda {lambda_grid[i]};
                 for (int k = 1; k <= rank; ++k) {
-                    const auto& [mu, F, S] = solve_(X, nan_pattern, Un, k, lambda, lambda, svd_flag);
+                    const auto& [mu, F, S, it, conv] =
+                      solve_(*smoother_, *fpca_, X, nan_pattern, Un, k, lambda, lambda, svd_flag);
                     Un = S * F.transpose() * smoother_->Psi().transpose();   // reconstruction update
                     Un.rowwise() += mu.transpose() * smoother_->Psi().transpose();
                     double edf = edf_(nan_pattern, mu, S, F, k, lambda, lambda);
@@ -853,23 +863,43 @@ template <typename fPCASolver> class fpca_na_impl {
         } break;
         case OptimizeMSRE: {   // k-fold cross-validation on the observed entries
             auto k_fold_cv = k_fold_missing_cv_impl(X, n_folds_);
-            matrix_t mse_table = matrix_t::Zero(lambda_grid.size(), rank);   // CV error for each (lambda, rank)
-            for (std::size_t i = 0; i < lambda_grid.size(); ++i) {
+            const int n_grid = lambda_grid.size(), n_tasks = n_grid * n_folds_;
+            // CV error of each (lambda, fold) pair, for each rank: the pairs are independent (each one starts from the
+            // mean imputation Un0, the ranks of a pair are fitted in turn)
+            matrix_t mse_per_task = matrix_t::Zero(n_tasks, rank);
+            auto cv_task = [&](int t, smoother_t& smoother, fpca_t& fpca) {
+                const int i = t / n_folds_, j = t % n_folds_;
                 std::vector<double> lambda {lambda_grid[i]};
-                matrix_t mse_per_fold = matrix_t::Zero(n_folds_, rank);
-                for (int j = 0; j < n_folds_; ++j) {
-                    auto [train_mask, test_mask] = k_fold_cv.split(X, j);
-                    matrix_t X_train = train_mask.select(X, std::numeric_limits<double>::quiet_NaN());
-                    binary_t train_nan_pattern = na_matrix(X_train);
-                    matrix_t Un = Un0;
-                    for (int k = 1; k <= rank; ++k) {
-                        const auto& [mu, F, S] = solve_(X_train, train_nan_pattern, Un, k, lambda, lambda, svd_flag);
-                        Un = S * F.transpose() * smoother_->Psi().transpose();   // reconstruction update
-                        Un.rowwise() += mu.transpose() * smoother_->Psi().transpose();
-                        mse_per_fold(j, k - 1) = test_mask.select(X - Un, 0).squaredNorm() / test_mask.count();
-                    }
+                auto [train_mask, test_mask] = k_fold_cv.split(X, j);
+                matrix_t X_train = train_mask.select(X, std::numeric_limits<double>::quiet_NaN());
+                binary_t train_nan_pattern = na_matrix(X_train);
+                matrix_t Un = Un0;
+                for (int k = 1; k <= rank; ++k) {
+                    const auto& [mu, F, S, it, conv] =
+                      solve_(smoother, fpca, X_train, train_nan_pattern, Un, k, lambda, lambda, svd_flag);
+                    Un = S * F.transpose() * smoother.Psi().transpose();   // reconstruction update
+                    Un.rowwise() += mu.transpose() * smoother.Psi().transpose();
+                    mse_per_task(t, k - 1) = test_mask.select(X - Un, 0).squaredNorm() / test_mask.count();
                 }
-                mse_table.row(i) = mse_per_fold.colwise().mean();
+            };
+            constexpr bool detachable = requires(smoother_t& s) { s.detach_factorizations(); };
+            if constexpr (detachable) {
+                if (make_fpca_ && parallel_get_num_threads() > 1) {
+                    parallel_for(0, n_tasks, 1, [&](int t) {   // one task per pair: coarse grained
+                        smoother_t smoother = *smoother_;
+                        smoother.detach_factorizations();      // its own factorizations, not the ones of smoother_
+                        fpca_t fpca = make_fpca_(smoother);
+                        cv_task(t, smoother, fpca);
+                    });
+                } else {
+                    for (int t = 0; t < n_tasks; ++t) { cv_task(t, *smoother_, *fpca_); }
+                }
+            } else {
+                for (int t = 0; t < n_tasks; ++t) { cv_task(t, *smoother_, *fpca_); }
+            }
+            matrix_t mse_table(n_grid, rank);   // CV error for each (lambda, rank), averaged over the folds
+            for (int i = 0; i < n_grid; ++i) {
+                mse_table.row(i) = mse_per_task.middleRows(i * n_folds_, n_folds_).colwise().mean();
             }
             Eigen::Index opt_lambda_idx, opt_rank_idx;
             mse_table.minCoeff(&opt_lambda_idx, &opt_rank_idx);
@@ -891,14 +921,15 @@ template <typename fPCASolver> class fpca_na_impl {
         converged_ = true;
         matrix_t Un = Un0;
         for (int k = 1; k <= opt_rank; ++k) {
-            const auto& [center, F, S] = solve_(X, nan_pattern, Un, k, opt_lambda_mu, opt_lambda_F, svd_flag);
+            const auto& [center, F, S, it, conv] =
+              solve_(*smoother_, *fpca_, X, nan_pattern, Un, k, opt_lambda_mu, opt_lambda_F, svd_flag);
             Un = S * F.transpose() * smoother_->Psi().transpose();   // reconstruction update
             Un.rowwise() += center.transpose() * smoother_->Psi().transpose();
             center_ = center;
             f_.leftCols(k) = F;
             s_.leftCols(k) = S;
-            n_iter_.push_back(n_iter_last_);
-            converged_ = converged_ && converged_last_;
+            n_iter_.push_back(it);
+            converged_ = converged_ && conv;
         }
         // store results, row 0 of lambda_ is the smoothing level of the mean
         for (int j = 0; j < n_lambda; ++j) { lambda_(0, j) = opt_lambda_mu[j]; }
@@ -920,54 +951,63 @@ template <typename fPCASolver> class fpca_na_impl {
     const std::vector<int>& n_iter() const { return n_iter_; }   // MM iterations of the final fit, for each rank
     bool converged() const { return converged_; }                // whether all final MM fits met the tolerance
    private:
-    // MM scheme for the rank-k model, started from the (n_units x n_locs) reconstruction Un0
+    // result of the MM scheme for one rank
+    struct mm_result_t {
+        vector_t center;
+        matrix_t F, S;
+        int n_iter = 0;
+        bool converged = false;
+    };
+    // MM scheme for the rank-k model, started from the (n_units x n_locs) reconstruction Un0. Works on the given smoother
+    // and inner fPCA solver only (no member is written): calls on distinct smoother/solver pairs can run concurrently
     template <typename LambdaT>
         requires(internals::is_subscriptable<LambdaT, int>)
-    auto solve_(
-      const matrix_t& X, const binary_t& nan, const matrix_t& Un0, int rank, const LambdaT& lambda_mu,
-      const LambdaT& lambda_F, int flag) {
+    mm_result_t solve_(
+      smoother_t& smoother, fpca_t& fpca, const matrix_t& X, const binary_t& nan, const matrix_t& Un0, int rank,
+      const LambdaT& lambda_mu, const LambdaT& lambda_F, int flag) const {
         for (int i = 0; i < n_lambda; ++i) {
             fdapde_assert(lambda_mu[i] > 0);
             fdapde_assert(lambda_F[i] > 0);
         }
-        vector_t center(n_dofs_);
-        matrix_t F(n_dofs_, rank);
-        matrix_t S(n_units_, rank);
+        mm_result_t r;
+        r.center.resize(n_dofs_);
+        r.F.resize(n_dofs_, rank);
+        r.S.resize(n_units_, rank);
         matrix_t U(n_units_, n_dofs_);
         matrix_t Un = Un0;
         matrix_t Xn(n_units_, n_locs_);
-        n_iter_last_ = 0;
-        converged_last_ = false;
+        // penalty matrices of the objective, fixed during the scheme (each P() call solves R0 X = R1)
+        const matrix_t P_mu = smoother.P(lambda_mu), P_F = smoother.P(lambda_F);
         double Jold = std::numeric_limits<double>::max(), Jnew = 1.0;
-        while (!almost_equal(Jnew, Jold, tol_) && n_iter_last_ < max_iter_) {
+        while (!almost_equal(Jnew, Jold, tol_) && r.n_iter < max_iter_) {
             // imputation update
             Xn = (~nan).select(X, Un);
             // smooth mean of the completed data
-            smoother_->update_response(Xn.colwise().mean().transpose());
-            smoother_->fit(lambda_mu[0]);
-            vector_t mu = smoother_->f();
-            Xn.rowwise() -= (smoother_->Psi() * mu).transpose();
+            smoother.update_response(Xn.colwise().mean().transpose());
+            smoother.fit(lambda_mu[0]);
+            vector_t mu = smoother.f();
+            Xn.rowwise() -= (smoother.Psi() * mu).transpose();
             // rank-k fPCA of the centred data, at fixed smoothing level
-            auto [f, s] = fpca_->fit(Xn.transpose(), rank, lambda_F, flag & ComputeRandSVD);
+            auto [f, s] = fpca.fit(Xn.transpose(), rank, lambda_F, flag & ComputeRandSVD);
             for (int i = 0; i < rank; ++i) {   // orthonormal scores
-                s.col(i) = s.col(i) / fpca_->loadings_norm()[i];
-                f.col(i) = f.col(i) * fpca_->loadings_norm()[i];
+                s.col(i) = s.col(i) / fpca.loadings_norm()[i];
+                f.col(i) = f.col(i) * fpca.loadings_norm()[i];
             }
             U = s * f.transpose();   // reconstruction update
             U.rowwise() += mu.transpose();
-            n_iter_last_++;
+            r.n_iter++;
             Jold = Jnew;
-            Un = U * smoother_->Psi().transpose();
-            Jnew = ((~nan).select(X - Un, 0)).squaredNorm() + n_units_ * mu.transpose() * smoother_->P(lambda_mu) * mu +
-                   (f.transpose() * smoother_->P(lambda_F) * f).trace();
-            if (almost_equal(Jnew, Jold, tol_) || n_iter_last_ == max_iter_) {
-                center = mu;
-                F = f;
-                S = s;
+            Un = U * smoother.Psi().transpose();
+            Jnew = ((~nan).select(X - Un, 0)).squaredNorm() + n_units_ * mu.transpose() * P_mu * mu +
+                   (f.transpose() * P_F * f).trace();
+            if (almost_equal(Jnew, Jold, tol_) || r.n_iter == max_iter_) {
+                r.center = mu;
+                r.F = f;
+                r.S = s;
             }
         }
-        converged_last_ = almost_equal(Jnew, Jold, tol_);
-        return std::make_tuple(center, F, S);
+        r.converged = almost_equal(Jnew, Jold, tol_);
+        return r;
     }
     // stochastic (Hutchinson) estimate of the effective degrees of freedom of the rank-k fit, single smoothing level
     template <typename LambdaT>
@@ -1036,10 +1076,9 @@ template <typename fPCASolver> class fpca_na_impl {
     // MM scheme parameters
     double tol_ = 1e-4;
     int max_iter_ = 100;
-    int n_iter_last_ = 0;          // iterations and convergence of the last call to solve_
-    bool converged_last_ = true;
     std::vector<int> n_iter_;
     bool converged_ = true;
+    fpca_factory_t make_fpca_ {};  // inner solvers for the parallel k-fold cross-validation (none: sequential)
 };
 
 }   // namespace internals
@@ -1138,7 +1177,9 @@ template <typename VariationalSolver> class fPCA {
         if (has_nan_) {
             // default to k-fold cross-validation, if no calibration provided
             if (lambda_grid.size() > n_lambda && (flag & CalibrationMask) == 0) { flag = flag | OptimizeMSRE; }
-            internals::fpca_na_impl mm_scheme(solver_, smoother_);
+            // the factory makes the inner solvers of the parallel cross-validation, on copies of smoother_
+            internals::fpca_na_impl mm_scheme(
+              solver_, smoother_, [&policy](smoother_t& smoother) { return policy.get(smoother); });
             const auto& [mu, f, s] = mm_scheme.fit(data_.transpose(), rank, lambda_grid, flag);
             center_ = mu;
             f_ = f;

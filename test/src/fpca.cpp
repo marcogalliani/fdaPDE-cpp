@@ -393,6 +393,45 @@ TEST(fpca, missing_data_kfold_default) {
     });
 }
 
+// the k-fold cross-validation runs its (lambda, fold) pairs in parallel when the MM scheme is given a factory of inner
+// solvers: same CV table, selection and fit as the sequential run (exact SVD: the computation is deterministic)
+TEST(fpca, missing_data_kfold_parallel_matches_sequential) {
+    ASSERT_GT(parallel_get_num_threads(), 1) << "the parallel path needs more than one worker";
+    Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);
+    matrix_t signal;
+    matrix_t Y = remove_entries(make_fpca_data(D, 50, 0.1, signal), 0.2, 2711);   // n_nodes x n_units
+    std::vector<double> grid = log_grid(-4, 0, 1);
+    FeSpace Vh(D, P1<1>);
+    TrialFunction u(Vh);
+    TestFunction  v(Vh);
+    auto a = integral(D)(dot(grad(u), grad(v)));
+    ZeroField<2> zero;
+    auto L = integral(D)(zero * v);
+    GeoFrame data(D);
+    auto& layer = data.template insert_scalar_layer<POINT>("layer", MESH_NODES);
+    layer.load_blk("y", Y);
+    internals::fe_ls_elliptic smoother;
+    smoother.discretize(fe_ls_elliptic{a, L}.get());
+    smoother.analyze_data(data, vector_t::Ones(data[0].rows()).asDiagonal());
+    auto solver = fpca_subspace_solver().get(smoother);
+    const int flag = ComputeXactSVD | OptimizeMSRE;
+    // sequential: no factory
+    internals::fpca_na_impl sequential(solver, smoother);
+    sequential.fit(matrix_t(Y.transpose()), 4, grid, flag);
+    // parallel: one inner solver per (lambda, fold) pair, on a copy of the smoother
+    internals::fpca_na_impl parallel(solver, smoother, [](internals::fe_ls_elliptic& s) {
+        return fpca_subspace_solver().get(s);
+    });
+    parallel.fit(matrix_t(Y.transpose()), 4, grid, flag);
+    EXPECT_EQ(parallel.gcv_scores().rows(), static_cast<int>(grid.size()));
+    EXPECT_EQ((parallel.gcv_scores() - sequential.gcv_scores()).cwiseAbs().maxCoeff(), 0.0);
+    EXPECT_EQ(parallel.lambda()(0, 0), sequential.lambda()(0, 0));
+    ASSERT_EQ(parallel.loading().cols(), sequential.loading().cols());
+    EXPECT_EQ((parallel.loading() - sequential.loading()).cwiseAbs().maxCoeff(), 0.0);
+    EXPECT_EQ((parallel.scores() - sequential.scores()).cwiseAbs().maxCoeff(), 0.0);
+    EXPECT_EQ((parallel.center() - sequential.center()).cwiseAbs().maxCoeff(), 0.0);
+}
+
 // complete data: no mean unless ComputeMean is set; with ComputeMean the smooth mean is recovered
 TEST(fpca, compute_mean_flag) {
     Triangulation<2, 2> D = Triangulation<2, 2>::UnitSquare(15);

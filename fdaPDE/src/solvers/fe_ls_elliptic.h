@@ -288,6 +288,14 @@ struct fe_ls_elliptic {
         return;
     }
 
+    // a copy shares the sparse factorizations of the original (Eigen's factorizations cannot be copied, the solvers are
+    // held through shared pointers): this gives the copy its own, refactorized at its next fit. Needed before a copy
+    // and the original (or two copies) are fitted concurrently
+    void detach_factorizations() {
+        invA_ = sparse_solver_t();
+        invR0_ = sparse_solver_t();
+        lambda_saved_ = -1;   // forces the next fit to refactorize
+    }
     // main fit entry point
     std::pair<vector_t, vector_t> fit(double lambda) {
         fdapde_assert(lambda > 0 && n_dofs_ > 0 && n_obs_ > 0);
