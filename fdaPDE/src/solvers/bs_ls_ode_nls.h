@@ -116,6 +116,27 @@ class bs_ls_ode_nls : public bs_ls_ode {
     }
     void set_line_search(line_search ls) { line_search_ = ls; }
     line_search line_search_policy() const { return line_search_; }
+    // Run the outer BFGS on z, theta_k = lower_k + exp(z_k), instead of on theta directly (see
+    // theta_log_map). `lower` has one entry per PARAMETER; a NaN entry leaves that component unmapped,
+    // and an estimated initial state is never mapped. The estimate and every observer stay in theta.
+    void set_parameter_map(const vector_t& lower) {
+        fdapde_assert(static_cast<bool>(engine_) && lower.size() == engine_.n_params());
+        param_map_.lower = lower;
+    }
+    void clear_parameter_map() { param_map_.lower.resize(0); }
+    const theta_log_map& parameter_map() const { return param_map_; }
+    // cap on the length of every accepted BFGS step, in the optimizer's own variables (see
+    // step_norm_cap). <= 0 (the default) leaves the step to the line search alone. Ignored by the
+    // trust-region outer optimizer, whose radius does the same job with a model behind it.
+    void set_outer_step_cap(double cap) { outer_step_cap_ = cap; }
+    // which optimizer minimizes S: BFGS with a line search (the default) or the trust-region
+    // quasi-Newton, which rejects a step into the divergent region instead of shortening it
+    // levenberg_marquardt is a TRUE Gauss-Newton method here: S is a sum of squares and the residual
+    // Jacobian d y/d z is available exactly, by forward propagation of the same step Jacobians the
+    // adjoint sweep contracts backwards (see nls_ls_problem).
+    enum class outer_method { bfgs, trust_region, levenberg_marquardt };
+    void set_outer_method(outer_method m) { outer_method_ = m; }
+    outer_method outer_method_policy() const { return outer_method_; }
     // Estimate the initial state jointly with theta (single shooting's standard nuisance parameter).
     // Defaults to ON when the discretization carries no hard initial condition -- with a free y0 the
     // shooting map is undefined until something fixes it, and leaving it at an arbitrary value would
@@ -166,9 +187,30 @@ class bs_ls_ode_nls : public bs_ls_ode {
         BFGS<Dynamic> optimizer(outer_max_iter_, outer_tol_, 1.0);
         // the line search is what makes the divergent-cost surrogate work: an unstable theta yields a huge
         // but finite S, which the Armijo test rejects, so the step is cut back into the stable region.
-        vector_t z_opt = (line_search_ == line_search::wolfe) ?
-                           optimizer.optimize(problem, decision_vector(), WolfeLineSearch()) :
-                           optimizer.optimize(problem, decision_vector(), BacktrackingLineSearch());
+        // the optimizer's variables are w (the decision vector itself under the identity map)
+        const vector_t w0 = w_of_z_(decision_vector());
+        vector_t z_opt;
+        if (outer_method_ == outer_method::levenberg_marquardt) {
+            LevenbergMarquardt<Dynamic> lm(outer_max_iter_, outer_tol_);
+            z_opt = z_of_w_(lm.optimize(nls_ls_problem {this}, w0));
+            outer_n_iter_ = lm.n_iter();
+            outer_converged_ = lm.converged();
+        } else if (outer_method_ == outer_method::trust_region) {
+            TrustRegion<Dynamic> tr(outer_max_iter_, outer_tol_, outer_step_cap_ > 0 ? outer_step_cap_ : 1.0);
+            z_opt = z_of_w_(tr.optimize(problem, w0));
+            outer_n_iter_ = tr.n_iter();
+            outer_converged_ = tr.converged();
+        } else {
+            z_opt = z_of_w_(
+              (line_search_ == line_search::wolfe) ?
+                optimizer.optimize(problem, w0, WolfeLineSearch(), step_norm_cap {outer_step_cap_}) :
+                optimizer.optimize(problem, w0, BacktrackingLineSearch(), step_norm_cap {outer_step_cap_}));
+            outer_n_iter_ = optimizer.n_iter();
+            outer_converged_ = optimizer.converged();
+        }
+        // the optimizer's own last iterate, kept before the safeguard may replace it
+        theta_last_ = theta_of_(z_opt);
+        outer_value_last_ = S_(z_opt);
         // SAFEGUARD. Return the best decision vector actually EVALUATED, not blindly the optimizer's last
         // iterate. On a criterion as unforgiving as the shooting one, a line search that walks into the
         // region where the forward integration diverges gets the sentinel cost and (by construction) a
@@ -186,8 +228,6 @@ class bs_ls_ode_nls : public bs_ls_ode {
         theta_ = theta_of_(z_opt);
         if (estimate_ic_) { y0_ = z_opt.tail(d_); }
         outer_value_ = S_(z_opt);
-        outer_n_iter_ = optimizer.n_iter();
-        outer_converged_ = (outer_n_iter_ < outer_max_iter_);
         write_state_(z_opt);   // leave the forward state consistent with the estimate
         return theta_;
     }
@@ -213,6 +253,10 @@ class bs_ls_ode_nls : public bs_ls_ode {
     // iterate. Routine, not a failure: the line search evaluates points the iterate sequence does not
     // keep. See the SAFEGUARD note in solve().
     bool safeguarded() const { return safeguarded_; }
+    // the optimizer's own last iterate and S there, before the safeguard: reporting a failure rate on both
+    // this and the returned estimate separates a solved problem from a rescued one
+    const vector_t& theta_last_iterate() const { return theta_last_; }
+    double outer_objective_last_iterate() const { return outer_value_last_; }
 
     // the decision vector layout: z = [theta] or z = [theta; y_0] when the initial state is estimated
     int n_unknowns() const { return n_params() + (estimate_ic_ ? d_ : 0); }
@@ -228,6 +272,14 @@ class bs_ls_ode_nls : public bs_ls_ode {
     // objective/gradient pair at the same z onto a single forward integration.
     double objective_at(const vector_t& z) { return S_(z); }
     vector_t gradient_at(const vector_t& z) { return grad_S_(z); }
+    // DIAGNOSTIC: the gradient as the least-squares view computes it, 2 J^T r. It must equal
+    // gradient_at() to round-off -- the forward sensitivity propagation and the backward adjoint sweep
+    // contract the same step Jacobians in opposite orders -- which is the check on the Jacobian LM uses.
+    // Takes the OPTIMIZER's variables w (equal to z when no parameter map is set).
+    vector_t ls_gradient_at(const vector_t& w) {
+        nls_ls_problem p {this};
+        return 2.0 * (p.jacobian(w).transpose() * p.residuals(w));
+    }
     // the shooting trajectory (m x d) at an explicit theta and the current initial state, without
     // touching the solver's own state
     matrix_t trajectory_at(const vector_t& theta) {
@@ -377,11 +429,101 @@ class bs_ls_ode_nls : public bs_ls_ode {
 
     // objective functor over the decision vector, adapting S and its adjoint gradient to the core BFGS
     // interface (the same shape the tracking solver's outer criterion presents)
+    // decision vector z = [theta; y_0] <-> optimizer variables w: the map acts on the theta head only, an
+    // estimated initial state is a plain unconstrained variable
+    vector_t z_of_w_(const vector_t& w) const {
+        if (!param_map_.active()) { return w; }
+        const int n_theta = engine_.n_params();
+        vector_t z = w;
+        z.head(n_theta) = param_map_.theta_of(vector_t(w.head(n_theta)));
+        return z;
+    }
+    vector_t w_of_z_(const vector_t& z) const {
+        if (!param_map_.active()) { return z; }
+        const int n_theta = engine_.n_params();
+        vector_t w = z;
+        w.head(n_theta) = param_map_.z_of(vector_t(z.head(n_theta)));
+        return w;
+    }
+    vector_t chain_(const vector_t& z, const vector_t& grad) const {
+        if (!param_map_.active()) { return grad; }
+        const int n_theta = engine_.n_params();
+        vector_t g = grad;
+        g.head(n_theta) = param_map_.chain(vector_t(z.head(n_theta)), vector_t(grad.head(n_theta)));
+        return g;
+    }
+
+    /* The SAME criterion S, presented as residuals and a Jacobian so Levenberg-Marquardt can build the
+    Gauss-Newton curvature J^T J exactly instead of accumulating it from secant pairs.
+
+    LAYOUT. One entry per observed (node, component) pair, in observed_entries_() order, plus ONE trailing
+    entry sqrt(divergent_prefix_cost_ * (m - k)/m) carrying the partial-prefix penalty S_ applies when the
+    integration blew up after k < m nodes. With that entry, ||r||^2 == S_(z) exactly, so LM minimises the
+    very same function BFGS and the trust region do and the three are directly comparable. Entries past
+    the finite prefix are zero, as are their Jacobian rows -- the same convention grad_S_ follows, which
+    sums over the prefix only, so the penalty contributes to the value and not to the derivative.
+
+    CHECK. 2 J^T r is grad_S_ to round-off by construction; the driver's --gradcheck exercises it. */
+    struct nls_ls_problem {
+        bs_ls_ode_nls* s;
+        Eigen::Matrix<double, Dynamic, 1> residuals(const vector_t& w) const {
+            const vector_t z = s->z_of_w_(w);
+            const matrix_t& Y = s->forward_(z);
+            const auto& idx = s->obs_idx_();
+            Eigen::Matrix<double, Dynamic, 1> r =
+              Eigen::Matrix<double, Dynamic, 1>::Zero(static_cast<int>(idx.size()) + 1);
+            const int k = s->n_finite_;
+            for (std::size_t i = 0; i < idx.size(); ++i) {
+                const auto [t, v] = idx[i];
+                if (t < k) { r[static_cast<int>(i)] = Y(t, v) - s->y_obs_(t, v); }
+            }
+            if (k < s->m_) {
+                r[static_cast<int>(idx.size())] =
+                  std::sqrt(divergent_prefix_cost_ * static_cast<double>(s->m_ - k) / s->m_);
+            }
+            return r;
+        }
+        Eigen::Matrix<double, Dynamic, Dynamic> jacobian(const vector_t& w) const {
+            const vector_t z = s->z_of_w_(w);
+            const matrix_t& Y = s->forward_(z);
+            const auto& idx = s->obs_idx_();
+            const int q = static_cast<int>(z.size()), n_theta = s->engine_.n_params();
+            Eigen::Matrix<double, Dynamic, Dynamic> J =
+              Eigen::Matrix<double, Dynamic, Dynamic>::Zero(static_cast<int>(idx.size()) + 1, q);
+            // seed: d y_0 / d z. A jointly estimated initial state is the identity in its own block; a
+            // hard IC that depends on theta contributes its Jacobian; a fixed hard IC contributes nothing.
+            matrix_t S0 = matrix_t::Zero(s->d_, q);
+            if (s->estimate_ic_) { S0.rightCols(s->d_) = matrix_t::Identity(s->d_, s->d_); }
+            else if (s->has_ic_ && s->ic_jacobian_) { S0.leftCols(n_theta) = s->ic_jacobian_(s->theta_of_(z)); }
+            const auto S = s->param_sensitivity_(Y, nullptr, S0, s->n_finite_);
+            for (std::size_t i = 0; i < idx.size(); ++i) {
+                const auto [t, v] = idx[i];
+                if (t < static_cast<int>(S.size())) { J.row(static_cast<int>(i)) = S[t].row(v); }
+            }
+            // chain through the parameter map: theta_j = lower_j + exp(w_j) scales column j by dtheta/dw
+            if (s->param_map_.active()) {
+                const vector_t th = s->theta_of_(z);
+                const vector_t d = s->param_map_.chain(th, vector_t::Ones(n_theta));
+                for (int j = 0; j < n_theta; ++j) { J.col(j) *= d[j]; }
+            }
+            return J;
+        }
+    };
+    // the observed (node, component) pairs, cached: the residual layout must be stable across iterations
+    const std::vector<std::pair<int, int>>& obs_idx_() {
+        if (obs_idx_cache_.empty() && n_obs_ > 0) { obs_idx_cache_ = observed_entries_(); }
+        return obs_idx_cache_;
+    }
+    std::vector<std::pair<int, int>> obs_idx_cache_;
+
     struct nls_objective {
         bs_ls_ode_nls* solver;
-        double operator()(const vector_t& z) const { return solver->S_(z); }
+        double operator()(const vector_t& w) const { return solver->S_(solver->z_of_w_(w)); }
         auto gradient() const {
-            return [s = solver](const vector_t& z) { return s->grad_S_(z); };
+            return [s = solver](const vector_t& w) {
+                const vector_t z = s->z_of_w_(w);
+                return s->chain_(z, s->grad_S_(z));   // grad_S_ already zeroes a non-finite gradient
+            };
         }
     };
 
@@ -392,6 +534,11 @@ class bs_ls_ode_nls : public bs_ls_ode {
     bool estimate_ic_ = false;       // is the initial state a decision variable?
     int outer_max_iter_ = 100;
     double outer_tol_ = 1e-6;
+    vector_t theta_last_;         // the optimizer's last iterate, before the safeguard
+    double outer_value_last_ = std::numeric_limits<double>::infinity();
+    outer_method outer_method_ = outer_method::bfgs;
+    theta_log_map param_map_;     // identity unless set_parameter_map() was called
+    double outer_step_cap_ = 0;   // <= 0: the step length is left to the line search
     // Magnitude of the horizon-loss term in the partial-prefix cost S_ scores a blown-up shooting solve
     // with. Unlike the base solver's flat sentinel (bs_ls_ode::divergent_cost_, which is infinity) this
     // one enters an ARITHMETIC expression -- s + divergent_prefix_cost_ * (m - k)/m -- whose whole point

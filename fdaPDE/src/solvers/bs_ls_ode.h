@@ -239,6 +239,77 @@ using any_controlled_ode_solver = fdapde::erase<fdapde::heap_storage, IControlle
 
 namespace internals {
 
+// Parameter reparametrization for the inverse solvers below. Both run an UNCONSTRAINED BFGS over theta,
+// which has nothing keeping the iterates inside the region where the model is even defined: one overlong
+// step is enough to leave it, and a field evaluated outside it returns non-finite values, which the
+// optimizer then reads as a converged gradient. This map removes the region instead of guarding each step:
+// on the components carrying a lower bound l_k it optimizes over z with
+//
+//   theta_k = l_k + exp(z_k),
+//
+// so theta_k > l_k identically and the chain rule scales the gradient by (theta_k - l_k) -- which also
+// pulls parameters of very different magnitudes onto a comparable scale. Components whose bound is NaN are
+// carried through unchanged. The price is a criterion that flattens far from the bound, so the map is a
+// modelling statement about the admissible region, not a numerical trick to switch on everywhere.
+struct theta_log_map {
+    using vector_t = Eigen::Matrix<double, Dynamic, 1>;
+    vector_t lower;                       // empty: identity map. NaN entry: that component is not mapped
+    static constexpr double floor_ = 1e-8;   // a start ON the bound has no logarithm: nudge it inside
+
+    bool active() const { return lower.size() > 0; }
+    bool mapped(int k) const { return active() && k < lower.size() && !std::isnan(lower[k]); }
+    // z -> theta
+    vector_t theta_of(const vector_t& z) const {
+        if (!active()) { return z; }
+        vector_t theta = z;
+        for (int k = 0; k < z.size(); ++k) {
+            if (mapped(k)) { theta[k] = lower[k] + std::exp(z[k]); }
+        }
+        return theta;
+    }
+    // theta -> z (the inverse, clamped: a start at or below the bound is moved just inside it)
+    vector_t z_of(const vector_t& theta) const {
+        if (!active()) { return theta; }
+        vector_t z = theta;
+        for (int k = 0; k < theta.size(); ++k) {
+            if (mapped(k)) { z[k] = std::log(std::max(theta[k] - lower[k], floor_)); }
+        }
+        return z;
+    }
+    // d/dz = (theta - l) * d/dtheta on the mapped components
+    vector_t chain(const vector_t& theta, const vector_t& grad) const {
+        if (!active()) { return grad; }
+        vector_t g = grad;
+        for (int k = 0; k < grad.size(); ++k) {
+            if (mapped(k)) { g[k] *= (theta[k] - lower[k]); }
+        }
+        return g;
+    }
+};
+
+// BFGS callback bounding the length of every accepted step, || h * update || <= cap, a poor man's trust
+// region. Two things make the raw steps unusable on these criteria:
+//
+//   - the inverse Hessian starts at the identity, so the first direction is the raw negative gradient,
+//     whose norm here runs to tens -- enough to throw the first trial point clean out of the physical
+//     region -- and the first secant update, built from that step, can then be worse still;
+//   - WolfeLineSearch DOUBLES alpha while it has found no upper bound (up to 2^10), so bounding the
+//     direction alone does not bound the step: it must be clamped after the line search has chosen h.
+//
+// Hence adapt_hook, which the optimizer runs after the line search's own adapt_hook and before it forms
+// x_new -- so pass this callback AFTER the line search. Shortening an accepted step can cost the curvature
+// condition the line search just secured; that is the trade, and it is why the cap defaults to off.
+struct step_norm_cap {
+    double cap = 0;   // <= 0: no cap
+    template <typename Opt, typename Obj> bool adapt_hook(Opt& optimizer, Obj&) {
+        if (cap > 0) {
+            const double norm = optimizer.update.norm();
+            if (std::isfinite(norm) && norm > 0 && optimizer.h * norm > cap) { optimizer.h = cap / norm; }
+        }
+        return false;
+    }
+};
+
 // Least-squares solver for ODE-penalized smoothing.
 //
 // Over a time grid t_1 < ... < t_m and a d-dimensional response, it fits the nodal trajectory
@@ -482,6 +553,20 @@ class bs_ls_ode {
     // defect (y_{t+1} - step_f(y_t))/dt against the *unforced* dynamics: the two coincide only for
     // forward Euler (see compute_misfit_).
     const matrix_t& control() const { return U_; }
+    /* The control's stage points, in time order: one per decision block ((m-1)*s of them), block t*s + i
+    at time_(t) + c_i dt_t for the tableau node c_i. control() carries the control's VALUES there and
+    nothing else -- it is a broken polynomial, so these are the abscissae any quadrature or difference
+    stencil on u has to use. Exposed because the H1-penalized solver builds its derivative stencil on
+    them, and a study comparing penalties needs the same stencil for every arm. */
+    vector_t control_stage_times() const {
+        fdapde_assert(m_ >= 2 && static_cast<bool>(engine_));
+        const vector_t c = engine_.nodes();
+        vector_t tau(n_blocks_());
+        for (int t = 0; t < m_ - 1; ++t) {
+            for (int i = 0; i < s_; ++i) { tau[t * s_ + i] = time_(t) + c[i] * dt_(t); }
+        }
+        return tau;
+    }
     // dual variables of the state box constraints (m x d, zero where inactive / unbounded)
     const matrix_t& bound_multipliers() const { return bound_mult_; }
     double objective() const { return objective_value_; }
@@ -558,6 +643,116 @@ class bs_ls_ode {
     }
     // the tableau quadrature weights b_i, which weight the stages in the control's L2 norm
     vector_t quad_weights_() const { return engine_.quad_weights(); }
+
+    /* FORWARD parameter sensitivity of the trajectory, d y_t / d(decision variables), at a FROZEN control.
+    The adjoint sweeps elsewhere in this file contract the same Jacobians backwards against a costate to
+    get one gradient in one pass. Levenberg-Marquardt needs the other thing: the full Jacobian of the
+    residual VECTOR, which is this propagated forwards,
+
+        S_0 = d y_0 / d z (the seed),     S_{t+1} = Flow_t S_t + [Theta_t | 0] ,
+
+    with Flow_t = d step/d y_t and Theta_t = d step/d theta from the same single stage solve the adjoint
+    uses (step_with_flow_param_jacobians). Cost is one (d x d)(d x q) product per interval instead of one
+    matrix-vector product, i.e. q times the adjoint's work for q unknowns -- which is the standard price
+    of a Jacobian over a gradient, and cheap here because q is at most a handful.
+
+    `U` is the control schedule the sensitivity is taken at, or nullptr for the unforced dynamics (NLS).
+    Passing the FITTED control freezes it, which is what the envelope theorem prescribes for the
+    penalized estimators: see the note on the Gauss-Newton model in bs_ls_ode_tracking.
+
+    The seed carries the first n_theta columns of d y_0/d z; any remaining columns (an estimated initial
+    state) are seeded by the caller. Returns fewer than `n_rows` matrices if the propagation turns
+    non-finite, so a caller can build the rows it has. */
+    std::vector<matrix_t>
+    param_sensitivity_(const matrix_t& Y, const matrix_t* U, const matrix_t& S0, int n_rows) {
+        const int n_theta = engine_.n_params();
+        std::vector<matrix_t> S;
+        if (n_rows < 1 || S0.rows() != d_ || S0.cols() < n_theta) { return S; }
+        S.reserve(n_rows);
+        S.push_back(S0);
+        const matrix_t zero_u = matrix_t::Zero(d_, s_);
+        for (int t = 0; t + 1 < n_rows; ++t) {
+            vector_t yc = Y.row(t).transpose();
+            const matrix_t ut = (U != nullptr) ? stage_block_(*U, t) : zero_u;
+            auto j = engine_.step_with_flow_param_jacobians(time_(t), yc, dt_(t), ut);
+            matrix_t next = j.flow * S[t];
+            next.leftCols(n_theta) += j.param;
+            if (!next.allFinite()) { break; }
+            S.push_back(std::move(next));
+        }
+        return S;
+    }
+    /* Sensitivity of the OBSERVED trajectory entries to the control, C = d r_data / d u, in PHYSICAL
+    control units ((n_obs) x ((m-1) s d)). Row i, for the observed entry (t, v), is
+
+        e_v^T Flow_{t-1} ... Flow_{tau+1} B_tau      for each interval tau < t,
+
+    which one backward sweep per observed entry produces from the per-interval Jacobians. Those are
+    recomputed here from (Y, U) rather than read out of the forward cache, so this works under BOTH inner
+    policies -- the SQP path never populates that cache.
+
+    Cost: m stage solves (one forward pass) plus n_obs cheap sweeps. Physical units, not the scaled
+    decision variable, because the only thing built from C is the orthogonal projector onto its column
+    space, which is invariant to a rescaling of u. */
+    matrix_t control_sensitivity_(
+      const matrix_t& Y, const matrix_t& U, const std::vector<std::pair<int, int>>& idx) {
+        const int sd = sd_(), nu = n_ctrl_();
+        matrix_t C = matrix_t::Zero(static_cast<int>(idx.size()), nu);
+        std::vector<matrix_t> flow(m_ - 1), B(m_ - 1);
+        for (int t = 0; t < m_ - 1; ++t) {
+            vector_t yc = Y.row(t).transpose();
+            auto j = engine_.step_with_jacobians(time_(t), yc, dt_(t), stage_block_(U, t));
+            flow[t] = j.flow;
+            B[t] = j.param;   // d y_{t+1} / d u_t  (d x s d)
+            if (!flow[t].allFinite() || !B[t].allFinite()) { return matrix_t(); }
+        }
+        for (std::size_t i = 0; i < idx.size(); ++i) {
+            const auto [t, v] = idx[i];
+            if (t < 1) { continue; }   // node 0 does not depend on the control
+            vector_t p = vector_t::Unit(d_, v);
+            for (int tau = t - 1; tau >= 0; --tau) {
+                C.block(static_cast<int>(i), tau * sd, 1, sd) = (B[tau].transpose() * p).transpose();
+                p = flow[tau].transpose() * p;
+            }
+        }
+        return C;
+    }
+    /* d u^star / d theta for the inner problem, by the implicit function theorem in Gauss-Newton form.
+    The inner optimality condition is A^T R = 0 with A = dR/du = [C ; P], and differentiating it in theta
+    gives A^T A (d u^star/d theta) = -A^T B. The penalty residuals carry no theta, so A^T B = C^T B_data and
+
+        d u^star / d theta = -(C^T C + M)^{-1} C^T B_data ,      M = P^T P .
+
+    M is DIAGONAL for the L2 penalty and tridiagonal for the H1 one, while C^T C has rank at most n_obs
+    -- 60 here against 588 control unknowns -- so Woodbury turns the (m-1)sd system into an n_obs one:
+
+        (M + C^T C)^{-1} C^T = M^{-1} C^T (I + C M^{-1} C^T)^{-1} .
+
+    That identity is why this is cheap: the only dense factorization is n_obs x n_obs. */
+    matrix_t inner_sensitivity_(
+      const matrix_t& C, const Eigen::SparseMatrix<double>& M, const matrix_t& B_data) const {
+        if (C.size() == 0) { return matrix_t(); }
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt(M);
+        if (ldlt.info() != Eigen::Success) { return matrix_t(); }
+        const matrix_t MiCt = ldlt.solve(matrix_t(C.transpose()));                 // nu x n_obs
+        matrix_t K = C * MiCt;                                                      // n_obs x n_obs
+        K.diagonal().array() += 1.0;
+        const matrix_t X = K.partialPivLu().solve(B_data);                          // n_obs x p
+        matrix_t du = -MiCt * X;                                                    // nu x p
+        if (!du.allFinite()) { return matrix_t(); }
+        return du;
+    }
+    // the observed (node, component) pairs, in the order a residual vector lists them. Built once per
+    // data set; the residual layout must not change between iterations of a least-squares solve.
+    std::vector<std::pair<int, int>> observed_entries_() const {
+        std::vector<std::pair<int, int>> idx;
+        for (int t = 0; t < m_; ++t) {
+            for (int v = 0; v < d_; ++v) {
+                if (mask_(t, v) != 0.0) { idx.emplace_back(t, v); }
+            }
+        }
+        return idx;
+    }
     // index of the interval of `grid` containing t (the last interval at the right endpoint)
     static int locate_in_(const vector_t& grid, double t) {
         const int n = static_cast<int>(grid.size());

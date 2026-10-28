@@ -84,6 +84,31 @@ class bs_ls_ode_tracking : public bs_ls_ode {
         outer_max_iter_ = max_iter;
         outer_tol_ = tol;
     }
+    // Run the outer BFGS on z, theta_k = lower_k + exp(z_k), instead of on theta directly (see
+    // theta_log_map). `lower` has one entry per parameter; a NaN entry leaves that component unmapped.
+    // The estimate, the gradients and every observer stay in theta.
+    void set_parameter_map(const vector_t& lower) {
+        fdapde_assert(static_cast<bool>(engine_) && lower.size() == engine_.n_params());
+        param_map_.lower = lower;
+    }
+    void clear_parameter_map() { param_map_.lower.resize(0); }
+    const theta_log_map& parameter_map() const { return param_map_; }
+    // cap on the length of every accepted BFGS step, in the optimizer's own variables (see
+    // step_norm_cap). <= 0 (the default) leaves the step to the line search alone. Ignored by the
+    // trust-region outer optimizer, whose radius does the same job with a model behind it.
+    void set_outer_step_cap(double cap) { outer_step_cap_ = cap; }
+    // which outer optimizer minimizes H_lambda: BFGS with a Wolfe line search (the default) or the
+    // trust-region quasi-Newton. They differ in how a step into the divergent region is handled -- the
+    // line search shortens it, the trust region rejects it and shrinks the radius.
+    // levenberg_marquardt here is Gauss-Newton on the FROZEN-CONTROL residual Jacobian: the gradient
+    // it uses is exact (the envelope theorem), the curvature is an upper bound. See tracking_ls_problem.
+    enum class outer_method { bfgs, trust_region, levenberg_marquardt };
+    void set_outer_method(outer_method m) { outer_method_ = m; }
+    outer_method outer_method_policy() const { return outer_method_; }
+    // Levenberg-Marquardt only: use the exact reduced (variable-projection) Jacobian (I - P_A)B, the
+    // default, or the frozen-control B alone. See tracking_ls_problem.
+    void use_exact_jacobian(bool on) { exact_jacobian_ = on; }
+    bool exact_jacobian() const { return exact_jacobian_; }
     // d y_0 / d theta (d x n_theta), only meaningful under a hard initial condition that itself depends
     // on theta. Absent (the default) the first node contributes nothing: with no hard IC the initial
     // state is an inner decision variable, so the envelope theorem freezes it too.
@@ -113,19 +138,52 @@ class bs_ls_ode_tracking : public bs_ls_ode {
         fdapde_assert(theta0.size() == engine_.n_params());
         lambda_outer_ = lambda;
         inner_failures_ = 0;
+        best_value_ = std::numeric_limits<double>::infinity();
+        best_theta_.resize(0);
         invalidate_cache_();
         tracking_objective problem {this};
-        BFGS<Dynamic> optimizer(outer_max_iter_, outer_tol_, 1.0);
-        // Wolfe line search, as in the inner adjoint solve: the curvature condition keeps the BFGS
-        // inverse Hessian positive definite and the Armijo test rejects the divergent-cost surrogate.
-        vector_t theta_opt = optimizer.optimize(problem, theta0, WolfeLineSearch());
+        const vector_t z0 = param_map_.z_of(theta0);
+        vector_t z_opt;
+        if (outer_method_ == outer_method::levenberg_marquardt) {
+            LevenbergMarquardt<Dynamic> lm(outer_max_iter_, outer_tol_);
+            z_opt = lm.optimize(tracking_ls_problem {this}, z0);
+            outer_n_iter_ = lm.n_iter();
+            outer_converged_ = lm.converged();
+        } else if (outer_method_ == outer_method::trust_region) {
+            TrustRegion<Dynamic> optimizer(outer_max_iter_, outer_tol_, outer_step_cap_ > 0 ? outer_step_cap_ : 1.0);
+            z_opt = optimizer.optimize(problem, z0);
+            outer_n_iter_ = optimizer.n_iter();
+            outer_converged_ = optimizer.converged();
+        } else {
+            BFGS<Dynamic> optimizer(outer_max_iter_, outer_tol_, 1.0);
+            // Wolfe line search, as in the inner adjoint solve: the curvature condition keeps the BFGS
+            // inverse Hessian positive definite and the Armijo test rejects the divergent-cost surrogate.
+            z_opt = optimizer.optimize(problem, z0, WolfeLineSearch(), step_norm_cap {outer_step_cap_});
+            outer_n_iter_ = optimizer.n_iter();
+            outer_converged_ = optimizer.converged();
+        }
+        vector_t theta_opt = param_map_.theta_of(z_opt);
+        // the optimizer's OWN last iterate, kept before the safeguard below may replace it: the two
+        // disagree exactly when the safeguard fires, and a study that reports only the returned point
+        // cannot tell a converged run from a rescued one
+        theta_last_ = theta_opt;
+        outer_value_last_ = theta_opt.allFinite() ? H_(theta_opt) : std::numeric_limits<double>::infinity();
+        // SAFEGUARD, as in bs_ls_ode_nls::solve(). Return the best theta actually EVALUATED rather than
+        // the optimizer's last iterate: a line search walking into the region where the inner solve
+        // diverges gets the sentinel cost and a zeroed gradient, which can leave the BFGS secant update
+        // with delta_grad = 0 and hand back a non-finite or uphill iterate -- an artifact of the
+        // optimizer, not a statement about the estimator.
+        if (!theta_opt.allFinite() || outer_value_last_ > best_value_) {
+            fdapde_assert(best_theta_.size() > 0);
+            theta_opt = best_theta_;
+            safeguarded_ = true;
+        } else {
+            safeguarded_ = false;
+        }
         theta_ = theta_opt;
-        outer_value_ = optimizer.value();
-        outer_n_iter_ = optimizer.n_iter();
-        outer_converged_ = (outer_n_iter_ < outer_max_iter_);
         // leave the forward state consistent with the estimate
         invalidate_cache_();
-        inner_solve_(theta_);
+        outer_value_ = H_(theta_);   // the inner solve at the estimate, which also refreshes the state
         return theta_;
     }
     const vector_t& solve(double lambda) { return solve(lambda, theta_); }
@@ -139,6 +197,14 @@ class bs_ls_ode_tracking : public bs_ls_ode {
     // number of outer evaluations whose inner solve did not meet its tolerance. The envelope gradient is
     // only valid at an inner optimum, so a nonzero count means the outer gradient was inconsistent.
     int n_inner_failures() const { return inner_failures_; }
+    // true when the estimate is the best point EVALUATED rather than the optimizer's last iterate; see
+    // the SAFEGUARD note in solve()
+    bool safeguarded() const { return safeguarded_; }
+    // the optimizer's own last iterate and the criterion there, before the safeguard. Reporting a study's
+    // failure rate on BOTH this and the returned estimate separates "the optimizer solved it" from "the
+    // safeguard found something better among the points a line search happened to try".
+    const vector_t& theta_last_iterate() const { return theta_last_; }
+    double outer_objective_last_iterate() const { return outer_value_last_; }
     fit_policy inner_policy() const {
         return policy_override_ ? inner_policy_ : (has_state_bounds() ? fit_policy::sqp : fit_policy::adjoint);
     }
@@ -153,6 +219,48 @@ class bs_ls_ode_tracking : public bs_ls_ode {
     vector_t outer_gradient_at(double lambda, const vector_t& theta) {
         set_lambda_(lambda);
         return grad_H_(theta);
+    }
+    // DIAGNOSTIC: 2 J^T r from the least-squares view. The envelope theorem makes this EXACTLY the
+    // envelope gradient above (the frozen-control term is the only one that survives), so the two must
+    // agree to round-off -- the check on the Jacobian LM uses. Takes the map's variables z (= theta when
+    // no parameter map is set).
+    /* DIAGNOSTIC: d u^star / d theta itself ((m-1)s*d x n_theta), the quantity the variable projection
+    is built on. It needs its OWN test: its contribution to the gradient cancels by the inner optimality
+    condition, so ls_gradient_at() is blind to it. The check is a central difference of the fitted
+    control against re-solved inner problems, which is what test_varpro does. */
+    matrix_t inner_sensitivity_at(double lambda, const vector_t& theta) {
+        set_lambda_(lambda);
+        inner_solve_(theta);
+        if (!Y_.allFinite() || !U_.allFinite()) { return matrix_t(); }
+        const auto& idx = obs_idx_();
+        const int n_obs = static_cast<int>(idx.size()), nu = n_ctrl_(), p = engine_.n_params();
+        matrix_t S0 = matrix_t::Zero(d_, p);
+        if (has_ic_ && ic_jacobian_) { S0 = ic_jacobian_(theta); }
+        const auto S = param_sensitivity_(Y_, &U_, S0, m_);
+        matrix_t B_data = matrix_t::Zero(n_obs, p);
+        for (int i = 0; i < n_obs; ++i) {
+            const auto [t, v] = idx[i];
+            if (t < static_cast<int>(S.size())) { B_data.row(i) = S[t].row(v); }
+        }
+        const matrix_t C = control_sensitivity_(Y_, U_, idx);
+        const vector_t w = penalty_weight_();
+        Eigen::SparseMatrix<double> M(nu, nu);
+        M.reserve(Eigen::VectorXi::Constant(nu, 1));
+        for (int j = 0; j < nu; ++j) { M.insert(j, j) = w[j]; }
+        M.makeCompressed();
+        return inner_sensitivity_(C, M, B_data);
+    }
+    // the fitted control at (lambda, theta), flattened as inner_sensitivity_at differentiates it
+    vector_t control_at(double lambda, const vector_t& theta) {
+        set_lambda_(lambda);
+        inner_solve_(theta);
+        return flat_control_();
+    }
+
+    vector_t ls_gradient_at(double lambda, const vector_t& z) {
+        set_lambda_(lambda);
+        tracking_ls_problem p {this};
+        return 2.0 * (p.jacobian(z).transpose() * p.residuals(z));
     }
 
    private:
@@ -187,7 +295,12 @@ class bs_ls_ode_tracking : public bs_ls_ode {
     double H_(const vector_t& theta) {
         inner_solve_(theta);
         double v = objective();
-        if (!std::isfinite(v) || !Y_.allFinite()) { return divergent_outer_cost_; }
+        if (!std::isfinite(v) || !Y_.allFinite()) { v = divergent_outer_cost_; }
+        // running best, for the safeguard in solve()
+        if (v < best_value_ && theta.allFinite()) {
+            best_value_ = v;
+            best_theta_ = theta;
+        }
         return v;
     }
 
@@ -228,12 +341,142 @@ class bs_ls_ode_tracking : public bs_ls_ode {
         return grad;
     }
 
-    // outer objective functor over theta, adapting H and its envelope gradient to the core BFGS interface
+    // outer objective functor over the optimizer's variables z (theta itself under the identity map),
+    // adapting H and its envelope gradient to the core BFGS interface
+    /* The penalized criterion H_lambda as residuals and a Jacobian, for Levenberg-Marquardt.
+
+    H_lambda(theta) = ||R(u^star(theta), theta)||^2 with R = [ y - y_obs ; sqrt(lambda W) u ], so a
+    least-squares view exists -- but the reduced Jacobian is a TOTAL derivative,
+
+        dR/dtheta = B + A (d u^star / d theta) ,     A = dR/du ,  B = partial R / partial theta ,
+
+    and d u^star/d theta is what the envelope theorem lets the gradient avoid. It does NOT let the
+    curvature avoid it. Substituting the implicit-function solution (see inner_sensitivity_),
+
+        dR/dtheta = ( I - P_A ) B ,     P_A = A (A^T A)^{-1} A^T ,
+
+    the frozen-control Jacobian PROJECTED off the column space of A -- Golub & Pereyra's variable
+    projection. Three things follow, and the first two are why the earlier frozen-control version was
+    both correct in its gradient and bad in its steps:
+
+      GRADIENT unchanged. P_A R = 0 IS the inner optimality condition, so B^T (I - P_A) R = B^T R. The
+      ls_gradient_at() check still has to reproduce the envelope gradient exactly -- and now it tests more,
+      since a poorly converged inner solve leaves A^T R != 0 and the two drift apart.
+
+      CURVATURE corrected downwards. B^T(I - P_A)B <= B^T B, the gap being ||P_A B||^2. Using B alone
+      over-states curvature, so the damped steps come out too short: measured on SB, LM on the
+      frozen-control model burned its whole outer budget and converged on none of 20 replicas, while the
+      trust region reached the lower criterion on 16 of them.
+
+      COVARIANCE. sigma^2 (J^T J)^{-1} with the projected J is the estimator's actual asymptotic
+      covariance; the frozen-control model understates it.
+
+    GAUSS-NEWTON ON THE INNER PROBLEM TOO. The implicit-function solution uses A^T A for the inner
+    Hessian, dropping sum_i R_i d^2 R_i/du^2. So d u^star/d theta is exact only as the residuals vanish.
+    Measured against central differences of re-solved inner problems (jacobian_checks.cpp): ~2e-5 with
+    clean data at the truth, 14-20% at sigma = 5 with theta 20% out, and INDEPENDENT of the step size, so
+    it is the approximation and not finite-difference noise. For a damped method that is acceptable --
+    the rho test absorbs model error, and a 15%-wrong curvature beats the frozen-control alternative,
+    which is wrong by ||P_A B||^2 -- but it is worth knowing before quoting (J^T J)^{-1} as a covariance.
+
+    Set use_exact_jacobian(false) to fall back to B alone -- kept for comparison, not recommended.
+    */
+    struct tracking_ls_problem {
+        bs_ls_ode_tracking* s;
+        // R = [ data residuals ; sqrt(lambda dt_t b_i) u_{t,i} ], so ||R||^2 == H_lambda exactly
+        Eigen::Matrix<double, Dynamic, 1> residuals(const vector_t& z) const {
+            const vector_t theta = s->param_map_.theta_of(z);
+            s->inner_solve_(theta);
+            const auto& idx = s->obs_idx_();
+            const int n_obs = static_cast<int>(idx.size()), nu = s->n_ctrl_();
+            Eigen::Matrix<double, Dynamic, 1> r(n_obs + nu);
+            if (!s->Y_.allFinite() || !s->U_.allFinite() || !std::isfinite(s->objective())) {
+                return r.setConstant(std::numeric_limits<double>::quiet_NaN());
+            }
+            for (int i = 0; i < n_obs; ++i) {
+                const auto [t, v] = idx[i];
+                r[i] = s->Y_(t, v) - s->y_obs_(t, v);
+            }
+            r.tail(nu) = s->penalty_weight_().cwiseSqrt().cwiseProduct(s->flat_control_());
+            return r;
+        }
+        Eigen::Matrix<double, Dynamic, Dynamic> jacobian(const vector_t& z) const {
+            const vector_t theta = s->param_map_.theta_of(z);
+            s->inner_solve_(theta);
+            const auto& idx = s->obs_idx_();
+            const int n_obs = static_cast<int>(idx.size()), nu = s->n_ctrl_(), p = s->engine_.n_params();
+            Eigen::Matrix<double, Dynamic, Dynamic> J =
+              Eigen::Matrix<double, Dynamic, Dynamic>::Zero(n_obs + nu, p);
+            if (!s->Y_.allFinite() || !s->U_.allFinite()) { return J; }
+            // B_data = d y / d theta at FROZEN control. Only a hard, theta-dependent initial condition
+            // moves y_0; with a free IC the initial state is an inner variable, frozen like the control.
+            matrix_t S0 = matrix_t::Zero(s->d_, p);
+            if (s->has_ic_ && s->ic_jacobian_) { S0 = s->ic_jacobian_(theta); }
+            const auto S = s->param_sensitivity_(s->Y_, &s->U_, S0, s->m_);
+            matrix_t B_data = matrix_t::Zero(n_obs, p);
+            for (int i = 0; i < n_obs; ++i) {
+                const auto [t, v] = idx[i];
+                if (t < static_cast<int>(S.size())) { B_data.row(i) = S[t].row(v); }
+            }
+            J.topRows(n_obs) = B_data;
+            if (s->exact_jacobian_) {
+                const matrix_t C = s->control_sensitivity_(s->Y_, s->U_, idx);
+                const vector_t w = s->penalty_weight_();
+                Eigen::SparseMatrix<double> M(nu, nu);   // M = P^T P, diagonal for the L2 penalty
+                M.reserve(Eigen::VectorXi::Constant(nu, 1));
+                for (int j = 0; j < nu; ++j) { M.insert(j, j) = w[j]; }
+                M.makeCompressed();
+                const matrix_t du = s->inner_sensitivity_(C, M, B_data);
+                if (du.size() != 0) {
+                    J.topRows(n_obs) += C * du;                              // data block
+                    J.bottomRows(nu) = w.cwiseSqrt().asDiagonal() * du;      // penalty block
+                }
+            }
+            if (s->param_map_.active()) {
+                const vector_t d = s->param_map_.chain(theta, vector_t::Ones(p));
+                for (int j = 0; j < p; ++j) { J.col(j) *= d[j]; }
+            }
+            return J;
+        }
+    };
+    // the per-block L2 penalty weight lambda*dt_t*b_i, as one vector over the (m-1)s*d control unknowns,
+    // and the fitted control flattened to match. ||sqrt(w) u||^2 is then exactly the penalty term of H.
+    vector_t penalty_weight_() const {
+        const vector_t b = quad_weights_();
+        vector_t w(n_ctrl_());
+        for (int t = 0; t < m_ - 1; ++t) {
+            for (int i = 0; i < s_; ++i) {
+                w.segment((t * s_ + i) * d_, d_).setConstant(lambda_outer_ * dt_(t) * b[i]);
+            }
+        }
+        return w;
+    }
+    vector_t flat_control_() const {
+        vector_t u(n_ctrl_());
+        for (int t = 0; t < m_ - 1; ++t) { u.segment(t * sd_(), sd_()) = U_.row(t).transpose(); }
+        return u;
+    }
+    // observed (node, component) pairs, cached: the residual layout must be stable across iterations
+    const std::vector<std::pair<int, int>>& obs_idx_() {
+        if (obs_idx_cache_.empty() && n_obs_ > 0) { obs_idx_cache_ = observed_entries_(); }
+        return obs_idx_cache_;
+    }
+    std::vector<std::pair<int, int>> obs_idx_cache_;
+
     struct tracking_objective {
         bs_ls_ode_tracking* solver;
-        double operator()(const vector_t& theta) const { return solver->H_(theta); }
+        double operator()(const vector_t& z) const { return solver->H_(solver->param_map_.theta_of(z)); }
         auto gradient() const {
-            return [s = solver](const vector_t& theta) { return s->grad_H_(theta); };
+            return [s = solver](const vector_t& z) {
+                const vector_t theta = s->param_map_.theta_of(z);
+                vector_t g = s->grad_H_(theta);
+                // GUARD. Outside the region where the field is defined the sweep returns non-finite
+                // entries. BFGS's stopping test reads grad.norm() > tol, which is FALSE for NaN, so an
+                // unguarded NaN ends the outer loop and reports the garbage point as converged. Zeroing it
+                // stops the loop too, but on a point the safeguard in solve() can then discard.
+                if (!g.allFinite()) { g.setZero(); }
+                return s->param_map_.chain(theta, g);
+            };
         }
     };
 
@@ -247,6 +490,14 @@ class bs_ls_ode_tracking : public bs_ls_ode {
     int outer_max_iter_ = 100;
     double outer_tol_ = 1e-6;
     static constexpr double divergent_outer_cost_ = 1e20;
+    theta_log_map param_map_;       // identity unless set_parameter_map() was called
+    bool exact_jacobian_ = true;    // LM: variable-projection Jacobian rather than the frozen-control one
+    double outer_step_cap_ = 0;     // <= 0: the step length is left to the line search
+
+    // best evaluated point, the fallback solve() returns when the optimizer's last iterate is not usable
+    vector_t best_theta_;
+    double best_value_ = std::numeric_limits<double>::infinity();
+    bool safeguarded_ = false;
 
     // inner-solve memoization
     vector_t theta_cache_;
@@ -254,6 +505,9 @@ class bs_ls_ode_tracking : public bs_ls_ode {
     int inner_failures_ = 0;
 
     // outer results
+    vector_t theta_last_;            // the optimizer's last iterate, before the safeguard
+    double outer_value_last_ = std::numeric_limits<double>::infinity();
+    outer_method outer_method_ = outer_method::bfgs;
     double outer_value_ = 0;
     int outer_n_iter_ = 0;
     bool outer_converged_ = false;
